@@ -33,7 +33,9 @@ const status = await new Promise((resolve, reject) => {
 if (status !== 0) process.exit(status ?? 1);
 
 const report = new Map();
-const row = /^\s*ℹ\s+([^|]+?)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|/gmu;
+// Node versions format TAP coverage summary rows with either the ℹ info marker
+// or TAP's # comment marker. Accept both so the per-module floors work in CI.
+const row = /^\s*(?:ℹ|#)\s+([^|]+?)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|/gmu;
 for (const match of output.matchAll(row)) {
   report.set(match[1].trim(), {
     lines: Number(match[2]), branches: Number(match[3]), functions: Number(match[4]),
