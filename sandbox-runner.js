@@ -468,8 +468,9 @@ def parse_r2_sections(output):
     current = None
     for line in output.splitlines():
         stripped = line.strip()
-        if stripped in sections:
+        if re.fullmatch(r"__DSH_R2_[A-Z0-9_]+__", stripped):
             current = stripped
+            sections.setdefault(current, [])
             continue
         if current is not None:
             sections[current].append(line)
@@ -713,7 +714,9 @@ if prefer_engine == "ghidra" and ghidra:
 if r2:
     engine_name = "rizin" if os.path.basename(r2) == "rizin" else "radare2"
     if target is None:
-        code, out, err = run([r2, "-e", "bin.relocs.apply=true", "-2", "-A", "-q", "-c", "aflj", "--", binary])
+        # 注意：radare2 的两个连字符参数不是"选项结束"，而是"不打开任何文件"。
+        # 这里绝不能补它，否则 aflj 会稳定返回 []（exit 0），看起来像"没识别到函数"。
+        code, out, err = run([r2, "-e", "bin.relocs.apply=true", "-2", "-A", "-q", "-c", "aflj", binary])
         funcs = []
         try:
             for item in json.loads(out or "[]")[:200]:
@@ -727,23 +730,36 @@ if r2:
             r2_report["warning"] = "r2 没有识别到函数。"
         print(json.dumps(with_ghidra_fallback(r2_report)))
         sys.exit(0)
-    r2_cmds = "; ".join([
-        "e scr.color=0",
-        "?e __DSH_R2_PDG__",
-        f"pdg @ {target}",
-        "?e __DSH_R2_PDC__",
-        f"pdc @ {target}",
-        "?e __DSH_R2_ASM__",
-        f"pdf @ {target}",
-        f"axt @ {target}",
-    ])
-    code, out, err = run([r2, "-e", "bin.relocs.apply=true", "-2", "-A", "-q", "-c", r2_cmds, "--", binary], timeout=60)
+    # r2 的 flag 名带前缀（裸 check_flag 会报 Invalid tmpseek address），
+    # 所以对非地址输入同时尝试 sym.<name> 与原始写法，逐个 section 取第一个有输出的。
+    candidates = []
+    if not re.fullmatch(r"(?:0x[0-9a-fA-F]+|\d+)", target) and not target.startswith(("sym.", "fcn.", "obj.", "loc.", "method.", "entry")):
+        candidates.append("sym." + target)
+    candidates.append(target)
+    cmds = ["e scr.color=0"]
+    for idx, cand in enumerate(candidates):
+        suffix = "" if idx == 0 else "_%d" % idx
+        cmds.extend([
+            "?e __DSH_R2_PDG%s__" % suffix, "pdg @ %s" % cand,
+            "?e __DSH_R2_PDC%s__" % suffix, "pdc @ %s" % cand,
+            "?e __DSH_R2_ASM%s__" % suffix, "pdf @ %s" % cand,
+        ])
+    cmds.append("axt @ %s" % candidates[0])
+    r2_cmds = "; ".join(cmds)
+    code, out, err = run([r2, "-e", "bin.relocs.apply=true", "-2", "-A", "-q", "-c", r2_cmds, binary], timeout=60)
     sections = parse_r2_sections(out)
-    pseudo = clean_r2_pseudo(sections["__DSH_R2_PDG__"]) or clean_r2_pseudo(sections["__DSH_R2_PDC__"])
-    asm = sections["__DSH_R2_ASM__"]
+    pseudo = ""
+    asm = ""
+    for idx in range(len(candidates)):
+        suffix = "" if idx == 0 else "_%d" % idx
+        pseudo = clean_r2_pseudo(sections.get("__DSH_R2_PDG%s__" % suffix, "")) \
+            or clean_r2_pseudo(sections.get("__DSH_R2_PDC%s__" % suffix, ""))
+        asm = sections.get("__DSH_R2_ASM%s__" % suffix, "")
+        if pseudo or asm:
+            break
     if not asm and not pseudo:
         asm = "\n".join(line for line in out.splitlines()
-                          if line.strip() not in ("__DSH_R2_PDG__", "__DSH_R2_PDC__", "__DSH_R2_ASM__")).strip()
+                          if not re.fullmatch(r"__DSH_R2_[A-Z0-9_]+__", line.strip())).strip()
     r2_report = {"engine": engine_name, "mode": "function", "target": target, "pseudocode": pseudo[:32768], "disassembly": asm[:32768], "exit_code": code, "stderr": err[:2048]}
     if code != 0:
         r2_report["error"] = f"r2 反编译失败，退出码 {code}。"

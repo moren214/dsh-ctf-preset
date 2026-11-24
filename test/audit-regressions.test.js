@@ -182,6 +182,18 @@ test('Ghidra 反编译契约：返回 image_base 且接受相对地址', async (
   assert.match(source, /rel_s == target_norm/u, 'function 必须同时按绝对地址与相对地址匹配');
 });
 
+test('r2 反编译路径不得给 r2 传 "--"，函数名要按 sym. 前缀回退', async () => {
+  const source = await readFile(new URL('../sandbox-runner.js', import.meta.url), 'utf8');
+  // r2 的 `--` 是"不打开任何文件"，不是选项结束符：传了它 aflj 恒返回 []、pdg 无输出，
+  // 表现成"r2 没有识别到函数"（exit 0），极难从错误信息反推。
+  assert.doesNotMatch(source, /"-c", "aflj", "--"/u, 'r2 调用不能带 --');
+  assert.doesNotMatch(source, /"-c", "[^"]*", "--"/u, 'r2 调用不能带 --');
+  // r2 的 flag 名带 sym. 前缀（pdg @ check_flag 会报 Invalid tmpseek address）。
+  assert.match(source, /candidates\.append\("sym\." \+ target\)/u, '必须按 sym.<name> 回退');
+  assert.match(source, /pdg @ %s/u, '必须实际执行 pdg');
+  assert.match(source, /__DSH_R2_PDG__/u, '多候选输出必须用 section 标记切分');
+});
+
 test('ctf_sandbox 的返回必须带 result_id（零拷贝链路）', async t => {
   const cwd = await mkdtemp(join(tmpdir(), 'ctf-audit-sandbox-'));
   t.after(() => rm(cwd, { recursive: true, force: true, maxRetries: 8, retryDelay: 40 }));

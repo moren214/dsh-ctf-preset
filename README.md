@@ -263,12 +263,13 @@ preset 已声明平台 shell（Windows 为 `pwsh`，其他平台为 `bash`），
 
 ## 变更记录
 
-完整变更与兼容矩阵见 `CHANGELOG.md`（当前 `0.51.0`）。近期摘要：
+完整变更与兼容矩阵见 `CHANGELOG.md`（当前 `0.51.1`）。近期摘要：
 
 - Unreleased：图谱租约拒绝未认领任务直接结案并分页 `ruled_out`；Python 热重载、CRLF Bash 脚本、反编译失败诊断、平台认证探测、只读看板与续接错误分类得到加固；平台附件复用适配器认证，模型扫描截断显示不完整状态。
 
+- 0.51.1 基础镜像恢复 r2/r2ghidra（radare2 5.9.8 真安装并同号锁定，修掉缺 `patch`、`symstall` 悬空、r2ghidra ABI 冲突三个构建缺陷）；修复 r2 反编译把 `--` 当选项结束导致的空函数列表，以及函数名需 `sym.` 前缀回退。
 - 0.51.0 补审计回归用例（PCAP UTC 过滤、GGUF/Safetensors 元数据注入、Ghidra `image_base`、`ctf_sandbox` 的 `result_id`、账本坏行容错）；CI 新增 Python worker 编译与真实容器隔离冒烟；基础镜像按 digest 固定、下载物校验 SHA-256；`check_flag`/`submit_flag` 回报 `corrupted_receipts`。
-- 0.50.0 精简 `ctf_progress` schema（-61%）；`ctf_graph` 新增 `board` 分页/过滤与只读 `export_writeup`；`ctf_arena` 支持 GZCTF `Cookie: GZCTF_Token=` 自动认证、`container extend` 与同分按 `solves` 排优；`browser_session` 新增弹窗自动捕获（`dialogs`）、`evaluate`/`set_cookie`/`set_headers`/`upload_file`；Docker 沙箱加固 `--cap-drop=ALL`/`no-new-privileges`/`read_only_work` 并增补 `bkcrack`/`ffuf`/`sqlmap`/`john`/`tesseract-ocr`/`pyinstxtractor-ng`/`pwninit`；`mobile_apk` 缺失本机工具时自动桥接沙箱；`inspect_media` 新增 `kind: "model"`（Pickle/PyTorch/Safetensors/GGUF/ONNX 静态安全体检）；`crypto_solver` 新增 `ecc_weak`/`padding_oracle`/`hash_ext` 脚手架；回归测试增至 179 项、覆盖率超 70%。
+- 0.50.0 精简 `ctf_progress` schema（-61%）；`ctf_graph` 新增 `board` 分页/过滤与只读 `export_writeup`；`ctf_arena` 支持 GZCTF `Cookie: GZCTF_Token=` 自动认证、`container extend` 与同分按 `solves` 排优；`browser_session` 新增弹窗自动捕获（`dialogs`）、`evaluate`/`set_cookie`/`set_headers`/`upload_file`；Docker 沙箱加固 `--cap-drop=ALL`/`no-new-privileges`/`read_only_work` 并增补 `bkcrack`/`ffuf`/`sqlmap`/`john`/`tesseract-ocr`/`pyinstxtractor-ng`/`pwninit`；`mobile_apk` 缺失本机工具时自动桥接沙箱；`inspect_media` 新增 `kind: "model"`（Pickle/PyTorch/Safetensors/GGUF/ONNX 静态安全体检）；`crypto_solver` 新增 `ecc_weak`/`padding_oracle`/`hash_ext` 脚手架；回归测试增至 180 项、覆盖率超 70%。
 - 0.49.1 加固 `ctf_graph finish_intent` 持有者与终态 Fencing 校验；`ctf_sandbox decompile` 合并 `r2` 单次分析并为 Ghidra 持久化项目缓存；`ctf_doctor` 增加 `tool_tier_sync` 与 `skill_sync` 自检；统一只读 `permission` 与 `EEXIST -> conflict` 错误分类并对齐扩展层文档。
 - 0.49.0 新增工具分层（27 核心 / 45 全量）、`ctf_sandbox` 双层镜像自动路由与 WSL2 兜底、`ctf_graph` 共享图谱与 `dispatch_plan`、`ctf_arena` CTFd/GZCTF 适配、`crypto_solver solve` 零依赖求解、`rev_query` 多架构/PE/`triage`、`gdb_driver` Linux 自动桥接与 `ctf_doctor` 双镜像自检。
 - 0.48.0 `rev_query` 新增函数级 `cfg` 控制流分析（基本块、分支/调用与 RIP 相对数据引用）。

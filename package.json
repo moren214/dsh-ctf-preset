@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-ctf-preset",
-  "version": "0.51.0",
+  "version": "0.51.1",
   "private": true,
   "description": "All-purpose CTF preset with shell, web, subagents and resumable progress for DeepSeek Harness",
   "type": "module",

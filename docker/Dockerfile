@@ -15,6 +15,9 @@ ARG GITHUB_BASE_URL=https://github.com
 ARG GITHUB_RAW_BASE_URL=https://raw.githubusercontent.com
 ARG RUBYGEMS_SOURCE_URL=https://rubygems.org
 ARG RADARE2_VERSION=5.9.8
+# r2ghidra 必须与 radare2 主版本成对锁定：master 跟随 r2 的 ABI 变动（5.9.8 上会撞
+# `RFlagItem has no member named 'addr'` / `r_anal_cc_argloc` 未声明），这里钉同号 tag。
+ARG R2GHIDRA_VERSION=5.9.8
 ARG GEF_VERSION=2025.01
 ARG BKCRACK_VERSION=1.7.1
 ARG FFUF_VERSION=2.1.0
@@ -159,14 +162,28 @@ RUN mkdir -p /opt/gef \
     && echo "${GEF_SHA256}  /opt/gef/gef.py" | sha256sum -c - \
     && echo "source /opt/gef/gef.py" > /root/.gdbinit
 
-# 6. radare2 + r2ghidra 伪 C 反编译引擎（锁定稳定标签，传 --build-arg WITH_R2=0 可跳过）
+# 6a. radare2（`patch` 是 configure 的硬性依赖，缺了会 error: This program is required.）
+#     必须用 `--install` 语义而不是 sys/install.sh 的默认 symstall：symstall 把 /usr/local/bin/r2
+#     软链到构建目录，删掉 /tmp/radare2 后 r2 与 r_core.pc 全部悬空（r2ghidra 会报
+#     `checking pkg-config flags for r_core... no`）。
 RUN if [ "$WITH_R2" = "1" ]; then \
-        apt-get update && apt-get install -y --no-install-recommends cmake ninja-build meson \
+        apt-get update && apt-get install -y --no-install-recommends cmake ninja-build meson patch \
         && rm -rf /var/lib/apt/lists/* \
         && git clone --depth 1 --branch "${RADARE2_VERSION}" "${GITHUB_BASE_URL}/radareorg/radare2" /tmp/radare2 \
-        && /tmp/radare2/sys/install.sh \
-        && r2pm -U && r2pm -ci r2ghidra \
-        && rm -rf /tmp/radare2 /root/.local/share/radare2/r2pm/git \
+        && cd /tmp/radare2 && ./configure --prefix=/usr/local && make -j"$(nproc)" && make install && cd / \
+        && ldconfig && r2 -v | head -1 \
+        && rm -rf /tmp/radare2; \
+    fi
+
+# 6b. r2ghidra 伪 C 反编译插件
+#     必须与 radare2 同号锁定：r2pm 的在线安装取的是 master 分支，在 r2 5.9.8 上会撞
+#     `RFlagItem has no member named 'addr'` / `r_anal_cc_argloc` 未声明（ABI 已变）。
+#     该 tag 只有 Makefile.acr，需先 ./configure 才会生成 Makefile（configure 会向
+#     `r2 -H R2_LIBR_PLUGINS` 查询插件安装目录，因此上一步必须先装好 r2）。
+RUN if [ "$WITH_R2" = "1" ]; then \
+        git clone --depth 1 --branch "${R2GHIDRA_VERSION}" "${GITHUB_BASE_URL}/radareorg/r2ghidra" /tmp/r2ghidra \
+        && cd /tmp/r2ghidra && ./configure && make -j"$(nproc)" && make install \
+        && cd / && rm -rf /tmp/r2ghidra \
         && apt-get purge -y --auto-remove cmake ninja-build meson \
         && rm -rf /var/lib/apt/lists/*; \
     fi

@@ -714,7 +714,12 @@ test('buildDockerArgs 容器加固（cap-drop/no-new-privileges/只读挂载）�
   assert.match(dockerfile, /ARG GITHUB_RAW_BASE_URL=/u);
   assert.match(dockerfile, /ARG RUBYGEMS_SOURCE_URL=/u);
   assert.doesNotMatch(dockerfile, /r2ghidra optional plugin install failed/u);
-  assert.match(dockerfile, /&& r2pm -ci r2ghidra/u);
+  // r2 与 r2ghidra 必须成对锁定，且不能走 `r2pm -ci`（取 master，会撞 r2 的 ABI 变动）。
+  assert.match(dockerfile, /ARG R2GHIDRA_VERSION=/u);
+  assert.doesNotMatch(dockerfile, /r2pm -ci r2ghidra/u);
+  assert.match(dockerfile, /--branch "\$\{R2GHIDRA_VERSION\}"/u);
+  assert.match(dockerfile, /\.\/configure --prefix=\/usr\/local && make -j"\$\(nproc\)" && make install/u);
+  assert.match(dockerfile, /ldconfig && r2 -v/u);
   const heavyDockerfile = await readFile(new URL('../docker/Dockerfile.heavy', import.meta.url), 'utf8');
   assert.match(heavyDockerfile, /USER root[\s\S]*USER 10001:10001/u);
   assert.match(heavyDockerfile, /ARG APT_MIRROR=/u);

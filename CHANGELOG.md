@@ -1,5 +1,11 @@
 # 变更记录
 
+## 0.51.1
+
+- **基础镜像恢复 r2/r2ghidra**：`WITH_R2=1`（默认值）此前从未真正构建成功，三个独立缺陷叠加：缺 `patch`（radare2 的 `configure` 直接 `error: This program is required.`）、`sys/install.sh` 默认 `symstall` 在清理构建目录后让 `/usr/local/bin/r2` 与 `r_core.pc` 全部悬空、r2ghidra 取 master 与 r2 5.9.8 的 ABI 冲突（`RFlagItem` 无 `addr` 成员）。现改为 6a/6b 两层：radare2 走 `./configure --prefix=/usr/local && make -j && make install` + `ldconfig`，r2ghidra 按同号 tag `R2GHIDRA_VERSION=5.9.8` 克隆后 `./configure && make -j && make install`。
+- **r2 反编译两处静默失败**：`sandbox-runner.js` 曾把 `--` 放在二进制之前，而 r2 的 `--` 语义是"不打开任何文件"（不是选项结束符），于是 `aflj` 恒返回 `[]`、base profile 报"r2 没有识别到函数"且 exit 0；函数模式又直接拼 `pdg @ check_flag`，而 r2 的 flag 名带 `sym.` 前缀，报 `ERROR: Invalid tmpseek address`。现按 `sym.<name>` 候选回退，并用 `__DSH_R2_PDG*__` section 标记逐个尝试，两个缺陷各有回归断言。
+- 回归测试 179 → 180 项。
+
 ## 0.51.0
 
 - **审计回归与可复现构建**：新增 `test/audit-regressions.test.js` 锁定本轮修复的六处缺陷（PCAP 按 UTC 时间过滤、GGUF 字符串数组模板注入、Safetensors `__metadata__` 模板注入、Ghidra `image_base`/相对地址契约、`ctf_sandbox` 的 `result_id` 链路、提交账本坏行容错）；CI 增加 Python worker 编译检查与真实容器隔离冒烟；`docker/Dockerfile` 的基础镜像改为按 digest 固定，`bkcrack`/`ffuf`/`pwninit`/`gef` 与 `Dockerfile.heavy` 的 `ghidra`/`jadx`/`apktool` 均校验 SHA-256。
@@ -203,7 +209,7 @@
 
 | 插件版本 | DSH 版本 | 说明 |
 |---|---|---|
-| 0.51.x | `>=0.2.2-rc.5 <0.3.0` | 当前版本。补审计回归用例、CI 容器冒烟与镜像 digest/SHA-256 锁定，提交账本坏行可见。 |
+| 0.51.x | `>=0.2.2-rc.5 <0.3.0` | 当前版本。补审计回归用例、CI 容器冒烟与镜像 digest/SHA-256 锁定，提交账本坏行可见；基础镜像恢复 r2/r2ghidra 并修好 r2 反编译调用。 |
 | 0.50.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。保持 Core Tier（27 核心 / 45 全量）；精简 `ctf_progress` schema、新增 `ctf_graph` 分页/`export_writeup`、`ctf_arena` GZCTF Cookie/续期/solves 排优、`browser_session` Web 进阶、Docker 加固与 `bkcrack`/`ffuf`/`sqlmap` 等兵器、`mobile_apk` 沙箱桥接、`inspect_media(kind: "model")` 及 3 个密码学脚手架。 |
 | 0.49.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。默认 Core Tier（27 工具，`enableExtendedAudit: true` 恢复全部 45 工具）；新增 `ctf_sandbox`（双层镜像自动路由/WSL2 兜底）、`ctf_graph`、`ctf_arena` 与 `crypto_solver solve`。 |
 | 0.48.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。函数级 Rev 控制流分析，以及 ZIP 候选检查、文件片段复读和压缩附件链路需要对应工具及宿主能力。 |
