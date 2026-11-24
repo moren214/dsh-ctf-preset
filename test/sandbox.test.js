@@ -7,6 +7,7 @@ import test from 'node:test';
 import { apply } from '../ctf-tools.js';
 import {
   analyzeSandboxNeed,
+  buildDockerArgs,
   chooseWslDistro,
   clearSandboxCache,
   DECOMPILE_SCRIPT,
@@ -541,5 +542,59 @@ test('DECOMPILE_SCRIPT：r2 单次进程分析回退 pdc，Ghidra 按二进制 S
     assert.ok(ghCalls[2].includes('-import'));
   } finally {
     await rm(workDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 120 });
+  }
+});
+
+test('buildDockerArgs 容器加固（cap-drop/no-new-privileges/只读挂载）与 Dockerfile 兵器库版本锁定', async () => {
+  const baseArgs = buildDockerArgs(['id'], {
+    cwd: '/tmp/ws',
+    containerName: 'dsh-test-base',
+    targetImage: 'dsh-ctf-sandbox:latest',
+    readOnlyWork: true,
+    network: 'none',
+    ptrace: false,
+    isHeavy: false,
+  });
+  assert.ok(baseArgs.includes('--cap-drop=ALL'));
+  assert.ok(baseArgs.includes('--security-opt=no-new-privileges:true'));
+  assert.equal(baseArgs[baseArgs.indexOf('--network') + 1], 'none');
+  assert.ok(baseArgs.includes('/tmp/ws:/work:ro'));
+  assert.ok(!baseArgs.includes('--cap-add=SYS_PTRACE'));
+  assert.ok(baseArgs.includes('--memory=2g'));
+
+  const heavyPwnArgs = buildDockerArgs(['gdb', '--version'], {
+    cwd: '/tmp/ws',
+    containerName: 'dsh-test-heavy',
+    targetImage: 'dsh-ctf-sandbox:heavy',
+    readOnlyWork: false,
+    network: 'bridge',
+    ptrace: true,
+    isHeavy: true,
+  });
+  assert.ok(heavyPwnArgs.includes('--cap-drop=ALL'));
+  assert.ok(heavyPwnArgs.includes('--cap-add=SYS_PTRACE'));
+  assert.equal(heavyPwnArgs[heavyPwnArgs.indexOf('--network') + 1], 'bridge');
+  assert.ok(heavyPwnArgs.includes('/tmp/ws:/work'));
+  assert.ok(heavyPwnArgs.includes('--memory=4g'));
+
+  // 新增高频 CLI 识别
+  for (const cmd of ['bkcrack -C a.zip -c f.txt -p plain', 'ffuf -u http://x/FUZZ', 'sqlmap -u http://x', 'john hash.txt', 'tesseract img.png stdout', 'pyinstxtractor-ng app.exe', 'pwninit']) {
+    assert.equal(analyzeSandboxNeed({ action: 'exec', command: cmd }).preferDocker, true, `should route to sandbox: ${cmd}`);
+  }
+
+  // 非布尔 read_only_work 拒绝
+  await assert.rejects(
+    runSandbox({ action: 'exec', command: 'id', read_only_work: 'yes' }, { cwd: process.cwd(), writable: true, config: {} }),
+    error => error.kind === 'unsupported',
+  );
+
+  // Dockerfile 版本锁定与新增工具校验
+  const dockerfile = await readFile(new URL('../docker/Dockerfile', import.meta.url), 'utf8');
+  for (const token of [
+    'ARG RADARE2_VERSION=', 'ARG GEF_VERSION=', 'ARG BKCRACK_VERSION=',
+    'ARG FFUF_VERSION=', 'ARG PWNINIT_VERSION=',
+    'tesseract-ocr', 'john', 'sqlmap', 'pyinstxtractor-ng', 'bkcrack', 'ffuf', 'pwninit',
+  ]) {
+    assert.ok(dockerfile.includes(token), `docker/Dockerfile 应包含 ${token}`);
   }
 });

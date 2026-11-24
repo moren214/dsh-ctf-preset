@@ -4,8 +4,10 @@ import hashlib
 import base64
 import io
 import json
+import pickletools
 import re
 import sqlite3
+import struct
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
@@ -551,6 +553,613 @@ def read_qr(data):
     }
 
 
+RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
+HIGH_RISK_MODULES = {
+    "os", "posix", "nt", "subprocess", "pty", "commands", "popen2", "shutil",
+    "sys", "ctypes", "marshal", "webbrowser", "socket", "http", "http.client",
+    "urllib", "urllib.request", "ftplib", "telnetlib", "smtplib", "pickle",
+    "_pickle", "cPickle", "importlib", "runpy", "code", "codeop", "timeit",
+    "bdb", "pdb", "doctest", "cProfile", "profile", "xmlrpc", "xmlrpc.client",
+    "ssl", "asyncio", "multiprocessing", "threading",
+}
+HIGH_RISK_CALLABLES = {
+    ("builtins", "eval"), ("builtins", "exec"), ("builtins", "__import__"),
+    ("builtins", "compile"), ("builtins", "open"), ("builtins", "getattr"),
+    ("builtins", "setattr"), ("builtins", "delattr"), ("builtins", "globals"),
+    ("builtins", "locals"), ("builtins", "breakpoint"),
+    ("__builtin__", "eval"), ("__builtin__", "exec"), ("__builtin__", "__import__"),
+    ("__builtin__", "compile"), ("__builtin__", "open"), ("__builtin__", "getattr"),
+    ("__builtin__", "setattr"),
+    ("operator", "attrgetter"), ("operator", "methodcaller"), ("operator", "itemgetter"),
+    ("types", "FunctionType"), ("types", "CodeType"), ("functools", "partial"),
+    ("torch.serialization", "load"), ("torch.jit", "load"), ("torch", "load"),
+    ("numpy", "load"), ("joblib", "load"), ("dill", "loads"), ("cloudpickle", "loads"),
+}
+BENIGN_MODULES = {
+    "collections", "torch", "torch._utils", "torch.storage", "torch.nn",
+    "torch.nn.modules", "torch.nn.parameter", "numpy", "numpy.core.multiarray",
+    "numpy._core.multiarray", "numpy.dtype", "copyreg", "copy_reg",
+    "datetime", "decimal", "fractions", "re",
+}
+BENIGN_BUILTINS = {
+    "object", "set", "frozenset", "slice", "bytes", "bytearray", "complex",
+    "range", "dict", "list", "tuple", "str", "int", "float", "bool",
+}
+SUSPICIOUS_CODE_PATTERNS = (
+    (re.compile(r"\b(?:os\.system|os\.popen|subprocess|__import__|eval|exec|compile)\s*\("), "high", "dangerous_call"),
+    (re.compile(r"\b(?:socket|urllib|http\.client|requests|ctypes|marshal)\b"), "high", "suspicious_import"),
+    (re.compile(r"\bopen\s*\("), "medium", "file_access"),
+)
+
+
+def max_risk(current, candidate):
+    return candidate if RISK_ORDER.get(candidate, 0) > RISK_ORDER.get(current, 0) else current
+
+
+def classify_pickle_global(module, name):
+    base_mod = module.split(".", 1)[0]
+    if module in HIGH_RISK_MODULES or base_mod in HIGH_RISK_MODULES or (module, name) in HIGH_RISK_CALLABLES:
+        return "high"
+    if module in ("builtins", "__builtin__"):
+        return "low" if name in BENIGN_BUILTINS else "medium"
+    if module in BENIGN_MODULES or base_mod in ("torch", "numpy", "collections"):
+        return "low"
+    return "medium"
+
+
+def scan_pickle_bytes(data, max_ops=200000):
+    mark = object()
+    stack = []
+    memo = {}
+    globals_seen = []
+    globals_keys = set()
+    findings = []
+    strings = []
+    strings_seen = set()
+    call_ops = {}
+    protocol = 0
+    op_count = 0
+    saw_stop = False
+    stop_pos = None
+    truncated = False
+    parse_error = None
+    risk = "low"
+
+    def record_global(mod, name, opcode, pos):
+        nonlocal risk
+        level = classify_pickle_global(mod, name)
+        key = (mod, name)
+        if key not in globals_keys and len(globals_seen) < 64:
+            globals_keys.add(key)
+            globals_seen.append({"module": mod, "name": name, "risk": level, "opcode": opcode, "offset": pos})
+        if level != "low" and len(findings) < 64:
+            findings.append({
+                "severity": level, "kind": "pickle_global", "opcode": opcode,
+                "offset": pos, "target": f"{mod}.{name}",
+            })
+        risk = max_risk(risk, level)
+
+    def push_str(value):
+        stack.append(value)
+        if isinstance(value, str) and 4 <= len(value) <= 4096 and value not in strings_seen and len(strings) < 32:
+            if all(ch.isprintable() or ch in "\t\r\n" for ch in value[:128]):
+                strings_seen.add(value)
+                strings.append(value[:200])
+
+    try:
+        for op, arg, pos in pickletools.genops(data):
+            op_count += 1
+            if op_count > max_ops:
+                truncated = True
+                break
+            name = op.name
+            if name == "PROTO":
+                protocol = int(arg)
+            elif name in ("SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8", "UNICODE", "STRING", "BINSTRING", "SHORT_BINSTRING"):
+                push_str(arg if isinstance(arg, str) else str(arg))
+            elif name in ("SHORT_BINBYTES", "BINBYTES", "BINBYTES8", "BYTEARRAY8"):
+                stack.append("<bytes>")
+            elif name in ("INT", "BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "FLOAT", "BINFLOAT", "NONE", "NEWTRUE", "NEWFALSE"):
+                stack.append(arg)
+            elif name in ("EMPTY_LIST", "EMPTY_DICT", "EMPTY_TUPLE", "EMPTY_SET"):
+                stack.append(None)
+            elif name == "MARK":
+                stack.append(mark)
+            elif name == "POP":
+                if stack:
+                    stack.pop()
+            elif name == "POP_MARK":
+                while stack and stack.pop() is not mark:
+                    pass
+            elif name == "DUP":
+                if stack:
+                    stack.append(stack[-1])
+            elif name == "MEMOIZE":
+                memo[len(memo)] = stack[-1] if stack else None
+            elif name in ("PUT", "BINPUT", "LONG_BINPUT"):
+                memo[arg] = stack[-1] if stack else None
+            elif name in ("GET", "BINGET", "LONG_BINGET"):
+                stack.append(memo.get(arg))
+            elif name in ("TUPLE", "LIST", "DICT", "FROZENSET"):
+                while stack and stack.pop() is not mark:
+                    pass
+                stack.append(None)
+            elif name in ("TUPLE1", "TUPLE2", "TUPLE3"):
+                n = int(name[-1])
+                del stack[-n:]
+                stack.append(None)
+            elif name in ("GLOBAL", "INST"):
+                raw = str(arg)
+                parts = raw.split(" ", 1)
+                mod = parts[0]
+                attr = parts[1] if len(parts) > 1 else ""
+                record_global(mod, attr, name, pos)
+                if name == "INST":
+                    call_ops[name] = call_ops.get(name, 0) + 1
+                    while stack and stack.pop() is not mark:
+                        pass
+                stack.append(("GLOBAL", mod, attr))
+            elif name == "STACK_GLOBAL":
+                attr = stack.pop() if stack else None
+                mod = stack.pop() if stack else None
+                if isinstance(mod, str) and isinstance(attr, str):
+                    record_global(mod, attr, name, pos)
+                    stack.append(("GLOBAL", mod, attr))
+                else:
+                    risk = max_risk(risk, "medium")
+                    if len(findings) < 64:
+                        findings.append({
+                            "severity": "medium", "kind": "dynamic_stack_global",
+                            "opcode": name, "offset": pos,
+                            "detail": "STACK_GLOBAL 使用了非常量/动态栈顶符号。",
+                        })
+                    stack.append(("GLOBAL", "<dynamic>", "<dynamic>"))
+            elif name in ("EXT1", "EXT2", "EXT4"):
+                risk = max_risk(risk, "medium")
+                if len(findings) < 64:
+                    findings.append({
+                        "severity": "medium", "kind": "pickle_extension",
+                        "opcode": name, "offset": pos, "code": int(arg),
+                    })
+                stack.append(None)
+            elif name in ("REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "BUILD"):
+                call_ops[name] = call_ops.get(name, 0) + 1
+                if name == "REDUCE":
+                    if len(stack) >= 2:
+                        stack.pop()
+                        callee = stack.pop()
+                        if isinstance(callee, tuple) and len(callee) == 3 and callee[0] == "GLOBAL":
+                            if classify_pickle_global(callee[1], callee[2]) == "high" and len(findings) < 64:
+                                findings.append({
+                                    "severity": "high", "kind": "pickle_reduce_call",
+                                    "opcode": name, "offset": pos, "target": f"{callee[1]}.{callee[2]}",
+                                })
+                    stack.append(None)
+                elif name == "OBJ":
+                    while stack and stack.pop() is not mark:
+                        pass
+                    stack.append(None)
+                elif name == "NEWOBJ_EX":
+                    del stack[-3:]
+                    stack.append(None)
+                else:
+                    del stack[-2:]
+                    stack.append(None)
+            elif name == "STOP":
+                saw_stop = True
+                stop_pos = pos + 1
+                break
+    except Exception as exc:
+        parse_error = str(exc)[:200]
+
+    trailing = max(0, len(data) - stop_pos) if saw_stop and stop_pos is not None else 0
+    if trailing > 0:
+        risk = max_risk(risk, "medium")
+        if len(findings) < 64:
+            findings.append({
+                "severity": "medium", "kind": "trailing_bytes",
+                "offset": stop_pos, "byte_length": trailing,
+            })
+
+    return {
+        "protocol": protocol,
+        "op_count": op_count,
+        "op_truncated": truncated,
+        "saw_stop": saw_stop,
+        "trailing_bytes": trailing,
+        "risk_level": risk,
+        "call_ops": call_ops,
+        "globals": globals_seen,
+        "findings": findings,
+        "string_samples": strings,
+        **({"parse_error": parse_error} if parse_error else {}),
+    }
+
+
+def try_inspect_safetensors(data):
+    if len(data) < 10:
+        return None
+    header_len = struct.unpack("<Q", data[:8])[0]
+    if header_len < 2 or header_len > 4 * 1024 * 1024 or 8 + header_len > len(data):
+        return None
+    if data[8:9] != b"{":
+        return None
+    try:
+        header = json.loads(data[8:8 + header_len].decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(header, dict):
+        return None
+    tensors = []
+    max_data_end = 0
+    raw_meta = header.get("__metadata__")
+    if raw_meta is not None and not isinstance(raw_meta, dict):
+        return None
+    tensor_items = [(k, v) for k, v in header.items() if k != "__metadata__"]
+    if not tensor_items and raw_meta is None:
+        return None
+    for name, info in tensor_items:
+        if not isinstance(info, dict) or "dtype" not in info or "shape" not in info or "data_offsets" not in info:
+            return None
+        offsets = info["data_offsets"]
+        if not isinstance(offsets, list) or len(offsets) != 2 or not all(isinstance(v, int) and v >= 0 for v in offsets):
+            return None
+        if offsets[1] > max_data_end:
+            max_data_end = offsets[1]
+        if len(tensors) < 64:
+            tensors.append({"name": str(name)[:256], "dtype": str(info["dtype"]), "shape": info["shape"], "data_offsets": offsets})
+    metadata = {}
+    if isinstance(raw_meta, dict):
+        for k, v in list(raw_meta.items())[:64]:
+            metadata[str(k)[:128]] = str(v)[:1024]
+    expected_end = 8 + header_len + max_data_end
+    trailing = max(0, len(data) - expected_end)
+    findings = []
+    risk = "low"
+    if trailing > 0:
+        risk = "medium"
+        findings.append({"severity": "medium", "kind": "trailing_bytes", "offset": expected_end, "byte_length": trailing})
+    return {
+        "status": "ok",
+        "format": "safetensors",
+        "byte_length": len(data),
+        "header_length": header_len,
+        "metadata": metadata,
+        "tensor_count": len(tensor_items),
+        "tensors": tensors,
+        "tensors_truncated": len(tensor_items) > 64,
+        "trailing_bytes": trailing,
+        "risk_level": risk,
+        "findings": findings,
+    }
+
+
+GGUF_SCALAR = {
+    0: ("uint8", "<B", 1), 1: ("int8", "<b", 1),
+    2: ("uint16", "<H", 2), 3: ("int16", "<h", 2),
+    4: ("uint32", "<I", 4), 5: ("int32", "<i", 4),
+    6: ("float32", "<f", 4), 7: ("bool", "<?", 1),
+    10: ("uint64", "<Q", 8), 11: ("int64", "<q", 8),
+    12: ("float64", "<d", 8),
+}
+
+
+def try_inspect_gguf(data):
+    if len(data) < 24 or data[:4] != b"GGUF":
+        return None
+    version = struct.unpack("<I", data[4:8])[0]
+    if version < 1 or version > 10:
+        return None
+    if version == 1:
+        tensor_count, kv_count = struct.unpack("<II", data[8:16])
+        pos = 16
+    else:
+        tensor_count, kv_count = struct.unpack("<QQ", data[8:24])
+        pos = 24
+
+    def read_u64(offset):
+        if offset + 8 > len(data):
+            raise EOFError()
+        return struct.unpack("<Q", data[offset:offset + 8])[0], offset + 8
+
+    def read_u32(offset):
+        if offset + 4 > len(data):
+            raise EOFError()
+        return struct.unpack("<I", data[offset:offset + 4])[0], offset + 4
+
+    def read_str(offset):
+        length, offset = read_u64(offset)
+        if length > 16 * 1024 * 1024 or offset + length > len(data):
+            raise EOFError()
+        raw = data[offset:offset + length]
+        return raw[:1024].decode("utf-8", errors="replace"), offset + length
+
+    def read_value(vtype, offset):
+        if vtype in GGUF_SCALAR:
+            _, fmt, size = GGUF_SCALAR[vtype]
+            if offset + size > len(data):
+                raise EOFError()
+            val = struct.unpack(fmt, data[offset:offset + size])[0]
+            return val, offset + size
+        if vtype == 8:
+            return read_str(offset)
+        if vtype == 9:
+            elem_type, offset = read_u32(offset)
+            count, offset = read_u64(offset)
+            if count > 10_000_000:
+                raise EOFError()
+            preview = []
+            if elem_type in GGUF_SCALAR:
+                ename, fmt, size = GGUF_SCALAR[elem_type]
+                byte_span = count * size
+                if offset + byte_span > len(data):
+                    raise EOFError()
+                for idx in range(min(count, 8)):
+                    preview.append(struct.unpack(fmt, data[offset + idx * size:offset + (idx + 1) * size])[0])
+                return {"type": "array", "element_type": ename, "count": count, "preview": preview}, offset + byte_span
+            if elem_type == 8:
+                if count > 65536:
+                    raise EOFError()
+                for idx in range(count):
+                    item, offset = read_str(offset)
+                    if idx < 8:
+                        preview.append(item[:128])
+                return {"type": "array", "element_type": "string", "count": count, "preview": preview}, offset
+            raise EOFError()
+        raise EOFError()
+
+    metadata = {}
+    parse_truncated = False
+    limit = min(kv_count, 64)
+    try:
+        for _ in range(limit):
+            key, pos = read_str(pos)
+            vtype, pos = read_u32(pos)
+            val, pos = read_value(vtype, pos)
+            metadata[key[:128]] = val
+    except EOFError:
+        parse_truncated = True
+
+    findings = []
+    risk = "low"
+    for key, val in metadata.items():
+        if isinstance(val, str) and ("chat_template" in key or "{{" in val or "os.system" in val):
+            if any(tok in val for tok in ("__class__", "__subclasses__", "popen", "os.system", "lipsum", "cycler")):
+                risk = "high"
+                findings.append({"severity": "high", "kind": "suspicious_metadata_template", "key": key})
+    return {
+        "status": "ok",
+        "format": "gguf",
+        "version": version,
+        "byte_length": len(data),
+        "tensor_count": tensor_count,
+        "metadata_kv_count": kv_count,
+        "metadata": metadata,
+        "metadata_truncated": kv_count > 64 or parse_truncated,
+        "risk_level": risk,
+        "findings": findings,
+    }
+
+
+def try_inspect_pytorch_zip(data):
+    if len(data) < 22 or data[:4] not in (b"PK\x03\x04", b"PK\x05\x06"):
+        return None
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data), "r")
+    except Exception:
+        return None
+    with zf:
+        infos = zf.infolist()
+        names = [info.filename for info in infos]
+        is_pytorch = any(
+            name.endswith(".pkl") or name.endswith("/data.pkl") or name == "data.pkl"
+            or name.endswith("/version") or "/code/" in name or name.startswith("code/")
+            for name in names
+        )
+        if not is_pytorch:
+            return None
+        entries = [
+            {"name": info.filename, "size": info.file_size, "compressed_size": info.compress_size}
+            for info in infos[:64]
+        ]
+        risk = "low"
+        findings = []
+        pickle_members = []
+        code_files = []
+        for info in infos:
+            if info.is_dir():
+                continue
+            if info.filename.endswith(".pkl") and len(pickle_members) < 8:
+                if info.file_size > 8 * 1024 * 1024:
+                    findings.append({"severity": "medium", "kind": "oversized_pickle_member", "member": info.filename, "size": info.file_size})
+                    risk = max_risk(risk, "medium")
+                    continue
+                member_bytes = zf.read(info)
+                scan = scan_pickle_bytes(member_bytes)
+                risk = max_risk(risk, scan["risk_level"])
+                for item in scan["findings"]:
+                    if len(findings) < 64:
+                        findings.append({**item, "member": info.filename})
+                pickle_members.append({"member": info.filename, "size": len(member_bytes), **scan})
+            elif info.filename.endswith(".py") and len(code_files) < 8:
+                if info.file_size <= 256 * 1024:
+                    text = zf.read(info).decode("utf-8", errors="replace")
+                    code_files.append({"member": info.filename, "size": info.file_size, "preview": text[:1024], "truncated": len(text) > 1024})
+                    for pattern, level, kind in SUSPICIOUS_CODE_PATTERNS:
+                        if pattern.search(text):
+                            risk = max_risk(risk, level)
+                            if len(findings) < 64:
+                                findings.append({"severity": level, "kind": kind, "member": info.filename})
+        return {
+            "status": "ok",
+            "format": "pytorch_zip",
+            "byte_length": len(data),
+            "entry_count": len(infos),
+            "entries": entries,
+            "entries_truncated": len(infos) > 64,
+            "pickle_members": pickle_members,
+            "code_files": code_files,
+            "risk_level": risk,
+            "findings": findings,
+        }
+
+
+def try_inspect_onnx(data):
+    if len(data) < 6:
+        return None
+    pos = 0
+    end = min(len(data), 1024 * 1024)
+    ir_version = None
+    model_version = None
+    producer_name = None
+    producer_version = None
+    domain = None
+    doc_string = None
+    has_graph = False
+    opset_domains = []
+    metadata_props = {}
+    valid_fields = 0
+
+    def read_varint(buf, offset):
+        shift = 0
+        result = 0
+        while offset < len(buf) and shift <= 63:
+            b = buf[offset]
+            offset += 1
+            result |= (b & 0x7F) << shift
+            if not (b & 0x80):
+                return result, offset
+            shift += 7
+        raise ValueError("bad varint")
+
+    try:
+        while pos < end and valid_fields < 256:
+            tag, pos = read_varint(data, pos)
+            field_no = tag >> 3
+            wire = tag & 7
+            if field_no == 0 or field_no > 32:
+                return None
+            if wire == 0:
+                val, pos = read_varint(data, pos)
+                if field_no == 1 and 1 <= val <= 32:
+                    ir_version = val
+                    valid_fields += 1
+                elif field_no == 5:
+                    model_version = val
+                    valid_fields += 1
+                else:
+                    return None
+            elif wire == 2:
+                length, pos = read_varint(data, pos)
+                if length > len(data) - pos:
+                    return None
+                chunk = data[pos:pos + length]
+                pos += length
+                if field_no == 2:
+                    producer_name = chunk[:256].decode("utf-8")
+                    valid_fields += 1
+                elif field_no == 3:
+                    producer_version = chunk[:256].decode("utf-8")
+                    valid_fields += 1
+                elif field_no == 4:
+                    domain = chunk[:256].decode("utf-8")
+                    valid_fields += 1
+                elif field_no == 6:
+                    doc_string = chunk[:512].decode("utf-8", errors="replace")
+                    valid_fields += 1
+                elif field_no == 7:
+                    has_graph = True
+                    valid_fields += 1
+                elif field_no == 8:
+                    opset_domains.append(chunk[:128].decode("utf-8", errors="replace"))
+                    valid_fields += 1
+                elif field_no == 14:
+                    valid_fields += 1
+                    p2 = 0
+                    mk = mv = None
+                    while p2 < len(chunk):
+                        t2, p2 = read_varint(chunk, p2)
+                        if (t2 & 7) != 2:
+                            break
+                        l2, p2 = read_varint(chunk, p2)
+                        if p2 + l2 > len(chunk):
+                            break
+                        s2 = chunk[p2:p2 + l2].decode("utf-8", errors="replace")
+                        p2 += l2
+                        if (t2 >> 3) == 1:
+                            mk = s2[:128]
+                        elif (t2 >> 3) == 2:
+                            mv = s2[:512]
+                    if mk and len(metadata_props) < 32:
+                        metadata_props[mk] = mv or ""
+                else:
+                    valid_fields += 1
+            elif wire == 1:
+                if pos + 8 > len(data):
+                    return None
+                pos += 8
+            elif wire == 5:
+                if pos + 4 > len(data):
+                    return None
+                pos += 4
+            else:
+                return None
+    except Exception:
+        return None
+
+    if ir_version is None or (not has_graph and producer_name is None and not opset_domains):
+        return None
+
+    findings = []
+    risk = "low"
+    if domain and domain not in ("", "ai.onnx", "ai.onnx.ml", "ai.onnx.preview.training"):
+        risk = "medium"
+        findings.append({"severity": "medium", "kind": "custom_onnx_domain", "domain": domain})
+    ext_hits = re.findall(rb"(?:\.\.[\\/]|/etc/|[A-Za-z]:\\)[\x20-\x7e]{1,120}", data[:2 * 1024 * 1024])
+    for hit in ext_hits[:8]:
+        risk = "high"
+        findings.append({"severity": "high", "kind": "suspicious_external_path", "sample": hit.decode("utf-8", errors="replace")})
+    return {
+        "status": "ok",
+        "format": "onnx",
+        "byte_length": len(data),
+        "ir_version": ir_version,
+        **({"model_version": model_version} if model_version is not None else {}),
+        **({"producer_name": producer_name} if producer_name is not None else {}),
+        **({"producer_version": producer_version} if producer_version is not None else {}),
+        **({"domain": domain} if domain is not None else {}),
+        **({"doc_string": doc_string} if doc_string is not None else {}),
+        "has_graph": has_graph,
+        "opset_count": len(opset_domains),
+        "metadata_props": metadata_props,
+        "risk_level": risk,
+        "findings": findings,
+    }
+
+
+def inspect_model(data):
+    if not data:
+        raise InvalidMedia("模型文件为空。")
+    for inspector in (try_inspect_gguf, try_inspect_safetensors, try_inspect_pytorch_zip):
+        report = inspector(data)
+        if report is not None:
+            return report
+    # Raw pickle: protocol 2..5 starts with \x80\x02..\x80\x05; protocol 0/1 validated by STOP + opcodes.
+    looks_proto = len(data) >= 2 and data[0] == 0x80 and 2 <= data[1] <= 5
+    pickle_scan = scan_pickle_bytes(data)
+    if looks_proto or (pickle_scan["saw_stop"] and pickle_scan["op_count"] >= 2 and not pickle_scan.get("parse_error")):
+        return {
+            "status": "ok",
+            "format": "pickle",
+            "byte_length": len(data),
+            **pickle_scan,
+        }
+    onnx_report = try_inspect_onnx(data)
+    if onnx_report is not None:
+        return onnx_report
+    raise InvalidMedia("无法识别为受支持的 AI 模型或 Pickle 格式（支持 safetensors/gguf/pytorch_zip/pickle/onnx）。")
+
+
 def main():
     request = json.loads(sys.argv[1])
     data = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
@@ -568,6 +1177,8 @@ def main():
             report = read_sqlite(data, request)
         elif kind == "office":
             report = read_office(data, request)
+        elif kind == "model":
+            report = inspect_model(data)
         else:
             report = read_qr(data)
     except MissingDependency as error:

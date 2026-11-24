@@ -14,7 +14,7 @@ const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_COMMAND_CHARS = 4096;
 const SCRIPT_PREVIEW_BYTES = 8192;
 const DETECT_CACHE_TTL_MS = 30000;
-const FULL_ARSENAL_PATTERN = /\b(?:ROPgadget|ropper|seccomp-tools|one_gadget|pwntools|pwn|z3|sympy|gmpy2|fpylll|capstone|angr|sage|sagemath|binwalk|steghide|tshark|radare2|r2|rizin|analyzeHeadless|ghidra|jadx|apktool|Crypto|upx|gdb-multiarch|qemu-[a-z0-9_]+|zsteg|exiftool|pngcheck|zbarimg|sox|ffmpeg|vol3?|volatility3|php|socat|wasm2wat|wasm-objdump|wasm-decompile|fls|icat|mmls|cpio|scapy|scipy|xdis)\b/u;
+const FULL_ARSENAL_PATTERN = /\b(?:ROPgadget|ropper|seccomp-tools|one_gadget|pwntools|pwn|pwninit|z3|sympy|gmpy2|fpylll|capstone|angr|sage|sagemath|binwalk|steghide|tshark|radare2|r2|rizin|analyzeHeadless|ghidra|jadx|apktool|Crypto|upx|gdb-multiarch|qemu-[a-z0-9_]+|zsteg|exiftool|pngcheck|zbarimg|sox|ffmpeg|vol3?|volatility3|php|socat|wasm2wat|wasm-objdump|wasm-decompile|fls|icat|mmls|cpio|scapy|scipy|xdis|bkcrack|ffuf|sqlmap|john|tesseract|pyinstxtractor)\b/u;
 const HEAVY_ARSENAL_PATTERN = /\b(?:analyzeHeadless|ghidra|angr|jadx|apktool|sage|sagemath)\b/u;
 const HEAVY_SCRIPT_IMPORT_PATTERN = /(?:^|\r?\n)\s*(?:import\s+(?:angr|cle|claripy|pyvex|archinfo|sage)\b|from\s+(?:angr|cle|claripy|pyvex|archinfo|sage)(?:\.|\s)|\b(?:analyzeHeadless|jadx|apktool)\b)/u;
 const APK_WORKLOAD_PATTERN = /\.(?:apk|dex|smali|aab)(?:["'\s]|$)/iu;
@@ -34,6 +34,7 @@ export const SANDBOX_PROPERTIES = {
   function: { type: 'string', maxLength: 256, description: 'decompile 函数名或 0x 地址；省略列函数表。' },
   network: { type: 'string', enum: ['none', 'bridge'], default: 'none' },
   ptrace: { type: 'boolean', default: false },
+  read_only_work: { type: 'boolean', default: false, description: 'Docker 后端以只读方式挂载 /work（跑陌生程序防篡改工作区）。' },
   allow_exec: { type: 'boolean', default: false, description: 'pwn_triage 是否运行 seccomp-tools dump。' },
   timeout_ms: { type: 'integer', minimum: MIN_TIMEOUT_MS, maximum: MAX_TIMEOUT_MS, default: DEFAULT_TIMEOUT_MS },
 };
@@ -370,7 +371,24 @@ export async function detectSandbox(config = {}, signal, { fresh = false } = {})
   return value;
 }
 
-export async function runSandboxCommand(argv, { cwd, config = {}, signal, timeoutMs = DEFAULT_TIMEOUT_MS, network = 'none', ptrace = false, detected, image, profile = 'base' } = {}) {
+export function buildDockerArgs(argv, { cwd, containerName, targetImage, isHeavy = false, network = 'none', ptrace = false, readOnlyWork = false }) {
+  return [
+    'run', '--rm', '--init', '--name', containerName,
+    '--cap-drop=ALL',
+    '--security-opt=no-new-privileges:true',
+    `--pids-limit=${isHeavy ? 512 : 256}`,
+    `--memory=${isHeavy ? '4g' : '2g'}`,
+    '--cpus=2',
+    '--network', network === 'bridge' ? 'bridge' : 'none',
+    ...(ptrace ? ['--cap-add=SYS_PTRACE'] : []),
+    '-v', `${cwd}:/work${readOnlyWork ? ':ro' : ''}`,
+    '-w', '/work',
+    targetImage,
+    ...argv,
+  ];
+}
+
+export async function runSandboxCommand(argv, { cwd, config = {}, signal, timeoutMs = DEFAULT_TIMEOUT_MS, network = 'none', ptrace = false, readOnlyWork = false, detected, image, profile = 'base' } = {}) {
   const env = detected ?? await detectSandbox(config, signal);
   if (!env.available) {
     throw new ToolError('dependency',
@@ -381,18 +399,7 @@ export async function runSandboxCommand(argv, { cwd, config = {}, signal, timeou
     const targetImage = image ?? env.image;
     const isHeavy = profile === 'heavy' || /:heavy$/iu.test(targetImage ?? '');
     const containerName = 'dsh-ctf-' + randomUUID().slice(0, 12);
-    const dockerArgs = [
-      'run', '--rm', '--init', '--name', containerName,
-      `--pids-limit=${isHeavy ? 512 : 256}`,
-      `--memory=${isHeavy ? '4g' : '2g'}`,
-      '--cpus=2',
-      '--network', network === 'bridge' ? 'bridge' : 'none',
-      ...(ptrace ? ['--cap-add=SYS_PTRACE'] : []),
-      '-v', `${cwd}:/work`,
-      '-w', '/work',
-      targetImage,
-      ...argv,
-    ];
+    const dockerArgs = buildDockerArgs(argv, { cwd, containerName, targetImage, isHeavy, network, ptrace, readOnlyWork });
     const result = await runProcess('docker', dockerArgs, {
       timeoutMs, signal,
       onKill() {
@@ -410,7 +417,7 @@ export async function runSandboxCommand(argv, { cwd, config = {}, signal, timeou
 
 const PROBE_SCRIPT = [
   'import importlib.util, json, os, shutil, platform',
-  'bins = ["gdb","gdb-multiarch","objdump","readelf","nm","file","strings","checksec","patchelf","upx","strace","ltrace","qemu-i386","qemu-arm","qemu-aarch64","qemu-riscv64","seccomp-tools","ROPgadget","ropper","one_gadget","r2","radare2","rizin","analyzeHeadless","tshark","binwalk","steghide","zsteg","exiftool","pngcheck","zbarimg","sox","ffmpeg","7z","cpio","wasm2wat","wasm-objdump","fls","icat","mmls","sqlite3","jq","xxd","php","node","socat","vol","vol3","jadx","apktool","python3","sage"]',
+  'bins = ["gdb","gdb-multiarch","objdump","readelf","nm","file","strings","checksec","patchelf","pwninit","upx","strace","ltrace","qemu-i386","qemu-arm","qemu-aarch64","qemu-riscv64","seccomp-tools","ROPgadget","ropper","one_gadget","r2","radare2","rizin","analyzeHeadless","tshark","binwalk","steghide","zsteg","exiftool","pngcheck","zbarimg","sox","ffmpeg","7z","cpio","wasm2wat","wasm-objdump","fls","icat","mmls","sqlite3","jq","xxd","php","node","socat","vol","vol3","jadx","apktool","bkcrack","ffuf","sqlmap","john","tesseract","python3","sage"]',
   'mods = ["pwn","capstone","z3","Crypto","sympy","gmpy2","angr","fpylll","ecdsa","jwt","itsdangerous","requests","bs4","flask","volatility3","ropper","PIL","numpy","scipy","scapy","xdis"]',
   'ghidra = shutil.which("analyzeHeadless") or (os.path.join(os.environ.get("GHIDRA_HOME",""),"support","analyzeHeadless") if os.environ.get("GHIDRA_HOME") else "")',
   'tools = {b: shutil.which(b) is not None for b in bins}',
@@ -869,7 +876,7 @@ export async function runSandbox(args, { cwd, config = {}, signal, writable, che
       : resolveExecutionPlan(detected, { preferHeavy: false }, 'auto');
     try {
       const probe = await runSandboxCommand(['python3', '-c', PROBE_SCRIPT], {
-        cwd, config: effectiveConfig, signal, timeoutMs: Math.min(timeoutMs, 15000), detected,
+        cwd, config: effectiveConfig, signal, timeoutMs: Math.min(timeoutMs, 15000), readOnlyWork: true, detected,
         image: statusPlan.image, profile: statusPlan.profile,
       });
       if (probe.code === 0) {
@@ -910,6 +917,9 @@ export async function runSandbox(args, { cwd, config = {}, signal, writable, che
     if (args.ptrace !== undefined && typeof args.ptrace !== 'boolean') {
       throw new ToolError('unsupported', 'ptrace 须为布尔值。');
     }
+    if (args.read_only_work !== undefined && typeof args.read_only_work !== 'boolean') {
+      throw new ToolError('unsupported', 'read_only_work 须为布尔值。');
+    }
     let argv;
     let scriptPreview;
     if (hasCommand) {
@@ -938,6 +948,7 @@ export async function runSandbox(args, { cwd, config = {}, signal, writable, che
       cwd, config: effectiveConfig, signal, timeoutMs,
       network: args.network ?? 'none',
       ptrace: args.ptrace === true,
+      readOnlyWork: args.read_only_work === true,
       detected,
       image: plan.image,
       profile: plan.profile,
@@ -1032,7 +1043,7 @@ export async function runSandbox(args, { cwd, config = {}, signal, writable, che
 
   const argv = ['python3', '-c', PWN_TRIAGE_SCRIPT, rel, args.allow_exec === true ? '1' : '0'];
   const result = await runSandboxCommand(argv, {
-    cwd, config: effectiveConfig, signal, timeoutMs, ptrace: args.allow_exec === true, detected,
+    cwd, config: effectiveConfig, signal, timeoutMs, ptrace: args.allow_exec === true, readOnlyWork: true, detected,
     image: plan.image, profile: plan.profile,
   });
   if (result.timedOut) {

@@ -1,16 +1,16 @@
 import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { inspectAudioMetadata } from './audio-metadata.js';
 import { WorkbenchDependencyError } from './workbench-config.js';
 
-const SCRIPT = readFileSync(new URL('./media-reader-worker.py', import.meta.url), 'utf8');
+const SCRIPT_PATH = fileURLToPath(new URL('./media-reader-worker.py', import.meta.url));
 const MAX_PIXELS_PER_PAGE = 128;
 const MAX_PIXELS_PER_LSB_PAGE = 8192;
 const MAX_BITSTREAM_BITS_PER_PAGE = 32768;
 const CHANNELS = ['L', 'P', 'R', 'G', 'B', 'A'];
 const BIT_ORDERS = ['msb_first', 'lsb_first'];
-const MEDIA_KINDS = ['pdf', 'qr', 'audio', 'image', 'sqlite', 'office'];
+const MEDIA_KINDS = ['pdf', 'qr', 'audio', 'image', 'sqlite', 'office', 'model'];
 const REGION_KEYS = ['x', 'y', 'width', 'height'];
 const MAX_DIMENSION = 16384;
 const FRAME_INDEX = { type: 'integer', minimum: 0, maximum: 255, description: '帧/页序号（从 0 起）。' };
@@ -38,7 +38,7 @@ export const PNG_PIXEL_PROPERTIES = {
 };
 
 export const MEDIA_PROPERTIES = {
-  kind: { type: 'string', enum: MEDIA_KINDS, description: 'pdf/qr/audio/image/sqlite/office。' },
+  kind: { type: 'string', enum: MEDIA_KINDS, description: 'pdf/qr/audio/image/sqlite/office/model（AI 模型/Pickle 静态安全体检）。' },
   frame_index: FRAME_INDEX,
   page_offset: { type: 'integer', minimum: 0 },
   page_limit: { type: 'integer', minimum: 1, maximum: 4 },
@@ -114,7 +114,7 @@ export function parsePngRequest(args) {
 
 export function parseMediaRequest(args) {
   const { kind, page_offset: offset, page_limit: limit, include_text: includeText = false } = args;
-  if (!MEDIA_KINDS.includes(kind)) throw new Error('kind 须为 pdf、qr、audio、image、sqlite 或 office。');
+  if (!MEDIA_KINDS.includes(kind)) throw new Error('kind 须为 pdf、qr、audio、image、sqlite、office 或 model。');
   if (kind !== 'image' && args.frame_index !== undefined) throw new Error('frame_index 只适用于 image。');
   if (kind === 'pdf') {
     if (args.sqlite_table !== undefined || args.sqlite_query !== undefined || args.row_offset !== undefined
@@ -172,7 +172,7 @@ export async function inspectMedia(bytes, request, signal, workbench) {
   }
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
-    const child = execFile(python, ['-E', '-P', '-B', '-X', 'utf8', '-c', SCRIPT, JSON.stringify(request)], {
+    const child = execFile(python, ['-E', '-P', '-B', '-X', 'utf8', SCRIPT_PATH, JSON.stringify(request)], {
       cwd: dirname(python), maxBuffer: 20 * 1024 * 1024, timeout: 30000, encoding: 'utf8', windowsHide: true, signal,
     }, (error, stdout) => {
       if (signal?.aborted) return reject(signal.reason);

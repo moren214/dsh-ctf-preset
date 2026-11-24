@@ -28,16 +28,16 @@ whenToUse: "需要检查 CTF 附件、运行解题脚本、分析二进制或整
 
 | 场景 | 优先工具 | 失败两次后的回退 |
 |---|---|---|
-| 赛题平台拉题/同步图谱/下附件/提 Flag（CTFd/GZCTF） | `ctf_arena`（`sync_graph`/`challenges`/`fetch_files`/`container`/`submit`） | `ctf_instance` / `submit_flag` / 平台网页 |
-| 多代理/跨会话共享事实与任务分工 | `ctf_graph`（`board`/`dispatch_plan`/`claim_intent`/`finish_intent`） | `ctf_progress` + `notes.md` |
-| Linux 兵器库 / 反编译 / Pwn 侦察 | `ctf_sandbox`（`status`/`exec`/`decompile`/`pwn_triage`，`profile` 自动升降级） | 本机 shell / WSL2 |
+| 赛题平台拉题/同步图谱/下附件/容器续期/提 Flag（CTFd/GZCTF） | `ctf_arena`（`sync_graph`/`challenges`/`fetch_files`/`container(create/extend/delete)`/`submit`） | `ctf_instance` / `submit_flag` / 平台网页 |
+| 多代理/跨会话共享事实、任务分工与草稿导出 | `ctf_graph`（`board` 分页过滤/`dispatch_plan`/`claim_intent`/`finish_intent`/`export_writeup`） | `ctf_progress` + `notes.md` |
+| Linux 兵器库 / 反编译 / Pwn 侦察 | `ctf_sandbox`（`status`/`exec`/`decompile`/`pwn_triage`，默认加固与 `read_only_work`） | 本机 shell / WSL2 |
 | 单文件定位 | `grep` / `read` | shell `rg` / `sed` |
 | 字节窗口与 strings | `read_binary_range` | shell `xxd` / `strings` |
 | 在附件中查找格式签名或已知字节 | `scan_binary` | `read_binary_range` 核对命中位置 |
 | zlib / bzip2 / xz / raw Deflate 附件 | `inspect_attachment` / `read_archive_member` | Python `zlib` / `bz2` / `lzma` |
 | 结构识别（PNG/JPEG/ELF/PE/WASM/TAR/PCAP/ZIP） | `inspect_attachment` / `inspect_elf` | `ctf_sandbox` `file` / `readelf` |
 | 图片像素、连续 LSB 与二维码 | `read_png_pixels` / `inspect_media` | Python Pillow 脚本 |
-| PDF 页面/附件、SQLite、Office | `inspect_media` | PyMuPDF / sqlite3 / zipfile |
+| PDF 页面/附件、SQLite、Office、AI 模型/Pickle 静态安全体检 | `inspect_media`（`pdf`/`sqlite`/`office`/`model`） | PyMuPDF / sqlite3 / `pickletools` |
 | 归档成员解压 | `read_archive_member` | shell `unzip -p` / `tar -xO` |
 | 二进制快检（加壳/密码常量）/ 多架构反汇编 / CFG | `rev_query`（`triage`/`disassemble`/`cfg`/`strings`） | `ctf_sandbox decompile` |
 | 动态调试（含 Windows 下自动桥接 Linux ELF） | `gdb_driver`（支持偏移表达式与 `args`） | `ctf_sandbox exec` 跑 `gdb` |
@@ -45,8 +45,8 @@ whenToUse: "需要检查 CTF 附件、运行解题脚本、分析二进制或整
 | TCP 长连接 | `net_session` | `ctf_sandbox exec` 跑 `pwntools` |
 | 大 PCAP 筛选与流重组 | `pcap_stream` | `ctf_sandbox` `tshark` / `scapy` |
 | 编码 / 古典密码 / RSA / ECDSA / 哈希 | `calculate_offline` | Python 脚本 |
-| JWT / Flask Session / LCG / MT19937 与格模板 | `crypto_solver`（`solve`/`template`/`check`） | `ctf_sandbox exec` 跑 Python |
-| 浏览器交互、网络抓包与控制台 | `browser_session` | Playwright / requests 脚本 |
+| JWT / Flask Session / LCG / MT19937 与 7 类密码学脚手架 | `crypto_solver`（`solve`/`template`/`check`） | `ctf_sandbox exec` 跑 Python |
+| 浏览器交互、弹窗捕获、JS 求值、Cookie/Header 注入与上传 | `browser_session`（含 `dialogs`/`evaluate`/`set_cookie`/`set_headers`/`upload_file`） | Playwright / requests 脚本 |
 | ZIP 口令 | `archive_crack` | john/hashcat（若安装） |
 | WAV 选段、声道、24 位 PCM 与隐写 | `stego_audio` | Python 脚本 |
 | 环境与沙箱自检 | `ctf_doctor` | `ctf_sandbox status` |
@@ -158,10 +158,10 @@ whenToUse: "需要检查 CTF 附件、运行解题脚本、分析二进制或整
 - **本地 HTTP 记录。** 开启 `enableExtendedAudit: true` 后可用 `verify_http_evidence` 核对已知方法和不带查询串的路径（HAR 与 JSONL 中记录了同一个请求 ID 时传入 `request_id`）；默认核心层用 `read`/`grep` 或脚本分析 HAR/日志。
 - **HTTP 响应。** 核对状态码、完整响应头（含 `Set-Cookie`/`WWW-Authenticate`，仅脱敏平台令牌）、正文范围和 SHA-256。允许自定义 `Host` 头；需要维持登录态或多账号隔离时使用 `cookie_jar`；文件上传题使用 `multipart`。空正文可以正常返回。自动跳转只适用于同源且无请求体的 GET/HEAD，保留被拦截的 3xx 响应及原因。
 - **Flask 源码与返回事件。** 开启 `enableExtendedAudit: true` 后可用 `trace_flask_route` 追踪已知方法和路径，并用 `verify_flask_response` 对照同一请求的 HTTP 观测、返回事件和源码行；默认核心层直接用 `grep`/`read` 追踪路由并用 `http_request` 复现。
-- **二进制和浏览器。** `gdb_driver inspect` 查看文件/节；`gdb_driver debug` 用受限命令运行题目二进制并读取寄存器、栈、回溯或反汇编。`browser_session` 可查看已授权页面、DOM、Cookie（默认含赛题值）、local/sessionStorage、捕获的网络请求（`network`，传 `request_id` 可读响应体）和控制台日志（`console`），等待动态元素并截图；可写会话中可点击、填表、选下拉项或发送常用按键。交互使用唯一匹配的 CSS selector。
-- **压缩包与音频。** `archive_crack` 检查 ZIP 结构并尝试 ZipCrypto 口令（`passwords`、`wordlist`、`mask` 和内置弱口令，默认 30 秒）；AES 压缩包或需要 john/hashcat 时改走 shell。`stego_audio` 支持 PCM 8/16/24 位 WAV，可按时间段和声道读取 LSB，或生成频谱 PNG。
-- **APK 与环境记录。** `mobile_apk`（扩展审计层）检查本地 APK；默认核心层可直接用 `inspect_attachment` 按 ZIP 检查 APK 或在 `ctf_sandbox` 中调用 `jadx`/`apktool`。环境记录以脱敏附件形式进入工作区，再核对原件和位置。
-- **计算环境。** `crypto_solver check` 检查可信 Python 的依赖。模板保存在工作区。
+- **二进制和浏览器。** `gdb_driver inspect` 查看文件/节；`gdb_driver debug` 用受限命令运行题目二进制并读取寄存器、栈、回溯或反汇编。`browser_session` 可查看已授权页面、DOM、Cookie（默认含赛题值）、local/sessionStorage、捕获的网络请求（`network`，传 `request_id` 可读响应体）、控制台日志（`console`）以及自动捕获放行的 JS 弹窗（`dialogs`），等待动态元素并截图；可写会话中支持点击、填表、选下拉项、发送常用按键、`evaluate` 页面 JS 求值、`set_cookie`、`set_headers` 与工作区文件 `upload_file`。交互使用唯一匹配的 CSS selector。
+- **压缩包与音频。** `archive_crack` 检查 ZIP 结构并尝试 ZipCrypto 口令（`passwords`、`wordlist`、`mask` 和内置弱口令，默认 30 秒）；明文攻击、AES 压缩包或需要 `bkcrack`/`john`/`hashcat` 时转 `ctf_sandbox`。`stego_audio` 支持 PCM 8/16/24 位 WAV，可按时间段和声道读取 LSB，或生成频谱 PNG。
+- **APK 与环境记录。** `mobile_apk`（扩展审计层）检查本地 APK，且在宿主机缺少 `jadx`/`apktool` 时自动桥接 `ctf_sandbox`（优先 `heavy` 镜像）；默认核心层可直接用 `inspect_attachment` 按 ZIP 检查 APK 或在 `ctf_sandbox` 中调用 `jadx`/`apktool`。环境记录以脱敏附件形式进入工作区，再核对原件和位置。
+- **计算环境。** `crypto_solver check` 检查可信 Python 的依赖；`template` 提供 7 类零占位脚手架（`z3_bitvec`/`coppersmith`/`lattice`/`aes_mode`/`ecc_weak`/`padding_oracle`/`hash_ext`）保存在 `.ctf-templates/`。
 - **编码与密码复算。** 先取题面样例或固定测试向量，用 `calculate_offline` 逐步比对预期值。已知种子和参数的线性同余序列用 `lcg_replay`。对人工提出的解释，用 `candidates` 指向各自的 `expected` 检查点，并报告首个不符或证据不足的步骤。超时后可携 `resume_id` 和原参数从 `next_step` 继续。
 - **杂项编码。** `calculate_offline` 的 `encode`/`decode` 支持 Base32、Base58、RFC1924 Base85、ASCII85、Z85 和 basE91。Z85 输入长度须满足其分组规则；basE91 解码忽略 ASCII 空白。
 - **XOR 分析。** `xor_repeating_bruteforce` 用归一化汉明距离估计密钥长度，再按列进行英文频率评分。短密文、非英文明文和随机数据会降低排序可靠性。
@@ -177,7 +177,7 @@ whenToUse: "需要检查 CTF 附件、运行解题脚本、分析二进制或整
 - **归档附件。** 用 `inspect_attachment` 查看目录并取得 `member_index`，再用 `read_archive_member` 读取解压后最多 1 MiB 的普通成员。单文件 gzip、zlib、bzip2 和 xz 使用成员 0；压缩 TAR 按展开后的目录读取。bzip2/xz 需要 Python 3.11 标准库；7z/RAR 依赖不可用时保留格式与原件哈希。
 - **压缩流。** `inspect_attachment` 自动识别带校验的 zlib、bzip2 和 xz 流。Raw Deflate 没有固定头部，先根据来源证据判断格式后传 `format_hint: deflate_raw`。解出的成员或 TAR 可继续通过 `source_result_id` 交给其他附件工具，并核对原件与成员 SHA-256。
 - **图像 LSB 到二维码。** `read_png_pixels operation: bitstream` 用 `next_bit_offset` 按整字节续页。把连续页的 `result_id` 按顺序交给 `inspect_media kind: qr`，工具会核对来源、帧和位偏移，自动拼接原始字节。
-- **PDF、数据库和 Office。** PDF 可检查文本、渲染指定页或读取嵌入附件；页面 PNG 和附件都能通过 `result_id` 继续读图、识别二维码或检查格式。SQLite 只允许只读查询。Office 读取常见 OpenXML/ODF 文本和单元格，不执行宏。
+- **PDF、数据库、Office 与 AI 模型。** PDF 可检查文本、渲染指定页或读取嵌入附件；页面 PNG 和附件都能通过 `result_id` 继续读图、识别二维码或检查格式。SQLite 只允许只读查询。Office 读取常见 OpenXML/ODF 文本和单元格，不执行宏。遇到 `.pkl`/`.pt`/`.pth`/`.safetensors`/`.gguf`/`.onnx` 等模型附件时，先用 `inspect_media(kind: "model")` 做纯静态零执行安全体检（绝不直接 `pickle.load`/`torch.load` 不可信模型），同样支持 `source_result_id` 承接归档成员。
 - **抓包。** `inspect_attachment` 可按节、接口和时间范围统计 PCAPNG，`packet_count` 代表筛选结果；`pcap_stream` 可按地址、协议、端口和 UTC 时间筛选。64 MiB 以上按包/块分块流读，最大 1 GiB。输出保留全文件范围、筛选范围、`analysis_status` 和结构化 `warnings[]`。TCP 重组遇到缺包时依然显示不完整标志。
 - **ELF 与 pwn triage。** `inspect_elf` 从原件读取入口和符号表，并给出 NX、PIE、RELRO、canary、FORTIFY、动态导入和 `DT_NEEDED`；x86-64 另有 PLT/GOT、常见符号及 `/bin/sh` 位置。Gadget 扫描只是字节匹配，可能命中数据。深度 Pwn 侦察优先用 `ctf_sandbox(action: "pwn_triage")`；开启 `enableExtendedAudit: true` 后还可直接用 `pwn_cyclic` 定位栈溢出偏移及 `pwn_payload` 组装基础 `ret2libc_x64` 载荷。
 - **TCP 远程交互。** 用 `net_session` 连接题目服务：`connect` 建会话，`send` 发字节（单次 1 MiB），`recv`/`read_until` 收包。文本安全时返回 UTF-8，二进制返回 Hex 和 hexdump；收到分隔符或 64 KiB 上限即返回。用 `list` 查看会话，`close` 关闭；取消操作会销毁 socket。

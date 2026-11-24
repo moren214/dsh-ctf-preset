@@ -9,7 +9,7 @@ import { deflateSync, inflateRawSync } from 'node:zlib';
 import { BROWSER_TIMEOUT_MS, createBrowserSession } from './browser-session.js';
 import { isLocalWorkbenchPath } from './workbench-config.js';
 import { describeToolError, ToolError } from './tool-errors.js';
-import { detectSandbox, runSandboxCommand } from './sandbox-runner.js';
+import { detectSandbox, resolveExecutionPlan, runSandboxCommand } from './sandbox-runner.js';
 import { CRYPTO_SOLVE_OPERATIONS, runCryptoSolve } from './crypto-toolbox.js';
 
 const MAX_INPUT_BYTES = 256 * 1024 * 1024;
@@ -833,6 +833,266 @@ const TEMPLATES = {
     '    demo_local_oracle()',
     '',
   ].join('\n'),
+  'ecc_weak': [
+    '# 弱椭圆曲线求解脚手架（纯 Python 标准库）：Pohlig-Hellman（光滑阶）+ Smart 攻击（异常曲线 #E(Fp)=p）。',
+    'import math',
+    '',
+    'def ec_add(P, Q, a, p):',
+    '    if P is None:',
+    '        return Q',
+    '    if Q is None:',
+    '        return P',
+    '    x1, y1 = P',
+    '    x2, y2 = Q',
+    '    if x1 == x2 and (y1 + y2) % p == 0:',
+    '        return None',
+    '    lam = ((3 * x1 * x1 + a) * pow(2 * y1, -1, p)) % p if P == Q else ((y2 - y1) * pow(x2 - x1, -1, p)) % p',
+    '    x3 = (lam * lam - x1 - x2) % p',
+    '    return (x3, (lam * (x1 - x3) - y1) % p)',
+    '',
+    'def ec_mul(k, P, a, p):',
+    '    R, Q = None, P',
+    '    while k > 0:',
+    '        if k & 1:',
+    '            R = ec_add(R, Q, a, p)',
+    '        Q = ec_add(Q, Q, a, p)',
+    '        k >>= 1',
+    '    return R',
+    '',
+    'def bsgs_ec(G, Q, order, a, p):',
+    '    m = math.isqrt(order) + 1',
+    '    table = {}',
+    '    cur = None',
+    '    for j in range(m):',
+    '        table[cur] = j',
+    '        cur = ec_add(cur, G, a, p)',
+    '    neg_mG = ec_mul(order - (m % order), G, a, p) if m % order else None',
+    '    gamma = Q',
+    '    for i in range(m + 1):',
+    '        if gamma in table:',
+    '            return (i * m + table[gamma]) % order',
+    '        gamma = ec_add(gamma, neg_mG, a, p)',
+    '    raise ValueError("BSGS 未在给定阶内找到离散对数")',
+    '',
+    'def crt(residues, moduli):',
+    '    x, M = 0, 1',
+    '    for r, m in zip(residues, moduli):',
+    '        inv = pow(M, -1, m)',
+    '        x += M * (((r - x) * inv) % m)',
+    '        M *= m',
+    '    return x % M, M',
+    '',
+    'def pohlig_hellman_ec(G, Q, factors, a, p):',
+    '    """给定群阶的素因子分解 factors=[(q, e), ...]，求解 Q = k * G。"""',
+    '    order = 1',
+    '    for q, e in factors:',
+    '        order *= q ** e',
+    '    residues, moduli = [], []',
+    '    for q, e in factors:',
+    '        qe = q ** e',
+    '        G0 = ec_mul(order // q, G, a, p)',
+    '        xk = 0',
+    '        for i in range(e):',
+    '            neg_xkG = None if xk == 0 else ec_mul(order - xk, G, a, p)',
+    '            Hi = ec_mul(order // (q ** (i + 1)), ec_add(Q, neg_xkG, a, p), a, p)',
+    '            di = bsgs_ec(G0, Hi, q, a, p)',
+    '            xk += di * (q ** i)',
+    '        residues.append(xk)',
+    '        moduli.append(qe)',
+    '    return crt(residues, moduli)[0]',
+    '',
+    'def _proj_add(P, Q, a, b, mod):',
+    '    X1, Y1, Z1 = P',
+    '    X2, Y2, Z2 = Q',
+    '    b3 = (3 * b) % mod',
+    '    t0, t1, t2 = (X1 * X2) % mod, (Y1 * Y2) % mod, (Z1 * Z2) % mod',
+    '    t3 = (((X1 + Y1) * (X2 + Y2)) - (t0 + t1)) % mod',
+    '    t4 = (((X1 + Z1) * (X2 + Z2)) - (t0 + t2)) % mod',
+    '    t5 = (((Y1 + Z1) * (Y2 + Z2)) - (t1 + t2)) % mod',
+    '    Z3 = (a * t4 + b3 * t2) % mod',
+    '    X3 = (t1 - Z3) % mod',
+    '    Z3 = (t1 + Z3) % mod',
+    '    Y3 = (X3 * Z3) % mod',
+    '    t1 = (3 * t0 + a * t2) % mod',
+    '    t4 = (b3 * t4 + a * (t0 - a * t2)) % mod',
+    '    Y3 = (Y3 + t1 * t4) % mod',
+    '    X3 = (t3 * X3 - t5 * t4) % mod',
+    '    Z3 = (t5 * Z3 + t3 * t1) % mod',
+    '    return (X3, Y3, Z3)',
+    '',
+    'def _proj_mul(k, P, a, b, mod):',
+    '    R, Q = (0, 1, 0), P',
+    '    while k > 0:',
+    '        if k & 1:',
+    '            R = _proj_add(R, Q, a, b, mod)',
+    '        Q = _proj_add(Q, Q, a, b, mod)',
+    '        k >>= 1',
+    '    return R',
+    '',
+    'def smart_attack_anomalous(G, Q, a, b, p):',
+    '    """Smart 攻击：针对 #E(Fp) == p 的异常椭圆曲线，O(log p) 恢复私钥 k。"""',
+    '    p2 = p * p',
+    '    for db in (0, p, 2 * p):',
+    '        bl = (b + db) % p2',
+    '        def lift(P):',
+    '            x, y = P',
+    '            r = (x * x * x + a * x + bl - y * y) % p2',
+    '            t = ((r // p) * pow(2 * y, -1, p)) % p',
+    '            return (x, (y + t * p) % p2, 1)',
+    '        def phi(P):',
+    '            X, Y, _Z = _proj_mul(p, lift(P), a, bl, p2)',
+    '            return ((-X * pow(Y, -1, p2)) % p2 // p) % p',
+    '        g_val = phi(G)',
+    '        if g_val != 0:',
+    '            return (phi(Q) * pow(g_val, -1, p)) % p',
+    '    raise ValueError("提升后的曲线仍落入典范提升，请尝试微调 a -> a + p")',
+    '',
+    'if __name__ == "__main__":',
+    '    # 自检 1：异常曲线 Smart 攻击（p=1009, #E=1009）',
+    '    p, a, b, G = 1009, 1, 79, (1, 9)',
+    '    k_smart = 731',
+    '    Q = ec_mul(k_smart, G, a, p)',
+    '    rec_smart = smart_attack_anomalous(G, Q, a, b, p)',
+    '    assert rec_smart == k_smart, (rec_smart, k_smart)',
+    '    # 自检 2：光滑阶曲线 Pohlig-Hellman（p=977, E: y^2=x^3+x+4, #E=945=3^3*5*7）',
+    '    p2, a2, G2 = 977, 1, (0, 2)',
+    '    k_ph = 419',
+    '    Q2 = ec_mul(k_ph, G2, a2, p2)',
+    '    rec_ph = pohlig_hellman_ec(G2, Q2, [(3, 3), (5, 1), (7, 1)], a2, p2)',
+    '    assert rec_ph == k_ph and ec_mul(rec_ph, G2, a2, p2) == Q2',
+    '    print("ecc_weak ok:", rec_smart, rec_ph)',
+    '',
+  ].join('\n'),
+  'padding_oracle': [
+    '# AES-CBC PKCS#7 Padding Oracle 解密与 CBC-R 伪造脚手架。',
+    'from Crypto.Cipher import AES',
+    'from Crypto.Util.Padding import pad, unpad',
+    '',
+    'def decrypt_block(prev_block, target_block, oracle, block_size=16):',
+    '    """给定 oracle(iv, ct) -> bool，逐字节恢复单块中间值与明文。"""',
+    '    inter = bytearray(block_size)',
+    '    for pad_val in range(1, block_size + 1):',
+    '        idx = block_size - pad_val',
+    '        prefix = bytearray(block_size)',
+    '        for j in range(idx + 1, block_size):',
+    '            prefix[j] = inter[j] ^ pad_val',
+    '        found = None',
+    '        for guess in range(256):',
+    '            prefix[idx] = guess',
+    '            if not oracle(bytes(prefix), target_block):',
+    '                continue',
+    '            if pad_val == 1 and idx > 0:',
+    '                check = bytearray(prefix)',
+    '                check[idx - 1] ^= 1',
+    '                if not oracle(bytes(check), target_block):',
+    '                    continue',
+    '            found = guess ^ pad_val',
+    '            break',
+    '        if found is None:',
+    '            raise ValueError(f"第 {idx} 字节未命中合法填充")',
+    '        inter[idx] = found',
+    '    return bytes(a ^ b for a, b in zip(inter, prev_block)), bytes(inter)',
+    '',
+    'def decrypt_cbc(iv, ciphertext, oracle, block_size=16):',
+    '    blocks = [iv] + [ciphertext[i:i + block_size] for i in range(0, len(ciphertext), block_size)]',
+    '    out = bytearray()',
+    '    for i in range(1, len(blocks)):',
+    '        pt_block, _ = decrypt_block(blocks[i - 1], blocks[i], oracle, block_size)',
+    '        out.extend(pt_block)',
+    '    return unpad(bytes(out), block_size)',
+    '',
+    'def cbc_r_forge(plaintext, oracle, block_size=16):',
+    '    """CBC-R：仅凭 Padding Oracle 伪造任意明文对应的 (iv, ciphertext)。"""',
+    '    padded = pad(plaintext, block_size)',
+    '    p_blocks = [padded[i:i + block_size] for i in range(0, len(padded), block_size)]',
+    '    c_next = bytes([0x41] * block_size)',
+    '    chain = [c_next]',
+    '    for pt in reversed(p_blocks):',
+    '        _, inter = decrypt_block(bytes(block_size), c_next, oracle, block_size)',
+    '        c_next = bytes(a ^ b for a, b in zip(inter, pt))',
+    '        chain.append(c_next)',
+    '    chain.reverse()',
+    '    return chain[0], b"".join(chain[1:])',
+    '',
+    'if __name__ == "__main__":',
+    '    key = b"0123456789abcdef"',
+    '    iv = b"fedcba9876543210"',
+    '    def local_oracle(cur_iv, cur_ct):',
+    '        try:',
+    '            unpad(AES.new(key, AES.MODE_CBC, cur_iv).decrypt(cur_ct), 16)',
+    '            return True',
+    '        except ValueError:',
+    '            return False',
+    '    secret = b"flag{padding_oracle_ok}"',
+    '    ct = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(secret, 16))',
+    '    recovered = decrypt_cbc(iv, ct, local_oracle)',
+    '    assert recovered == secret, recovered',
+    '    f_iv, f_ct = cbc_r_forge(b"admin=true&role=root", local_oracle)',
+    '    forged_pt = unpad(AES.new(key, AES.MODE_CBC, f_iv).decrypt(f_ct), 16)',
+    '    assert forged_pt == b"admin=true&role=root", forged_pt',
+    '    print("padding_oracle ok:", recovered.decode(), forged_pt.decode())',
+    '',
+  ].join('\n'),
+  'hash_ext': [
+    '# 纯 Python SHA-256 长度扩展攻击脚手架（零第三方依赖）：已知 H(secret||data) 与 len(secret) 伪造 H(secret||data||pad||append)。',
+    'import hashlib',
+    'import struct',
+    '',
+    '_K = (',
+    '    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,',
+    '    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,',
+    '    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,',
+    '    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,',
+    '    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,',
+    '    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,',
+    '    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,',
+    '    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,',
+    ')',
+    '',
+    'def _rotr(x, n):',
+    '    return ((x >> n) | (x << (32 - n))) & 0xffffffff',
+    '',
+    'def sha256_compress(state, block):',
+    '    w = list(struct.unpack(">16I", block)) + [0] * 48',
+    '    for i in range(16, 64):',
+    '        s0 = _rotr(w[i - 15], 7) ^ _rotr(w[i - 15], 18) ^ (w[i - 15] >> 3)',
+    '        s1 = _rotr(w[i - 2], 17) ^ _rotr(w[i - 2], 19) ^ (w[i - 2] >> 10)',
+    '        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & 0xffffffff',
+    '    a, b, c, d, e, f, g, h = state',
+    '    for i in range(64):',
+    '        S1 = _rotr(e, 6) ^ _rotr(e, 11) ^ _rotr(e, 25)',
+    '        ch = (e & f) ^ ((~e) & g)',
+    '        t1 = (h + S1 + ch + _K[i] + w[i]) & 0xffffffff',
+    '        S0 = _rotr(a, 2) ^ _rotr(a, 13) ^ _rotr(a, 22)',
+    '        maj = (a & b) ^ (a & c) ^ (b & c)',
+    '        t2 = (S0 + maj) & 0xffffffff',
+    '        h, g, f, e, d, c, b, a = g, f, e, (d + t1) & 0xffffffff, c, b, a, (t1 + t2) & 0xffffffff',
+    '    return tuple((x + y) & 0xffffffff for x, y in zip(state, (a, b, c, d, e, f, g, h)))',
+    '',
+    'def sha256_padding(msg_len):',
+    '    rem = (msg_len + 1) % 64',
+    '    zeros = (56 - rem) % 64',
+    '    return b"\\x80" + (b"\\x00" * zeros) + struct.pack(">Q", msg_len * 8)',
+    '',
+    'def sha256_length_extend(orig_digest_hex, orig_data, append_data, secret_len):',
+    '    state = struct.unpack(">8I", bytes.fromhex(orig_digest_hex))',
+    '    glue = sha256_padding(secret_len + len(orig_data))',
+    '    total_len = secret_len + len(orig_data) + len(glue) + len(append_data)',
+    '    tail = append_data + sha256_padding(total_len)',
+    '    for offset in range(0, len(tail), 64):',
+    '        state = sha256_compress(state, tail[offset:offset + 64])',
+    '    return orig_data + glue + append_data, struct.pack(">8I", *state).hex()',
+    '',
+    'if __name__ == "__main__":',
+    '    secret = b"super_secret_ctf_key"',
+    '    orig_data = b"user=guest&role=viewer"',
+    '    orig_sig = hashlib.sha256(secret + orig_data).hexdigest()',
+    '    forged_msg, forged_sig = sha256_length_extend(orig_sig, orig_data, b"&role=admin", len(secret))',
+    '    expected = hashlib.sha256(secret + forged_msg).hexdigest()',
+    '    assert forged_sig == expected, (forged_sig, expected)',
+    '    print("hash_ext ok:", forged_sig)',
+    '',
+  ].join('\n'),
 };
 
 // ── 注册 ─────────────────────────────────────────────────────────────────────
@@ -868,12 +1128,19 @@ export function registerExtraTools(ctx, configSource, access) {
   }
 
   register('browser_session',
-    '隔离 Chrome/Edge 会话：open/dom/screenshot/cookies/storage/network/console 及可写交互（click/fill/select/press/wait_for）。',
+    '隔离 Chrome/Edge 会话：open/dom/screenshot/cookies/storage/network/console/dialogs 及可写交互（click/fill/select/press/wait_for/evaluate/set_cookie/set_headers/upload_file）。',
     {
-      action: { type: 'string', enum: ['open', 'dom', 'screenshot', 'cookies', 'title', 'close', 'status', 'list', 'click', 'fill', 'select', 'press', 'wait_for', 'storage', 'network', 'console'] },
+      action: { type: 'string', enum: ['open', 'dom', 'screenshot', 'cookies', 'title', 'close', 'status', 'list', 'click', 'fill', 'select', 'press', 'wait_for', 'storage', 'network', 'console', 'dialogs', 'evaluate', 'set_cookie', 'set_headers', 'upload_file'] },
       url: { type: 'string' },
       selector: { type: 'string', maxLength: 1024 },
       value: { type: 'string', maxLength: 16384 },
+      expression: { type: 'string', maxLength: 4096, description: 'evaluate 执行的页面 JS 表达式。' },
+      name: { type: 'string', maxLength: 256, description: 'set_cookie 的 Cookie 名称。' },
+      http_only: { type: 'boolean' },
+      secure: { type: 'boolean' },
+      same_site: { type: 'string', enum: ['Strict', 'Lax', 'None'] },
+      headers: { type: 'object', maxProperties: 16, additionalProperties: { type: 'string', maxLength: 2048 }, description: 'set_headers 附加请求头。' },
+      file_path: { type: 'string', maxLength: 1024, description: 'upload_file 工作区内待上传文件相对路径。' },
       key: { type: 'string', enum: ['Enter', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Backspace', 'Delete'] },
       storage_type: { type: 'string', enum: ['local', 'session'] },
       include_values: { type: 'boolean', default: true },
@@ -886,19 +1153,50 @@ export function registerExtraTools(ctx, configSource, access) {
     async (args, execution) => {
       const location = await access.location(execution);
       const action = args.action;
-      if (['click', 'fill', 'select', 'press'].includes(action)) requireWritable(ctx, execution);
+      if (['click', 'fill', 'select', 'press', 'evaluate', 'set_cookie', 'set_headers', 'upload_file'].includes(action)) {
+        requireWritable(ctx, execution);
+      }
       if (args.selector !== undefined && (typeof args.selector !== 'string' || args.selector.length === 0 || args.selector.length > 1024)) {
         throw new ToolError('unsupported', 'selector 须为不超过 1024 字符的 CSS 选择器。');
       }
-      if (['click', 'fill', 'select', 'press', 'wait_for'].includes(action)
+      if (['click', 'fill', 'select', 'press', 'wait_for', 'upload_file'].includes(action)
         && (typeof args.selector !== 'string' || args.selector.length === 0)) {
         throw new ToolError('unsupported', `${action} 需要非空 CSS selector。`);
       }
       if (args.value !== undefined && (typeof args.value !== 'string' || args.value.length > 16384)) {
         throw new ToolError('unsupported', 'value 须为不超过 16384 字符的文本。');
       }
-      if (['fill', 'select'].includes(action) && typeof args.value !== 'string') {
+      if (['fill', 'select', 'set_cookie'].includes(action) && typeof args.value !== 'string') {
         throw new ToolError('unsupported', `${action} 需要字符串 value。`);
+      }
+      if (action === 'evaluate' && (typeof args.expression !== 'string' || args.expression.trim().length === 0 || args.expression.length > 4096)) {
+        throw new ToolError('unsupported', 'evaluate 需要 1 至 4096 字符的 JS expression。');
+      }
+      if (action === 'set_cookie') {
+        if (typeof args.name !== 'string' || args.name.trim().length === 0 || /[\r\n\0;=]/u.test(args.name)) {
+          throw new ToolError('unsupported', 'set_cookie 需要合法的 Cookie 名称 name。');
+        }
+        if (typeof args.url !== 'string' || args.url.trim().length === 0) {
+          throw new ToolError('unsupported', 'set_cookie 需要已授权的目标 url。');
+        }
+        if (args.same_site !== undefined && !['Strict', 'Lax', 'None'].includes(args.same_site)) {
+          throw new ToolError('unsupported', 'same_site 须为 Strict、Lax 或 None。');
+        }
+      }
+      if (action === 'set_headers') {
+        if (!args.headers || typeof args.headers !== 'object' || Array.isArray(args.headers)) {
+          throw new ToolError('unsupported', 'set_headers 需要 headers 字符串键值对象。');
+        }
+        const entries = Object.entries(args.headers);
+        if (entries.length > 16) throw new ToolError('unsupported', 'headers 最多 16 项。');
+        for (const [hKey, hVal] of entries) {
+          if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/u.test(hKey) || typeof hVal !== 'string' || hVal.length > 2048 || /[\r\n\0]/u.test(hVal)) {
+            throw new ToolError('unsupported', `header ${JSON.stringify(hKey)} 名称或值不合法。`);
+          }
+        }
+      }
+      if (action === 'upload_file' && (typeof args.file_path !== 'string' || args.file_path.trim().length === 0)) {
+        throw new ToolError('unsupported', 'upload_file 需要工作区内的 file_path。');
       }
       if (action === 'press' && !['Enter', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Backspace', 'Delete'].includes(args.key)) {
         throw new ToolError('unsupported', 'press 的 key 须为 Enter、Tab、Escape、方向键、Space、Backspace 或 Delete。');
@@ -1000,6 +1298,36 @@ export function registerExtraTools(ctx, configSource, access) {
         if (action === 'console') {
           const entries = browser.console(target, args.clear_logs === true);
           return { status: 'console', count: entries.length, entries };
+        }
+        if (action === 'dialogs') {
+          const entries = browser.dialogs(target, args.clear_logs === true);
+          return { status: 'dialogs', count: entries.length, entries };
+        }
+        if (action === 'evaluate') {
+          return { ...(await browser.evaluateUser(target, args.expression, signal)) };
+        }
+        if (action === 'set_cookie') {
+          await access.authorize(args.url, signal);
+          const cookie = {
+            name: args.name.trim(),
+            value: args.value,
+            url: args.url,
+            ...(args.http_only !== undefined ? { httpOnly: args.http_only } : {}),
+            ...(args.secure !== undefined ? { secure: args.secure } : {}),
+            ...(args.same_site !== undefined ? { sameSite: args.same_site } : {}),
+          };
+          const res = await browser.setCookie(target, cookie, signal);
+          return { status: res.success ? 'cookie_set' : 'failed', name: cookie.name, url: args.url };
+        }
+        if (action === 'set_headers') {
+          const res = await browser.setExtraHeaders(target, args.headers, signal);
+          return { status: 'headers_set', ...res };
+        }
+        if (action === 'upload_file') {
+          const absFile = await access.input(location, args.file_path);
+          const res = await browser.uploadFile(target, args.selector, absFile, signal);
+          if (res.status === 'match_count') throw new ToolError('missing', `CSS selector 匹配 ${res.count} 个元素，upload_file 要求恰好一个。`);
+          return { ...res, selector: args.selector, file_path: args.file_path };
         }
         if (action === 'list') return { status: 'targets', targets: await browser.list(target, signal) };
         throw new ToolError('unsupported', `未知操作：${action}。`);
@@ -1283,18 +1611,50 @@ export function registerExtraTools(ctx, configSource, access) {
           requireWritable(ctx, execution);
           const jadx = findJavaTool(['jadx', 'jadx.bat']);
           const apktool = findJavaTool(['apktool', 'apktool.bat']);
-          if (!jadx && !apktool) throw new ToolError('dependency', '没有找到 jadx 或 apktool。', '安装 jadx（https://github.com/skylot/jadx）或 apktool 后重试。');
           const output = await access.output(location, args.output_dir ?? ('.apk-' + path.basename(file, path.extname(file))), true);
-          const command = jadx
-            ? { bin: jadx.path, args: ['-d', output, '--no-res', file] }
-            : { bin: apktool.path, args: ['d', '-f', '-o', output, file] };
-          const result = await spawnCapture(command.bin, command.args, {
-            cwd, signal: execution.signal, timeoutMs: Math.min(Math.max(args.timeout_ms ?? 120000, 1000), 300000),
+          const timeoutMs = Math.min(Math.max(args.timeout_ms ?? 120000, 1000), 300000);
+          if (jadx || apktool) {
+            const command = jadx
+              ? { bin: jadx.path, args: ['-d', output, '--no-res', file] }
+              : { bin: apktool.path, args: ['d', '-f', '-o', output, file] };
+            const result = await spawnCapture(command.bin, command.args, { cwd, signal: execution.signal, timeoutMs });
+            return {
+              status: result.timedOut ? 'timeout' : (result.code === 0 ? 'ok' : 'failed'),
+              backend: 'host',
+              tool: jadx ? 'jadx' : 'apktool', output_dir: output, exit_code: result.code,
+              stdout: truncate(result.stdout), stderr: truncate(result.stderr),
+            };
+          }
+          const config = getConfig();
+          const detected = await detectSandbox(config, execution.signal);
+          if (!detected.available) {
+            throw new ToolError('dependency', '宿主机与沙箱均未找到 jadx 或 apktool。', '安装本机 jadx/apktool，或构建重型镜像：docker build -f docker/Dockerfile.heavy -t dsh-ctf-sandbox:heavy docker/。');
+          }
+          const plan = resolveExecutionPlan(detected, { preferDocker: true, preferHeavy: true, heavyReasons: ['apk_workload'] }, 'auto');
+          const relApk = path.relative(cwd, file).replaceAll('\\', '/');
+          const relOut = path.relative(cwd, output).replaceAll('\\', '/');
+          const script = 'if command -v jadx >/dev/null 2>&1; then echo "__TOOL=jadx"; exec jadx -d "$2" --no-res "$1"; '
+            + 'elif command -v apktool >/dev/null 2>&1; then echo "__TOOL=apktool"; exec apktool d -f -o "$2" "$1"; '
+            + 'else exit 127; fi';
+          const result = await runSandboxCommand(['bash', '-c', script, '_', relApk, relOut], {
+            cwd, config, signal: execution.signal, timeoutMs, detected, image: plan.image, profile: plan.profile,
           });
+          if (result.code === 127) {
+            throw new ToolError('dependency', `沙箱（${result.backend}:${result.target}）内未安装 jadx 或 apktool。`, '请构建重型镜像：docker build -f docker/Dockerfile.heavy -t dsh-ctf-sandbox:heavy docker/。');
+          }
+          const toolHit = /^__TOOL=(jadx|apktool)\r?\n?/u.exec(result.stdout);
+          const cleanStdout = toolHit ? result.stdout.slice(toolHit[0].length) : result.stdout;
           return {
             status: result.timedOut ? 'timeout' : (result.code === 0 ? 'ok' : 'failed'),
-            tool: jadx ? 'jadx' : 'apktool', output_dir: output, exit_code: result.code,
-            stdout: truncate(result.stdout), stderr: truncate(result.stderr),
+            backend: result.backend,
+            target: result.target,
+            profile: result.profile,
+            ...(plan.profileFallbackReason ? { profile_fallback_reason: plan.profileFallbackReason } : {}),
+            tool: toolHit ? toolHit[1] : 'sandbox',
+            output_dir: output,
+            exit_code: result.code,
+            stdout: truncate(cleanStdout),
+            stderr: truncate(result.stderr),
           };
         }
         if (args.action === 'signature') {
@@ -1328,7 +1688,7 @@ export function registerExtraTools(ctx, configSource, access) {
     '检查 Python 密码库（check）、生成求解脚手架（template）或直接执行内置无依赖求解（solve：JWT/Flask Session/LCG/MT19937）。',
     {
       action: { type: 'string', enum: ['check', 'template', 'solve'] },
-      kind: { type: 'string', enum: ['z3_bitvec', 'coppersmith', 'lattice', 'aes_mode'] },
+      kind: { type: 'string', enum: ['z3_bitvec', 'coppersmith', 'lattice', 'aes_mode', 'ecc_weak', 'padding_oracle', 'hash_ext'] },
       operation: { type: 'string', enum: CRYPTO_SOLVE_OPERATIONS },
       token: { type: 'string', maxLength: 32768 },
       salt: { type: 'string', maxLength: 256 },

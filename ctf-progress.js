@@ -19,104 +19,62 @@ const STATE_BACKUP = '.ctf/state.previous.json';
 const STATE_RECOVERY = '.ctf/state.saved.json';
 const STATE_HEADER = /^<!-- machine: ([^ ]+) sha256:([a-f0-9]{64}) -->\n/u;
 
-const REFERENCE_PROPERTIES = {
-  file_path: { type: 'string', description: '相对原件路径。' },
-  line: { type: 'integer', minimum: 1 },
-  byte_offset: { type: 'integer', minimum: 0 },
-  byte_length: { type: 'integer', minimum: 1 },
-  json_pointer: { type: 'string', maxLength: 256 },
-  sha256: { type: 'string' },
+const SCALAR_SCHEMA = { anyOf: [{ type: 'string', maxLength: MAX_VALUE_LENGTH }, { type: 'number' }, { type: 'boolean' }, { type: 'null' }] };
+const SOURCE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['file_path'],
+  properties: {
+    file_path: { type: 'string' },
+    line: { type: 'integer', minimum: 1 },
+    byte_offset: { type: 'integer', minimum: 0 },
+    byte_length: { type: 'integer', minimum: 1 },
+    json_pointer: { type: 'string', maxLength: 256 },
+    sha256: { type: 'string' },
+  },
 };
+const REFERENCE_PROPERTIES = SOURCE_SCHEMA.properties;
 const TEXT = { type: 'string', minLength: 1, maxLength: MAX_TEXT };
 const TEXT_LIST = { type: 'array', maxItems: MAX_ENTRIES, items: TEXT };
-const SOURCE_SCHEMA = { type: 'object', properties: REFERENCE_PROPERTIES, additionalProperties: false, required: ['file_path'] };
 const VALUE_FIELDS = {
   label: TEXT,
   result_id: { type: 'string' },
-  pointer: { type: 'string', maxLength: 256, description: '字段路径，如 /steps/0/result。' },
-  value: { anyOf: [{ type: 'string', maxLength: MAX_VALUE_LENGTH }, { type: 'number' }, { type: 'boolean' }, { type: 'null' }] },
+  pointer: { type: 'string', maxLength: 256 },
+  value: SCALAR_SCHEMA,
   tool: { type: 'string' },
-  sources: { type: 'array', maxItems: MAX_RESULT_SOURCES, items: SOURCE_SCHEMA },
+  sources: { type: 'array', maxItems: MAX_RESULT_SOURCES, items: { type: 'object' } },
 };
 const VALUE_LIST = {
   type: 'array', maxItems: MAX_ENTRIES,
-  items: { type: 'object', properties: VALUE_FIELDS, additionalProperties: false, required: ['label', 'result_id', 'pointer', 'value'] },
-};
-const INSIGHT_FIELDS = {
-  text: TEXT,
-  source: { type: 'string', enum: ['self', 'human', 'external'] },
-  note: TEXT,
-};
-const INSIGHT_LIST = {
-  type: 'array', maxItems: 16,
-  items: { type: 'object', properties: INSIGHT_FIELDS, additionalProperties: false, required: ['text', 'source'] },
-};
-const HINT_FIELDS = {
-  hint: TEXT,
-  source: { type: 'string', enum: ['self', 'human', 'external'] },
-  hypothesis: TEXT,
-  test: TEXT,
-  verified: { type: 'boolean' },
-};
-const HINT_LIST = {
-  type: 'array', maxItems: 16,
-  items: { type: 'object', properties: HINT_FIELDS, additionalProperties: false, required: ['hint', 'source', 'hypothesis'] },
-};
-const EXPERIMENT_FIELDS = {
-  label: TEXT,
-  hypothesis: TEXT,
-  pointer: VALUE_FIELDS.pointer,
-  expected: VALUE_FIELDS.value,
-  result_id: VALUE_FIELDS.result_id,
-  actual: VALUE_FIELDS.value,
-  tool: { type: 'string', enum: EXPERIMENT_TOOLS },
-  request_sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
-  sources: VALUE_FIELDS.sources,
+  items: { type: 'object', required: ['label', 'result_id', 'pointer', 'value'], properties: VALUE_FIELDS, additionalProperties: false },
 };
 const PROGRESS_FIELDS = {
-  insights: { ...INSIGHT_LIST, description: '关键判断及来源（self/human/external）。' },
-  hints: { ...HINT_LIST, description: '提示假设与验证记录。' },
   confirmed: {
     type: 'array', maxItems: MAX_ENTRIES,
-    items: {
-      type: 'object', required: ['text', 'sources'], additionalProperties: false,
-      properties: {
-        text: TEXT,
-        sources: {
-          type: 'array', minItems: 1, maxItems: MAX_SOURCES,
-          items: SOURCE_SCHEMA,
-        },
-      },
-    },
+    items: { type: 'object', required: ['text', 'sources'], additionalProperties: false, properties: { text: TEXT, sources: { type: 'array', minItems: 1, maxItems: MAX_SOURCES, items: SOURCE_SCHEMA } } },
   },
   ruled_out: TEXT_LIST,
   pending: TEXT_LIST,
   attachments: { type: 'array', maxItems: MAX_ATTACHMENTS, items: { type: 'string' } },
-  commands: {
-    type: 'array', maxItems: 16,
-    items: {
-      type: 'object', additionalProperties: false, required: ['command'],
-      properties: {
-        command: TEXT,
-        exit_code: { type: 'integer' },
-        output: TEXT,
-        cwd: TEXT,
-      },
-    },
-  },
-  values: VALUE_LIST,
-  experiments: {
-    type: 'array', maxItems: MAX_EXPERIMENTS,
-    items: { type: 'object', additionalProperties: false, properties: EXPERIMENT_FIELDS,
-      required: ['label', 'hypothesis', 'pointer', 'expected'] },
-  },
+  commands: { type: 'array', maxItems: 16, items: { type: 'object', required: ['command'] } },
+  values: { type: 'array', maxItems: MAX_ENTRIES, items: { type: 'object', required: ['label', 'result_id', 'pointer', 'value'] } },
+  insights: { type: 'array', maxItems: 16, items: { type: 'object', required: ['text', 'source'] } },
+  hints: { type: 'array', maxItems: 16, items: { type: 'object', required: ['hint', 'source', 'hypothesis'] } },
+  experiments: { type: 'array', maxItems: MAX_EXPERIMENTS, items: { type: 'object', required: ['label', 'hypothesis', 'pointer', 'expected'] } },
+};
+const INSIGHT_FIELDS = { text: TEXT, source: { type: 'string', enum: ['self', 'human', 'external'] }, note: TEXT };
+const HINT_FIELDS = { hint: TEXT, source: { type: 'string', enum: ['self', 'human', 'external'] }, hypothesis: TEXT, test: TEXT, verified: { type: 'boolean' } };
+const EXPERIMENT_FIELDS = {
+  label: TEXT, hypothesis: TEXT, pointer: VALUE_FIELDS.pointer, expected: SCALAR_SCHEMA,
+  result_id: VALUE_FIELDS.result_id, actual: SCALAR_SCHEMA, tool: { type: 'string', enum: EXPERIMENT_TOOLS },
+  request_sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' }, sources: VALUE_FIELDS.sources,
 };
 
 export const PROGRESS_PROPERTIES = {
   action: { type: 'string', enum: ['load', 'check', 'save', 'writeup', 'handoff', 'results', 'experiments', 'repair'],
-    description: '按动作传对应字段：check 传 claims；save 传 revision+progress；repair 传 revision。' },
+    description: 'load/handoff/results 仅传 action；check 传 claims；save 传 revision+progress(+instance)；writeup/repair 传 revision；experiments 可选 experiment_query。' },
   revision: { type: 'string', description: 'load 返回的 notes.md 版本（save/repair 必填）。' },
-  claims: { ...VALUE_LIST, description: 'check 待核对的工具值列表。' },
+  claims: { ...VALUE_LIST, description: 'check 待核对的工具值列表（label/result_id/pointer/value）。' },
   experiment_query: {
     type: 'object', additionalProperties: false, required: ['tool', 'args'],
     properties: { tool: { type: 'string', enum: EXPERIMENT_TOOLS }, args: { type: 'object' } },
@@ -124,6 +82,7 @@ export const PROGRESS_PROPERTIES = {
   progress: {
     type: 'object', properties: PROGRESS_FIELDS, additionalProperties: false,
     required: ['confirmed', 'ruled_out', 'pending'],
+    description: 'save 进度对象：confirmed/ruled_out/pending 必填，可选 attachments/commands/values/insights/hints/experiments。',
   },
   instance: { type: 'string', maxLength: 200, description: 'save 可选实例标识。' },
 };
@@ -139,22 +98,11 @@ export const PROGRESS_ACTION_KEYS = Object.freeze({
   repair: ['action', 'revision'],
 });
 
-const REQUIRED_PROGRESS_ACTION_KEYS = {
-  check: ['claims'],
-  save: ['revision', 'progress'],
-  repair: ['revision'],
-};
-
 export const PROGRESS_PARAMETERS = {
   type: 'object',
   properties: PROGRESS_PROPERTIES,
   additionalProperties: false,
   required: ['action'],
-  oneOf: Object.entries(PROGRESS_ACTION_KEYS).map(([action, allowed]) => ({
-    properties: { action: { type: 'string', const: action } },
-    required: ['action', ...(REQUIRED_PROGRESS_ACTION_KEYS[action] ?? [])],
-    not: { anyOf: Object.keys(PROGRESS_PROPERTIES).filter(key => !allowed.includes(key)).map(key => ({ required: [key] })) },
-  })),
 };
 
 function digest(text) {

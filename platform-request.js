@@ -23,7 +23,7 @@ export function platformAuthHeaders(config) {
   if (!HEADER_TOKEN.test(header)) throw new ToolError('unsupported', 'platformAuthHeader 不是合法的 HTTP 头名称。');
   const scheme = config?.platformAuthScheme === undefined ? 'Bearer' : String(config.platformAuthScheme).trim();
   if (/[\r\n\0]/u.test(scheme)) throw new ToolError('unsupported', 'platformAuthScheme 不能包含换行或控制字符。');
-  return { [header]: scheme ? `${scheme} ${token}` : token };
+  return { [header]: scheme ? (scheme.endsWith('=') ? `${scheme}${token}` : `${scheme} ${token}`) : token };
 }
 
 export function redactPlatformToken(response, token = '') {

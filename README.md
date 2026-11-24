@@ -42,7 +42,7 @@
 | 识别附件结构、归档目录 | `inspect_attachment`、`read_archive_member` |
 | 让已读成员或派生字节继续进入分析 | `source_result_id` / `source_result_ids` |
 | PDF 页面与内嵌附件 | `inspect_media`（`kind: pdf`） |
-| SQLite / Office 文件 | `inspect_media`（`kind: sqlite` / `office`） |
+| SQLite / Office / AI 模型与 Pickle 静态体检 | `inspect_media`（`kind: sqlite` / `office` / `model`） |
 | 复算编码/密码/哈希/RSA | `calculate_offline` |
 | JWT/Flask Session/LCG/MT19937 求解与脚手架 | `crypto_solver`（`solve` / `template` / `check`） |
 | 发 HTTP / 连 TCP | `http_request` / `net_session` |
@@ -79,6 +79,7 @@
   - `kind: audio` 读取 RIFF/RIFX WAV 头和 INFO 标签、原生 FLAC STREAMINFO 和 Vorbis 注释、ID3v1 和常规 ID3v2.3/2.4 文字帧，无需额外软件。WAV 的 PCM 和 FLAC 可在样本数已知时给出时长。 [FLAC 元数据规范](https://www.rfc-editor.org/rfc/rfc9639.html#section-8)
   - `kind: sqlite` 只读列出 SQLite 表或运行单条 SELECT / WITH 查询，默认每页 25 行、最多 100 行；写入、PRAGMA、ATTACH 和扩展加载会被拒绝。数据库在内存中打开，不落盘。
   - `kind: office` 从 DOCX、XLSX、PPTX、ODT、ODS 和 ODP 的 ZIP/XML 部件提取段落或单元格预览，不执行宏。可传 `office_part` 指定部件。旧式 `.doc` / `.xls` 暂不支持。
+  - `kind: model` 零执行静态体检 AI 模型与序列化文件（纯 Python 标准库）：支持 **Pickle**（`pickletools` 栈跟踪 `GLOBAL`/`STACK_GLOBAL`/`REDUCE` 与危险模块、尾随字节）、**PyTorch ZIP**（扫描 `.pkl` 与 TorchScript `.py`）、**Safetensors**（`__metadata__`、张量表与尾部附加字节）、**GGUF**（版本、KV 元数据与可疑模板）和 **ONNX**（IR 版本、自定义域与外部路径穿越），同样支持从 `read_archive_member` 经 `source_result_id` 链式检查。
   - `file_path` 可换成前一步的 `source_result_id`。可接 `read_archive_member`、PDF 派生结果、音频 LSB 或 PNG 位流；`source_result_ids` 只用于按顺序拼接同图像、同区域、同通道且偏移连续的 `bitstream` 页。派生结果保留输入 SHA-256 和来源位置。缓存限当前会话，DSH 重载后需重新读取来源。
   - PNG 和二维码图像限单边 16384、总像素 16777216。依赖缺失时返回 `dependency_missing`、缺失组件和原件 SHA-256。
 - `read_log_range`（扩展审计层）按 `byte_offset` 读取 UTF-8 日志或文本，`byte_length` 可传 1 至 4096。工具会向外对齐完整字符，返回实际范围和 `next_byte_offset`。读取下一段时，可将上一段的 SHA-256 填入 `expected_sha256`，核对原件是否变化。
@@ -101,19 +102,20 @@
   - TCP 流的 `first_packet`、`last_packet` 保留捕获记录的文件偏移和 UTC 时间。SPB 等没有时间戳的记录返回 `timestamp_utc: null`。
   - `dns_udp.samples` 返回前 24 条有完整 DNS 头的 UDP 53 样本，附捕获位置、查询名和响应 TXT。解析会保留畸形或截断标记，头部计数仍统计整份抓包。 [DNS 报文格式](https://www.rfc-editor.org/rfc/rfc1035.html#section-4.1)
   - UDP 统计包括 IPv4 数据报数量及端口 53 上可读取的 DNS 报文头数量、查询、响应、截断标志和基础响应码。IPv4 分片及截断包单列，避免将首段当完整报文。
-- `browser_session` 在隔离的浏览器配置中查看已授权页面、DOM、标题、Cookie、localStorage/sessionStorage、捕获的网络请求（`network`，传 `request_id` 可读最多 64 KiB 响应体）和控制台日志/JS 异常（`console`），并支持截图到题目目录。`click`、`fill`、`select`、`press` 可操作唯一匹配的页面元素；这些交互须处于可写会话。`press` 支持 Enter、Tab、Escape、方向键、空格、Backspace 和 Delete。`wait_for` 等待动态页面元素，最长 30 秒。填充值最多 16 KiB；存储结果最多 32 项、每值 2 KiB。`cookies` 默认返回赛题 Cookie 值（仅脱敏平台令牌；设 `include_values: false` 可仅列元数据）。`timeout_ms` 覆盖启动与操作；取消、超时和关闭都会清理进程及临时配置目录。
-- `ctf_sandbox` 提供跨平台 Linux 安全工具沙箱（Docker 优先，自动回退至本机 WSL2 发行版；内置 30 秒探测缓存，支持单次传 `backend: "auto" | "docker" | "wsl"` 与 `profile: "auto" | "base" | "heavy"` 覆盖，强隔离运行不可信程序传 `backend: "docker"` 可禁止静默降级至 WSL2）：
-  - `status` 探测当前可用后端、双层镜像就绪状态（`profiles.base` / `profiles.heavy`）及内部 52 项二进制与 21 项 Python 模块矩阵。
-  - `exec` 运行单行命令或工作区相对脚本（`.py`/`.sh`/`.sage`）；默认 `profile: "auto"` 自动检测 `angr`/`ghidra`/`jadx`/`apktool`/`sage` 及 `.py` 脚本导入头部，按需自动切入 `dsh-ctf-sandbox:heavy` 并扩容容器内存至 `4g`；Docker 后端默认 `--network=none` 纯离线运行，连远程靶机可传 `network: "bridge"`，动态调试传 `ptrace: true`。
+- `browser_session` 在隔离的浏览器配置中查看已授权页面、DOM、标题、Cookie、localStorage/sessionStorage、捕获的网络请求（`network`，传 `request_id` 可读最多 64 KiB 响应体）、控制台日志/JS 异常（`console`）以及自动捕获并放行的弹窗记录（`dialogs`，防止 XSS 弹窗阻塞会话），并支持截图到题目目录。`click`、`fill`、`select`、`press`、`evaluate`（执行页面 JS 表达式）、`set_cookie`（受 `authorize` 来源约束）、`set_headers`（附加自定义请求头）与 `upload_file`（上传工作区内文件到 `<input type="file">`）均须处于可写会话。`press` 支持 Enter、Tab、Escape、方向键、空格、Backspace 和 Delete。`wait_for` 等待动态页面元素，最长 30 秒。填充值最多 16 KiB；存储结果最多 32 项、每值 2 KiB。`cookies` 默认返回赛题 Cookie 值（仅脱敏平台令牌；设 `include_values: false` 可仅列元数据）。`timeout_ms` 覆盖启动与操作；取消、超时和关闭都会清理进程及临时配置目录。
+- `ctf_sandbox` 提供跨平台 Linux 安全工具沙箱（Docker 优先，自动回退至本机 WSL2 发行版；内置 30 秒探测缓存，支持单次传 `backend: "auto" | "docker" | "wsl"` 与 `profile: "auto" | "base" | "heavy"` 覆盖，强隔离运行不可信程序传 `backend: "docker"` 可禁止静默降级至 WSL2；Docker 容器默认启用 `--cap-drop=ALL` 与 `--security-opt=no-new-privileges:true` 加固）：
+  - `status` 探测当前可用后端、双层镜像就绪状态（`profiles.base` / `profiles.heavy`）及内部兵器库二进制与 Python 模块矩阵（只读挂载 `/work:ro`）。
+  - `exec` 运行单行命令或工作区相对脚本（`.py`/`.sh`/`.sage`）；默认 `profile: "auto"` 自动检测 `angr`/`ghidra`/`jadx`/`apktool`/`sage` 及 `.py` 脚本导入头部，按需自动切入 `dsh-ctf-sandbox:heavy` 并扩容容器内存至 `4g`；Docker 后端默认 `--network=none` 纯离线运行，连远程靶机可传 `network: "bridge"`，动态调试传 `ptrace: true`，仅做只读扫描可传 `read_only_work: true` 挂载 `/work:ro`。
   - `decompile` 默认优先 `r2`/`r2ghidra`（单次 `-A` 分析输出 `pdg`/`pdc` 与 `pdf`/`axt`；基础镜像无 `r2` 且本机有 `heavy` 时自动升级 Ghidra；显式传 `profile: "heavy"` 时优先调用 Ghidra Headless 并默认给足 120 秒超时，按二进制 SHA-256 持久化缓存项目至 `.ctf-cache/ghidra/` 复用，仍保留 `objdump`/PT_LOAD/gdb 兜底），省略 `function` 时列函数表，传入函数名或地址输出伪 C/汇编。
-  - `pwn_triage` 一次性采集 `file`、`checksec`、`DT_NEEDED`/解释器、`ROPgadget` 关键 gadget，以及可选（`allow_exec: true`）`seccomp-tools dump`。
+  - `pwn_triage` 一次性采集 `file`、`checksec`、`DT_NEEDED`/解释器、`ROPgadget` 关键 gadget，以及可选（`allow_exec: true`）`seccomp-tools dump`（默认只读挂载 `/work:ro`）。
   - 双层镜像构建（在 `ctf-preset` 目录按需手动执行，建完后无需修改配置即可自动按需切换）：
-    - 基础全栈版（覆盖 ~90% 题型，含 32 位运行库、`qemu-user`/`gdb-multiarch`/`gef`、`radare2`+`r2ghidra`、`fpylll`/`z3`/`pwntools`/`ropper`/`seccomp-tools`/`one_gadget`/`zsteg`/`exiftool`/`volatility3`/`wabt`/`sleuthkit`/`cpio`/`pillow`/`numpy`/`scipy`/`scapy`/`xdis`/`php`/`node`）：`docker build -t dsh-ctf-sandbox:latest docker/`（可传 `--build-arg WITH_R2=0` 或 `--build-arg PIP_INDEX_URL=...`）。
+    - 基础全栈版（版本锁定 `radare2`/`GEF`/`bkcrack`/`ffuf`/`pwninit`，覆盖 ~90% 题型，含 32 位运行库、`qemu-user`/`gdb-multiarch`/`gef`、`radare2`+`r2ghidra`、`pwntools`/`pwninit`/`z3`/`fpylll`/`ROPgadget`/`ropper`/`seccomp-tools`/`one_gadget`/`bkcrack`/`ffuf`/`sqlmap`/`john`/`tesseract-ocr`/`pyinstxtractor-ng`/`zsteg`/`exiftool`/`volatility3`/`wabt`/`sleuthkit`/`cpio`/`pillow`/`numpy`/`scipy`/`scapy`/`xdis`/`php`/`node`）：`docker build -t dsh-ctf-sandbox:latest docker/`（可传 `--build-arg WITH_R2=0` 或 `--build-arg PIP_INDEX_URL=...`）。
     - 重型扩展版（`FROM dsh-ctf-sandbox:latest` 增量叠加，默认含 Ghidra Headless + `angr` + `jadx`/`apktool`，可加 `--build-arg WITH_SAGE=1` 启用 SageMath）：`docker build -f docker/Dockerfile.heavy -t dsh-ctf-sandbox:heavy docker/`；构建完成后 `ctf_sandbox` 默认 `profile: "auto"` 会自动发现并按需启用（亦可通过 `sandboxHeavyImage` 自定义重型镜像名）。
-- `ctf_arena` 原生适配 **CTFd**、**GZCTF** 与通用赛题平台（`platformType: "auto" | "ctfd" | "gzctf" | "generic"`，GZCTF 可配 `platformGameId`）：支持 `status` / `games` / `challenges` / `detail`（自动授权题面与连接信息中的靶机）/ `sync_graph`（幂等导入 `.ctf-graph/` 并按分值排优）/ `fetch_files` / `container` / `submit`。
+- `ctf_arena` 原生适配 **CTFd**、**GZCTF** 与通用赛题平台（`platformType: "auto" | "ctfd" | "gzctf" | "generic"`，GZCTF 自动适配 `Cookie: GZCTF_Token=` 认证并可配 `platformGameId`）：支持 `status` / `games` / `challenges` / `detail`（自动授权题面与连接信息中的靶机）/ `sync_graph`（幂等导入 `.ctf-graph/`，按分值升序、同分按解出人数 `solves` 降序排优）/ `fetch_files` / `container`（`create`/`delete`/`extend` 容器续期）/ `submit`。
 - `ctf_graph` 在工作区 `.ctf-graph/` 维护跨题/跨代理分层 Fact-Intent DAG（`graph.json` + `graph.saved.json` 恢复副本 + 自动投影的 `BOARD.md`）：
-  - `board` 返回第一层极简标题索引、按题汇总（`challenges`）、已排除路线（`ruled_out`）与超时预警（`overdue`），控制上下文开销；`BOARD.md` 自动生成总览表与进行中/已结案分区；
+  - `board` 返回第一层极简标题索引、按题汇总（`challenges`）、已排除路线（`ruled_out`）与超时预警（`overdue`），支持 `status_filter`（`all|active|open|claimed|done|dead|overdue`）、`limit`/`offset` 分页与 `summary_only` 控制上下文开销；`BOARD.md` 自动生成总览表与进行中/已结案分区；
   - `expand` 按 `fact_ids`/`intent_ids` 按需展开二/三层摘要与证据；
+  - `export_writeup` 只读导出单题或全图谱 Markdown 题解草稿；
   - `add_fact` / `add_intent` 写入确认事实（支持 `dedupe_key` 去重与 `spawn_intents` 派生任务）；
   - `claim_intent` 通过 CAS 乐观锁互斥认领指定 ID 或 `next: true` 最高优任务，超时卡死支持 `steal_overdue: true` 接管；
   - `finish_intent` 原子结案（`done`/`dead`）并写入产出 `facts` 与新 `spawn_intents`；内置持有者与终态 Fencing 校验，拒绝越权覆盖或重复结案；
@@ -121,9 +123,9 @@
 - `gdb_driver` 对工作区内的二进制做静态检查或受限调试。`action: inspect` 的 `kind` 为 `files`/`sections`；`action: debug` 接受 1–24 条只读白名单命令（支持算术偏移如 `b *main+0x1a`、`x/20gx $rbp-0x40`、`p/x $rax-$rbx`、`p *(void**)$rsp` 及常用缩写 `c`/`ni`/`si`/`n`/`s`/`i r`/`disas`/`fin`），可选 `args` 传命令行参数与 `stdin_file` 重定向输入。在 Windows 宿主遇到 Linux ELF 且沙箱可用时自动经 Docker/WSL2 调用 Linux `gdb`。仍禁用 shell、Python、`source`、写内存赋值与自动加载。
 - `archive_crack` 读取 ZIP 中央目录并尝试 ZipCrypto 口令：`passwords`、`wordlist`、`mask`（`?l` `?u` `?d` `?h` `?s` `?a` 与字面字符）和内置弱口令，默认 30 秒；命中后用解压 CRC 复核。AES（method 99）或需要 john/hashcat 的场景会给出替代提示。
 - `stego_audio` 解析 WAV（PCM 8/16/24 位）的元数据和 LSB，或用多窗 FFT 生成时频谱 PNG。`start_seconds` / `duration_seconds` 或帧号限定片段，`channels` 选择声道；默认混合全部声道。图的横轴为所选片段时间，纵轴为频率，返回窗长、步长、频率刻度及主要峰值。
-- `mobile_apk`（扩展审计层）读取 APK 的清单、dex、ABI、native 库、assets、META-INF 签名文件和 APK Sig Block；`decompile` 调 jadx/apktool，`signature` 调 apksigner/jarsigner。
+- `mobile_apk`（扩展审计层）读取 APK 的清单、dex、ABI、native 库、assets、META-INF 签名文件和 APK Sig Block；`decompile` 优先调本机 jadx/apktool，本机缺失时自动桥接 `ctf_sandbox`（优先 `heavy` 镜像）；`signature` 调 apksigner/jarsigner。
 - 云环境取证需把脱敏后的日志或配置作为附件放入题目目录，再用文本和证据工具检查。`cloud_metadata`（扩展审计层）仅保留兼容入口，实际探测已关闭。
-- `crypto_solver` 支持 `check`（探测 Python 密码库）、`template`（生成可运行的 `z3_bitvec`/`coppersmith`/`lattice`/`aes_mode` 脚手架到 `.ctf-templates/`）以及 `solve`（零依赖纯 Node.js 即用求解：`jwt_inspect`、`jwt_crack`、`flask_session`、`lcg_recover`、`mt19937_recover`）。
+- `crypto_solver` 支持 `check`（探测 Python 密码库）、`template`（生成 7 个零占位可运行脚手架到 `.ctf-templates/`：`z3_bitvec`/`coppersmith`/`lattice`/`aes_mode`/`ecc_weak`/`padding_oracle`/`hash_ext`）以及 `solve`（零依赖纯 Node.js 即用求解：`jwt_inspect`、`jwt_crack`、`flask_session`、`lcg_recover`、`mt19937_recover`）。
 - `verify_elf`（扩展审计层）重新读取原文件，核验指定的入口、`main`、动态符号偏移标注或 SHA-256。
 - `rev_query` 用本机 Python 3.11+ 支持 **ELF32 / ELF64**（x86、x86-64、ARM、AArch64、RISC-V）与 **PE32 / PE32+**（x86、x86-64、AArch64）：`triage` 无需 `capstone` 即可快检格式、节表、加壳/编译器（UPX/PyInstaller/Go/Rust/.NET/GCC/Clang/MSVC）与密码常量（AES S-box、SHA-256、MD5、ChaCha20、TEA delta、CRC32、自定义 Base64 表）；`cfg` 支持 x86-64/x86/AArch64 ELF 函数控制流；`disassemble` 返回 20–400 条线性指令；`strings` 扫描可见字符串。文件限 64 MiB。
 - `verify_evidence`（扩展审计层）对照 2 至 8 个证据位置，适合核验源码声明、配置和日志里的同一字段。选定普通 UTF-8 文本文件和目标值前的原样 `prefix`，可用 1 起始的 `line` 消歧，或指定值后的 `suffix`。省略后缀时取到行尾。也可以直接传 `{ "result_id": "..." }` 引用 `read_binary_range`、`read_log_range` 等结果的记录位置，工具按记录的偏移和 SHA-256 复核，不必重写前缀。工具按原样比较值，返回一致、冲突或证据不足，并记录原件 SHA-256、行号、从 0 起算的字节偏移和长度。每个文件限 32 MiB。
@@ -169,7 +171,7 @@
   - 直接输入与 `expected` 最多 4,096 字符，整批最多 12 步。运算错误会标记该步和受影响的后续步骤。
 - `workbench_base100`（扩展审计层）调用本机 CTF 工作台的 Base100 编解码，可在一个请求里提交 1 至 8 项。编码接受 UTF-8 或成对 Hex。解码返回 Hex，并在字节是有效 UTF-8 时返回文本。每项最多处理 4096 字节，按工作台规则识别编码偏移。
   - 使用下方本机配置关联工作台的 `ctf_extra_ops.py` 和已验证的 SHA-256。连续调用会复用 Python 进程，空闲 60 秒后退出。
-- `ctf_progress` 用当前题目目录的 `notes.md` + `.ctf/state.json` 续接分析。参数 schema 按 `action` 限定字段：`check` 只收 `claims`，`save` 收 `revision`、`progress` 和可选 `instance`，`repair` 收 `revision`。`notes.md` 只保留人读的"结论/命令/排除/待办"（以及判断来源、提示吸收），机器状态（revision、session、instance、values）在 `.ctf/state.json`。保存以 revision 做 CAS；旧 revision 会拒绝覆盖，状态文件保留上一份和恢复副本，`repair` 为手改笔记另留备份。`load` 恢复结论、已排除假设、待补证据和工具值，并核对原件的 SHA-256 与引用范围；旧版内联 JSON 块仍可读，`save` 后自动迁移。
+- `ctf_progress` 用当前题目目录的 `notes.md` + `.ctf/state.json` 续接分析。运行时按 `action` 严格限定对应字段（schema 保持精简紧凑）：`check` 只收 `claims`，`save` 收 `revision`、`progress` 和可选 `instance`，`repair` 收 `revision`。`notes.md` 只保留人读的"结论/命令/排除/待办"（以及判断来源、提示吸收），机器状态（revision、session、instance、values）在 `.ctf/state.json`。保存以 revision 做 CAS；旧 revision 会拒绝覆盖，状态文件保留上一份和恢复副本，`repair` 为手改笔记另留备份。`load` 恢复结论、已排除假设、待补证据和工具值，并核对原件的 SHA-256 与引用范围；旧版内联 JSON 块仍可读，`save` 后自动迁移。
 - `load` 的 `value_status` 区分 `reverified`（当前工具值和原件引用均已复核）、`tool_match`（当前工具值一致，缺少可复核的原件引用）、`recorded`（仅从笔记恢复）、`review`（原件或引用待复核）、`unavailable` 和 `mismatch`。笔记、题解和简报也会区分这些状态。
 - `ctf_progress check` 对照当前工具输出核对 `claims`。每项传 `label`、`result_id`、`pointer` 和 `value`，例如 `/steps/0/result`。字符串 `"12"` 和数值 `12` 会判为不一致。只有工具值时返回 `tool_match`，只有笔记保存值时返回 `recorded`。原件的当前哈希和引用位置可通过 `load` 复核。
 - `progress.experiments` 可保存单题验证，每项填写 `label`、`hypothesis`、`pointer`、`expected` 和可选的 `result_id`。保存时从结果取得实际标量值。用 `action: experiments` 查阅，或传 `experiment_query: {"tool":"calculate_offline","args":{...}}` 按原调用参数找回验证。响应复核原件，并区分支持、反驳与证据不足；`observation_status` 标明观测来自当前会话或历史记录。
@@ -261,8 +263,9 @@ preset 已声明平台 shell（Windows 为 `pwsh`，其他平台为 `bash`），
 
 ## 变更记录
 
-完整变更与兼容矩阵见 `CHANGELOG.md`（当前 `0.49.1`）。近期摘要：
+完整变更与兼容矩阵见 `CHANGELOG.md`（当前 `0.50.0`）。近期摘要：
 
+- 0.50.0 精简 `ctf_progress` schema（-61%）；`ctf_graph` 新增 `board` 分页/过滤与只读 `export_writeup`；`ctf_arena` 支持 GZCTF `Cookie: GZCTF_Token=` 自动认证、`container extend` 与同分按 `solves` 排优；`browser_session` 新增弹窗自动捕获（`dialogs`）、`evaluate`/`set_cookie`/`set_headers`/`upload_file`；Docker 沙箱加固 `--cap-drop=ALL`/`no-new-privileges`/`read_only_work` 并增补 `bkcrack`/`ffuf`/`sqlmap`/`john`/`tesseract-ocr`/`pyinstxtractor-ng`/`pwninit`；`mobile_apk` 缺失本机工具时自动桥接沙箱；`inspect_media` 新增 `kind: "model"`（Pickle/PyTorch/Safetensors/GGUF/ONNX 静态安全体检）；`crypto_solver` 新增 `ecc_weak`/`padding_oracle`/`hash_ext` 脚手架；回归测试增至 149 项、覆盖率超 70%。
 - 0.49.1 加固 `ctf_graph finish_intent` 持有者与终态 Fencing 校验；`ctf_sandbox decompile` 合并 `r2` 单次分析并为 Ghidra 持久化项目缓存；`ctf_doctor` 增加 `tool_tier_sync` 与 `skill_sync` 自检；统一只读 `permission` 与 `EEXIST -> conflict` 错误分类并对齐扩展层文档。
 - 0.49.0 新增工具分层（27 核心 / 45 全量）、`ctf_sandbox` 双层镜像自动路由与 WSL2 兜底、`ctf_graph` 共享图谱与 `dispatch_plan`、`ctf_arena` CTFd/GZCTF 适配、`crypto_solver solve` 零依赖求解、`rev_query` 多架构/PE/`triage`、`gdb_driver` Linux 自动桥接与 `ctf_doctor` 双镜像自检。
 - 0.48.0 `rev_query` 新增函数级 `cfg` 控制流分析（基本块、分支/调用与 RIP 相对数据引用）。

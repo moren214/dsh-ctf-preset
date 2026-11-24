@@ -57,11 +57,17 @@ for (const [name, tool] of fullTools) {
   });
 }
 
-test('ctf_progress schema separates fields by action', () => {
-  const schema = coreTools.get('ctf_progress').parameters;
-  assert.equal(schema.oneOf.length, 8);
-  assert.ok(schema.oneOf.some(variant => variant.properties.action.const === 'save'));
-  assert.ok(schema.oneOf.some(variant => variant.properties.action.const === 'repair'));
+test('ctf_progress schema stays compact while runtime still separates fields by action', async () => {
+  const tool = coreTools.get('ctf_progress');
+  const schema = tool.parameters;
+  assert.equal(schema.oneOf, undefined, 'avoid verbose oneOf/not schema bloat');
+  assert.ok(JSON.stringify(schema).length < 3600, 'ctf_progress schema should stay compact');
+  const invalid = JSON.parse(await tool.execute({ action: 'load', revision: 'abc' }, {
+    signal: new AbortController().signal,
+    agent: { session: {} },
+  }));
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.error.kind, 'unsupported');
 });
 
 test('package.json version, files manifest, CHANGELOG.md, and README.md stay consistent', async () => {

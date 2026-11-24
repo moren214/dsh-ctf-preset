@@ -19,7 +19,7 @@ export const ARENA_PROPERTIES = {
   category: { type: 'string', maxLength: 120 },
   unsolved_only: { type: 'boolean', default: true },
   limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
-  container_action: { type: 'string', enum: ['create', 'delete'] },
+  container_action: { type: 'string', enum: ['create', 'delete', 'extend'] },
   flag: { type: 'string', maxLength: 512 },
   pattern: { type: 'string', maxLength: 200 },
   source: { type: 'string', maxLength: 400 },
@@ -50,8 +50,22 @@ function okHttp(response) {
 }
 
 function adapterConfig(config, adapter) {
-  if (adapter === 'ctfd' && config?.platformAuthHeader === undefined && config?.platformAuthScheme === undefined) {
+  if (config?.platformAuthHeader !== undefined || config?.platformAuthScheme !== undefined) {
+    return config;
+  }
+  if (adapter === 'ctfd') {
     return { ...config, platformAuthScheme: 'Token' };
+  }
+  if (adapter === 'gzctf') {
+    const { token } = platformCredential(config);
+    if (token) {
+      if (/(?:^|;\s*)GZCTF_Token=/u.test(token)) {
+        return { ...config, platformAuthHeader: 'Cookie', platformAuthScheme: '' };
+      }
+      if (!token.includes('=')) {
+        return { ...config, platformAuthHeader: 'Cookie', platformAuthScheme: 'GZCTF_Token=' };
+      }
+    }
   }
   return config;
 }
@@ -64,7 +78,7 @@ export async function resolveAdapter(config, requestedType, gameId, signal, requ
   if (configured !== 'auto') return configured;
   if (gameId) {
     try {
-      const gz = await requestFn(config, signal, 'GET', `/api/game/${encodeURIComponent(gameId)}/details`);
+      const gz = await requestFn(adapterConfig(config, 'gzctf'), signal, 'GET', `/api/game/${encodeURIComponent(gameId)}/details`);
       if (okHttp(gz)) return 'gzctf';
     } catch { /* fall through */ }
   }
@@ -76,7 +90,7 @@ export async function resolveAdapter(config, requestedType, gameId, signal, requ
     }
   } catch { /* fall through */ }
   try {
-    const gz = await requestFn(config, signal, 'GET', '/api/game');
+    const gz = await requestFn(adapterConfig(config, 'gzctf'), signal, 'GET', '/api/game');
     const body = parseJsonBody(gz);
     if (okHttp(gz) && (Array.isArray(body) || Array.isArray(body?.data))) {
       return 'gzctf';
@@ -189,12 +203,20 @@ function normalizeSubmitResponse(adapter, response) {
   return mapped ? { ...response, body: JSON.stringify(mapped) } : response;
 }
 
-function priorityForChallenge(item, allValues) {
-  if (allValues.length === 0) return 3;
-  const sorted = [...allValues].sort((a, b) => a - b);
-  const idx = sorted.indexOf(item.value);
-  const ratio = sorted.length <= 1 ? 0.5 : idx / (sorted.length - 1);
-  // 较低分值往往是开场快手题，优先度更高（5 -> 1）
+function priorityForChallenge(item, allItems) {
+  if (allItems.length === 0) return 3;
+  // 综合分值（低分优先）与解出人数（高解出优先）：开赛初期所有题目初始分相同时按 solves 精准排序
+  const ordered = [...allItems].sort((a, b) => {
+    const scoreDiff = (a.value ?? 0) - (b.value ?? 0);
+    if (scoreDiff !== 0) return scoreDiff;
+    const solvesA = Number.isFinite(a.solves) ? a.solves : -1;
+    const solvesB = Number.isFinite(b.solves) ? b.solves : -1;
+    return solvesB - solvesA;
+  });
+  const key = entry => `${entry.value ?? 0}:${Number.isFinite(entry.solves) ? entry.solves : -1}`;
+  const itemKey = key(item);
+  const idx = ordered.findIndex(entry => key(entry) === itemKey);
+  const ratio = ordered.length <= 1 ? 0.5 : Math.max(0, idx) / (ordered.length - 1);
   if (ratio <= 0.2) return 5;
   if (ratio <= 0.45) return 4;
   if (ratio <= 0.7) return 3;
@@ -371,11 +393,10 @@ export async function runArena(args, {
     if (!listed.ok) return { action: 'sync_graph', adapter, status: 'failed', request: listed.request };
     const limit = Math.min(args.limit ?? 20, 50);
     const slice = listed.challenges.slice(0, limit);
-    const values = slice.map(c => c.value);
     const imported = [];
     let deduplicated = 0;
     for (const item of slice) {
-      const priority = priorityForChallenge(item, values);
+      const priority = priorityForChallenge(item, slice);
       const challengeKey = `${item.category.toLowerCase()}-${item.name}`.replace(/[^\w\u4e00-\u9fff.-]+/gu, '-').slice(0, 80);
       const res = await syncGraphFact({
         action: 'add_fact',
@@ -435,21 +456,24 @@ export async function runArena(args, {
   if (action === 'container') {
     const id = safeId(args.challenge_id, 'challenge_id');
     const op = args.container_action;
-    if (op !== 'create' && op !== 'delete') {
-      throw new ToolError('unsupported', 'container 需要指定 container_action 为 create 或 delete。');
+    if (op !== 'create' && op !== 'delete' && op !== 'extend') {
+      throw new ToolError('unsupported', 'container 需要指定 container_action 为 create、delete 或 extend。');
     }
     if (adapter !== 'gzctf') {
-      throw new ToolError('unsupported', `当前平台适配器 ${adapter} 不支持题目级容器启删，请使用 ctf_instance 管理实例。`);
+      throw new ToolError('unsupported', `当前平台适配器 ${adapter} 不支持题目级容器启删/续期，请使用 ctf_instance 管理实例。`);
     }
-    const route = `/api/game/${encodeURIComponent(requireGzGame())}/challenges/${encodeURIComponent(id)}/container`;
-    const res = await requestFn(cfg, signal, op === 'create' ? 'POST' : 'DELETE', route, op === 'create' ? {} : undefined);
+    const baseRoute = `/api/game/${encodeURIComponent(requireGzGame())}/challenges/${encodeURIComponent(id)}/container`;
+    const route = op === 'extend' ? `${baseRoute}/extend` : baseRoute;
+    const method = op === 'delete' ? 'DELETE' : 'POST';
+    const res = await requestFn(cfg, signal, method, route, op === 'delete' ? undefined : {});
     if (!okHttp(res)) return { action: 'container', container_action: op, adapter, status: 'failed', request: res };
-    const authorized = op === 'create' ? authorizeResponse?.(res) : undefined;
+    const authorized = op !== 'delete' ? authorizeResponse?.(res) : undefined;
+    const statusLabel = op === 'create' ? 'created' : op === 'extend' ? 'extended' : 'deleted';
     return {
       action: 'container',
       container_action: op,
       adapter,
-      status: op === 'create' ? 'created' : 'deleted',
+      status: statusLabel,
       challenge_id: id,
       container: parseJsonBody(res),
       ...(authorized ? { authorized_targets: authorized } : {}),

@@ -1,5 +1,19 @@
 # 变更记录
 
+## 0.50.0
+
+- **Schema 瘦身、图谱分页与 Writeup 导出（包 A）**：
+  - `ctf_progress` 去除冗长 `oneOf`/`not` 嵌套，Schema 体积缩减 ~61%（7.5 KB → 2.9 KB），运行时按 `action` 的字段校验完全保持不变。
+  - `ctf_graph` 的 `board` 新增 `status_filter`（`all|active|open|claimed|done|dead|overdue`）、`limit`/`offset` 分页与 `summary_only` 极简汇总；新增只读 `action: "export_writeup"` 一键导出按题/全图谱 Markdown 题解草稿。
+  - `ctf_arena` 原生支持 GZCTF `Cookie: GZCTF_Token=` 自动认证（由 `platform-request` 识别 `=` 后缀不插空格）、`container_action: "extend"` 容器续期，以及 `sync_graph` 同分题目按解出人数（`solves`）降序动态排优。
+- **Web 浏览器进阶、容器安全加固与 APK 沙箱桥接（包 B）**：
+  - `browser_session` 启用 `Page` 事件监听，自动捕获并放行 `alert`/`confirm`/`prompt`（防止 XSS 触发弹窗卡死会话），新增 `dialogs`、`evaluate`、`set_cookie`（受 `authorize` 来源约束）、`set_headers` 与 `upload_file`（受工作区路径约束）。
+  - `ctf_sandbox` 容器运行默认加固 `--cap-drop=ALL` 与 `--security-opt=no-new-privileges:true`，`status`/`pwn_triage` 及 `exec(read_only_work: true)` 自动以只读 `/work:ro` 挂载工作区；`docker/Dockerfile` 锁定 `radare2`/`GEF`/`bkcrack`/`ffuf`/`pwninit` 版本，并增补 `tesseract-ocr`、`john`、`sqlmap`、`pyinstxtractor-ng`、`bkcrack`、`ffuf`、`pwninit`；`mobile_apk(action: "decompile")` 在宿主机缺少 `jadx`/`apktool` 时自动桥接至 `ctf_sandbox`（优先 `heavy` 镜像）。
+- **AI 模型/Pickle 静态安全体检、密码学模板与覆盖率跃升（包 C）**：
+  - `inspect_media` 新增 `kind: "model"`（纯 Python 标准库零执行静态扫描），支持 **Pickle**（`pickletools` 模拟栈跟踪 `STACK_GLOBAL`/memo 混淆、识别危险模块/调用及尾随数据）、**PyTorch ZIP**（扫描 `.pkl` 与 TorchScript `.py`）、**Safetensors**（`__metadata__`/张量表/尾随隐写字节）、**GGUF**（KV 元数据与可疑模板）和 **ONNX**（自定义域与外部路径穿越），完整继承 `source_result_id` 零拷贝链路；同步将 `media-reader.js` 改为脚本文件路径调用，彻底消除 Windows 下 `-c` 命令行 32 KiB 长度限制。
+  - `crypto_solver` 新增 3 个零占位可运行脚手架：`ecc_weak`（纯标准库 Pohlig-Hellman + 异常曲线 Smart 攻击）、`padding_oracle`（AES-CBC 解密 + CBC-R 伪造）与 `hash_ext`（纯标准库 SHA-256 长度扩展）。
+  - 新增 `test/web-and-core-coverage.test.js` 并扩充回归用例至 **149 项**，消除 `net-session`、`elf`、`pwn-payload`、`browser-gateway`、`browser-session`、`audio-metadata` 等核心模块 0% 覆盖盲区，全局覆盖率突破 **70%+**。
+
 ## 0.49.1
 
 - **`ctf_graph` 结案 Fencing 保护**：`finish_intent` 拒绝重复结案已处终态（`done`/`dead`）的 Intent（返回 `status: "closed"`），并拒绝非当前持有者越权结案已被其他代理认领的 Intent（返回 `status: "conflict"`），防止超时接管后的滞后子代理覆盖新进度。
@@ -167,7 +181,8 @@
 
 | 插件版本 | DSH 版本 | 说明 |
 |---|---|---|
-| 0.49.x | `>=0.2.2-rc.5 <0.3.0` | 当前版本。默认 Core Tier（27 工具，`enableExtendedAudit: true` 恢复全部 45 工具）；新增 `ctf_sandbox`（双层镜像自动路由/WSL2 兜底）、`ctf_graph`、`ctf_arena` 与 `crypto_solver solve`。 |
+| 0.50.x | `>=0.2.2-rc.5 <0.3.0` | 当前版本。保持 Core Tier（27 核心 / 45 全量）；精简 `ctf_progress` schema、新增 `ctf_graph` 分页/`export_writeup`、`ctf_arena` GZCTF Cookie/续期/solves 排优、`browser_session` Web 进阶、Docker 加固与 `bkcrack`/`ffuf`/`sqlmap` 等兵器、`mobile_apk` 沙箱桥接、`inspect_media(kind: "model")` 及 3 个密码学脚手架。 |
+| 0.49.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。默认 Core Tier（27 工具，`enableExtendedAudit: true` 恢复全部 45 工具）；新增 `ctf_sandbox`（双层镜像自动路由/WSL2 兜底）、`ctf_graph`、`ctf_arena` 与 `crypto_solver solve`。 |
 | 0.48.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。函数级 Rev 控制流分析，以及 ZIP 候选检查、文件片段复读和压缩附件链路需要对应工具及宿主能力。 |
 | 0.45.x–0.47.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本；依具体功能需要相应工具及宿主能力。 |
 | 0.44.x–0.39.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本；ZIP 候选检查与文件片段复读需要 `ctx.fs.readByteRange`。 |

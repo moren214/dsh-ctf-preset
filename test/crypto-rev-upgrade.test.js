@@ -227,7 +227,7 @@ test('crypto-toolbox: mt19937_recover 与 Python random.Random 逐比特一致',
   assert.deepEqual(res.predictions, all.slice(624, 634));
 });
 
-test('crypto_solver template 生成的 4 个脚手架均无 NotImplementedError 且通过 Python 语法编译', async () => {
+test('crypto_solver template 生成的 7 个脚手架均无 NotImplementedError、语法编译通过且核心算法自检通过', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'ctf-templates-'));
   try {
     const tools = new Map();
@@ -259,16 +259,28 @@ test('crypto_solver template 生成的 4 个脚手架均无 NotImplementedError 
     const execution = { signal: new AbortController().signal, agent: { session: { header: { cwd }, id: 'tpl-test' } } };
     const python = process.platform === 'win32' ? 'python' : 'python3';
 
-    for (const kind of ['z3_bitvec', 'coppersmith', 'lattice', 'aes_mode']) {
+    const generated = new Map();
+    for (const kind of ['z3_bitvec', 'coppersmith', 'lattice', 'aes_mode', 'ecc_weak', 'padding_oracle', 'hash_ext']) {
       const out = JSON.parse(await tools.get('crypto_solver').execute({ action: 'template', kind }, execution));
       assert.equal(out.status, 'ok', JSON.stringify(out));
       const src = await readFile(out.file, 'utf8');
       assert.equal(src.includes('NotImplementedError'), false, `${kind} should not contain NotImplementedError`);
-      execFileSync(python, ['-c', 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")', out.file]);
+      execFileSync(python, ['-B', '-c', 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")', out.file]);
+      generated.set(kind, out.file);
     }
+
+    // 实跑纯标准库脚手架 ecc_weak 与 hash_ext 的内置自检
+    const eccRun = execFileSync(python, ['-B', generated.get('ecc_weak')], { encoding: 'utf8' });
+    assert.match(eccRun, /ecc_weak ok:/u);
+    const hashRun = execFileSync(python, ['-B', generated.get('hash_ext')], { encoding: 'utf8' });
+    assert.match(hashRun, /hash_ext ok:/u);
 
     const checkOut = JSON.parse(await tools.get('crypto_solver').execute({ action: 'check' }, execution));
     assert.equal(checkOut.status, 'ok', JSON.stringify(checkOut));
+    if (checkOut.modules.pycryptodome?.ok) {
+      const padRun = execFileSync(python, ['-B', generated.get('padding_oracle')], { encoding: 'utf8' });
+      assert.match(padRun, /padding_oracle ok:/u);
+    }
     const anyMissing = Object.values(checkOut.modules).some(m => !m.ok);
     if (anyMissing) {
       assert.ok(checkOut.sandbox_fallback && typeof checkOut.sandbox_fallback.hint === 'string');

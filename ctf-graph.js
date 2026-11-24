@@ -16,10 +16,14 @@ const FACT_KINDS = ['recon', 'vuln', 'credential', 'crypto', 'binary', 'flag', '
 export const GRAPH_PROPERTIES = {
   action: {
     type: 'string',
-    enum: ['board', 'expand', 'add_fact', 'add_intent', 'claim_intent', 'finish_intent', 'dispatch_plan'],
-    description: 'board 查索引；expand 展开；add_fact/add_intent 写入；claim_intent 互斥认领；finish_intent 结案；dispatch_plan 生成多代理并行分派计划。',
+    enum: ['board', 'expand', 'add_fact', 'add_intent', 'claim_intent', 'finish_intent', 'dispatch_plan', 'export_writeup'],
+    description: 'board 查索引（支持分页与 summary_only）；expand 展开；add_fact/add_intent 写入；claim_intent 互斥认领；finish_intent 结案；dispatch_plan 生成并行计划；export_writeup 导出题解草稿。',
   },
   challenge: { type: 'string', maxLength: 120 },
+  status_filter: { type: 'string', enum: ['all', 'active', 'open', 'claimed', 'done', 'dead', 'overdue'], description: 'board 按状态筛选 Intent（active=open+claimed）。' },
+  limit: { type: 'integer', minimum: 1, maximum: 500, description: 'board 每页最多返回的 Fact/Intent 条数（默认 50）。' },
+  offset: { type: 'integer', minimum: 0, maximum: 500, description: 'board 分页起始偏移（默认 0）。' },
+  summary_only: { type: 'boolean', default: false, description: 'board 仅返回按题汇总、统计与超时预警，不展开单条列表。' },
   fact_ids: { type: 'array', maxItems: 32, items: { type: 'string', maxLength: 32 } },
   intent_ids: { type: 'array', maxItems: 32, items: { type: 'string', maxLength: 32 } },
   kind: { type: 'string', enum: FACT_KINDS },
@@ -368,8 +372,18 @@ async function commitMutation(files, nowMs, mutate) {
   }
 }
 
-function summarizeBoard(graph, challengeFilter, nowMs) {
-  const facts = (challengeFilter ? graph.facts.filter(f => f.challenge === challengeFilter) : graph.facts)
+const BOARD_STATUS_FILTERS = ['all', 'active', 'open', 'claimed', 'done', 'dead', 'overdue'];
+const DEFAULT_BOARD_LIMIT = 50;
+
+function matchesBoardStatus(intent, statusFilter, nowMs) {
+  if (statusFilter === 'all') return true;
+  if (statusFilter === 'active') return intent.status === 'open' || intent.status === 'claimed';
+  if (statusFilter === 'overdue') return isIntentOverdue(intent, nowMs);
+  return intent.status === statusFilter;
+}
+
+function summarizeBoard(graph, challengeFilter, nowMs, { statusFilter = 'all', limit = DEFAULT_BOARD_LIMIT, offset = 0, summaryOnly = false } = {}) {
+  const allFacts = (challengeFilter ? graph.facts.filter(f => f.challenge === challengeFilter) : graph.facts)
     .map(f => ({
       id: f.id,
       challenge: f.challenge,
@@ -378,13 +392,14 @@ function summarizeBoard(graph, challengeFilter, nowMs) {
       ...(f.source ? { source: f.source } : {}),
       ...(f.evidence ? { has_evidence: true } : {}),
     }));
-  const filteredIntents = challengeFilter
+  const scopedIntents = challengeFilter
     ? graph.intents.filter(i => i.challenge === challengeFilter)
     : graph.intents;
   let overdueCount = 0;
   const counts = { open: 0, claimed: 0, done: 0, dead: 0 };
   const ruledOut = [];
-  const intents = filteredIntents.map(i => {
+  const matchedIntents = [];
+  for (const i of scopedIntents) {
     counts[i.status] = (counts[i.status] ?? 0) + 1;
     const overdue = isIntentOverdue(i, nowMs);
     if (overdue) overdueCount += 1;
@@ -396,31 +411,139 @@ function summarizeBoard(graph, challengeFilter, nowMs) {
         ...(i.outcome ? { outcome: i.outcome.replace(/\s+/gu, ' ').slice(0, 160) } : {}),
       });
     }
-    return {
-      id: i.id,
-      challenge: i.challenge,
-      title: i.title,
-      priority: i.priority,
-      status: i.status,
-      ...(i.owner ? { owner: i.owner } : {}),
-      budget_minutes: i.budget_minutes,
-      ...(i.status === 'claimed' && i.claimed_at ? { claimed_minutes: elapsedMinutes(i.claimed_at, nowMs) } : {}),
-      ...(overdue ? { overdue: true } : {}),
-    };
-  });
+    if (matchesBoardStatus(i, statusFilter, nowMs)) {
+      matchedIntents.push({
+        id: i.id,
+        challenge: i.challenge,
+        title: i.title,
+        priority: i.priority,
+        status: i.status,
+        ...(i.owner ? { owner: i.owner } : {}),
+        budget_minutes: i.budget_minutes,
+        ...(i.status === 'claimed' && i.claimed_at ? { claimed_minutes: elapsedMinutes(i.claimed_at, nowMs) } : {}),
+        ...(overdue ? { overdue: true } : {}),
+      });
+    }
+  }
   const challenges = challengeMetrics(graph, challengeFilter, nowMs);
-  return {
+  const base = {
     action: 'board',
     status: 'ok',
     revision: graph.revision,
     ...(challengeFilter ? { challenge: challengeFilter } : {}),
-    counts: { challenges: challenges.length, facts: facts.length, ...counts, overdue: overdueCount },
+    ...(statusFilter !== 'all' ? { status_filter: statusFilter } : {}),
+    counts: { challenges: challenges.length, facts: allFacts.length, ...counts, overdue: overdueCount },
     challenges,
+  };
+  if (summaryOnly) {
+    return {
+      ...base,
+      summary_only: true,
+      ...(ruledOut.length > 0 ? { ruled_out: ruledOut.slice(0, 20), ...(ruledOut.length > 20 ? { ruled_out_truncated: true } : {}) } : {}),
+      ...(overdueCount > 0 ? { hint: `有 ${overdueCount} 条已认领 Intent 超过时间预算；可核对进展或用 claim_intent(steal_overdue: true) 接管止损。` } : {}),
+    };
+  }
+  const facts = allFacts.slice(offset, offset + limit);
+  const intents = matchedIntents.slice(offset, offset + limit);
+  const hasMoreFacts = offset + facts.length < allFacts.length;
+  const hasMoreIntents = offset + intents.length < matchedIntents.length;
+  const truncated = hasMoreFacts || hasMoreIntents;
+  return {
+    ...base,
     facts,
     intents,
-    ...(ruledOut.length > 0 ? { ruled_out: ruledOut } : {}),
+    ...(truncated || offset > 0 ? {
+      paging: {
+        offset,
+        limit,
+        total_facts: allFacts.length,
+        total_intents: matchedIntents.length,
+        has_more_facts: hasMoreFacts,
+        has_more_intents: hasMoreIntents,
+        ...(truncated ? { next_offset: offset + limit } : {}),
+      },
+    } : {}),
+    ...(ruledOut.length > 0 ? { ruled_out: ruledOut.slice(0, limit), ...(ruledOut.length > limit ? { ruled_out_truncated: true } : {}) } : {}),
     ...(overdueCount > 0 ? { hint: `有 ${overdueCount} 条已认领 Intent 超过时间预算；可核对进展或用 claim_intent(steal_overdue: true) 接管止损。` } : {}),
   };
+}
+
+export function renderWriteupMarkdown(graph, challengeFilter) {
+  const challenges = challengeMetrics(graph, challengeFilter, Date.now());
+  const lines = [
+    challengeFilter ? `# ${challengeFilter} 题解草稿` : '# CTF 共享图谱题解草稿',
+    '',
+    `> 来源：\`.ctf-graph/graph.json\`（rev ${graph.revision}，更新于 ${graph.updated_at}）`,
+  ];
+  if (challenges.length === 0) {
+    lines.push('', '_当前图谱无匹配题目记录。_', '');
+    return { markdown: lines.join('\n'), challengeCount: 0, factCount: 0, intentCount: 0 };
+  }
+  let totalFacts = 0;
+  let totalIntents = 0;
+  for (const row of challenges) {
+    const ch = row.challenge;
+    const chFacts = graph.facts.filter(f => f.challenge === ch);
+    const chIntents = graph.intents.filter(i => i.challenge === ch);
+    totalFacts += chFacts.length;
+    totalIntents += chIntents.length;
+    const flags = chFacts.filter(f => f.kind === 'flag');
+    const otherFacts = chFacts.filter(f => f.kind !== 'flag');
+    const doneIntents = chIntents.filter(i => i.status === 'done');
+    const deadIntents = chIntents.filter(i => i.status === 'dead');
+    const openIntents = chIntents.filter(i => i.status === 'open' || i.status === 'claimed');
+
+    lines.push('', `## ${ch}`);
+    lines.push('', '### 结论与 Flag');
+    if (flags.length === 0) {
+      lines.push('- （尚未记录 `kind: flag` 事实）');
+    } else {
+      for (const f of flags) {
+        const src = f.source ? `（来源：\`${f.source}\`）` : '';
+        lines.push(`- **${f.title}**${src}`);
+        if (f.summary) lines.push(`  - 摘要：${f.summary}`);
+        if (f.evidence) lines.push(`  - 证据：${f.evidence.replace(/\r?\n/gu, ' ').slice(0, 400)}`);
+      }
+    }
+
+    lines.push('', '### 观察与关键事实');
+    if (otherFacts.length === 0) {
+      lines.push('- （无）');
+    } else {
+      for (const f of otherFacts) {
+        const src = f.source ? ` [src: \`${f.source}\`]` : '';
+        lines.push(`- \`${f.id}\` (${f.kind}) ${f.title}${src}`);
+        if (f.summary) lines.push(`  - ${f.summary}`);
+        if (f.evidence) lines.push(`  - 证据：${f.evidence.replace(/\r?\n/gu, ' ').slice(0, 400)}`);
+      }
+    }
+
+    lines.push('', '### 已完成分析路径');
+    if (doneIntents.length === 0) {
+      lines.push('- （无）');
+    } else {
+      for (const i of doneIntents) {
+        const owner = i.owner ? ` [${i.owner}]` : '';
+        lines.push(`- \`${i.id}\` ${i.title}${owner}：${i.outcome ?? ''}`);
+      }
+    }
+
+    if (deadIntents.length > 0) {
+      lines.push('', '### 已排除路径');
+      for (const i of deadIntents) {
+        lines.push(`- \`${i.id}\` ${i.title}：${i.outcome ?? ''}`);
+      }
+    }
+
+    if (openIntents.length > 0) {
+      lines.push('', '### 待核实与未完成事项');
+      for (const i of openIntents) {
+        lines.push(`- \`${i.id}\` (${i.status}, P${i.priority}) ${i.title}`);
+      }
+    }
+  }
+  lines.push('');
+  return { markdown: lines.join('\n'), challengeCount: challenges.length, factCount: totalFacts, intentCount: totalIntents };
 }
 
 function buildDispatchPlan(graph, { challengeFilter, maxWorkers, allowSameChallenge, nowMs }) {
@@ -491,8 +614,38 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
 
   if (action === 'board') {
     const challenge = cleanText(args.challenge, 'challenge', 120, { singleLine: true });
+    const statusFilter = args.status_filter ?? 'all';
+    if (!BOARD_STATUS_FILTERS.includes(statusFilter)) {
+      throw new ToolError('unsupported', `status_filter 须为 ${BOARD_STATUS_FILTERS.join('、')} 之一。`);
+    }
+    const limit = args.limit ?? DEFAULT_BOARD_LIMIT;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+      throw new ToolError('unsupported', 'limit 须为 1 至 500 的整数。');
+    }
+    const offset = args.offset ?? 0;
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 500) {
+      throw new ToolError('unsupported', 'offset 须为 0 至 500 的整数。');
+    }
+    const summaryOnly = args.summary_only === true;
     const { graph, recovered } = await readGraph(files);
-    return { ...summarizeBoard(graph, challenge, nowMs), recovered };
+    return { ...summarizeBoard(graph, challenge, nowMs, { statusFilter, limit, offset, summaryOnly }), recovered };
+  }
+
+  if (action === 'export_writeup') {
+    const challenge = cleanText(args.challenge, 'challenge', 120, { singleLine: true });
+    const { graph, recovered } = await readGraph(files);
+    const rendered = renderWriteupMarkdown(graph, challenge);
+    return {
+      action: 'export_writeup',
+      status: 'ok',
+      revision: graph.revision,
+      recovered,
+      ...(challenge ? { challenge } : {}),
+      challenge_count: rendered.challengeCount,
+      fact_count: rendered.factCount,
+      intent_count: rendered.intentCount,
+      markdown: rendered.markdown,
+    };
   }
 
   if (action === 'dispatch_plan') {

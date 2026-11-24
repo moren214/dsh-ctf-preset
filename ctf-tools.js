@@ -1966,7 +1966,7 @@ export function apply(ctx, config) {
     (args, execution, location) => readMediaAttachment(ctx, args, parsePngRequest(args), location, workbench, execution, results, inspectRanges),
     [], fileResults);
   registerTool(ctx, 'inspect_media',
-    '检查 PDF（含渲染与嵌入附件）、图像、二维码、音频、只读 SQLite 和 Office 文档。',
+    '检查 PDF（含渲染与嵌入附件）、图像、二维码、音频、只读 SQLite、Office 与 AI 模型/Pickle 静态安全体检。',
     { file_path: PATH_SCHEMA, ...RESULT_SOURCE_PROPERTIES, ...MEDIA_PROPERTIES, expected_sha256: SHA256_SCHEMA },
     (args, execution, location) => readMediaAttachment(ctx, args, parseMediaRequest(args), location, workbench, execution, results, inspectRanges),
     ['kind'], fileResults);

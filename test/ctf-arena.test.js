@@ -289,3 +289,76 @@ test('ctf_arena 端到端适配 GZCTF：games、分组题单、容器启删自�
     await rm(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
   }
 });
+
+test('ctf_arena: GZCTF 自动 Cookie 鉴权、容器 extend 续期与同分按解出人数(solves)动态排序', async () => {
+  const seenCookies = [];
+  let extendedCalled = false;
+  const server = await startServer((req, res) => {
+    seenCookies.push(req.headers.cookie ?? '');
+    if (req.headers.cookie !== 'GZCTF_Token=gz_cookie_secret_42') {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ title: 'Unauthorized' }));
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/api/game/9/details') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        challenges: {
+          Web: [
+            { id: 21, title: 'hard_same_score', score: 300, solvedCount: 1, solved: false },
+            { id: 22, title: 'easy_same_score', score: 300, solvedCount: 45, solved: false },
+            { id: 23, title: 'cheapest_one', score: 100, solvedCount: 5, solved: false },
+          ],
+        },
+      }));
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/api/game/9/challenges/22/container/extend') {
+      extendedCalled = true;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ expectStopAt: '2026-11-24T04:00:00Z' }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  const envKey = 'CTF_ARENA_TEST_GZ_COOKIE';
+  const prev = process.env[envKey];
+  process.env[envKey] = 'gz_cookie_secret_42';
+  const cwd = await mkdtemp(join(tmpdir(), 'ctf-arena-gz-ext-'));
+  try {
+    const config = {
+      platformUrl: server.baseUrl,
+      platformType: 'gzctf',
+      platformGameId: '9',
+      platformTokenEnv: envKey,
+      allowInsecurePlatformHttp: true,
+    };
+    const { tools, execution } = createRealWorkspaceContext(cwd, config, true);
+
+    // 同步题单：校验 Cookie: GZCTF_Token=<raw> 自动拼装 + 同分按 solves 降序分配优先级
+    const synced = JSON.parse(await tools.get('ctf_arena').execute({ action: 'sync_graph' }, execution));
+    assert.equal(synced.status, 'ok', JSON.stringify(synced));
+    assert.equal(synced.imported_count, 3);
+    assert.ok(seenCookies.every(c => c === 'GZCTF_Token=gz_cookie_secret_42'));
+
+    const board = JSON.parse(await tools.get('ctf_graph').execute({ action: 'board' }, execution));
+    const byChallenge = new Map(board.intents.map(i => [i.challenge, i.priority]));
+    assert.ok(byChallenge.get('web-cheapest_one') >= byChallenge.get('web-easy_same_score'), JSON.stringify([...byChallenge]));
+    assert.ok(byChallenge.get('web-easy_same_score') > byChallenge.get('web-hard_same_score'),
+      `solves 更多的同分题应优先于 solves 少的题: ${JSON.stringify([...byChallenge])}`);
+
+    // 容器续期 container_action: extend
+    const extended = JSON.parse(await tools.get('ctf_arena').execute({
+      action: 'container', challenge_id: '22', container_action: 'extend',
+    }, execution));
+    assert.equal(extended.status, 'extended', JSON.stringify(extended));
+    assert.equal(extendedCalled, true);
+  } finally {
+    await server.close();
+    await rm(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
+    if (prev === undefined) delete process.env[envKey];
+    else process.env[envKey] = prev;
+  }
+});

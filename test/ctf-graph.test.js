@@ -343,3 +343,75 @@ test('ctf_graph: dispatch_plan 按优先级分派不同题目、避开进行中�
   }, files, { now });
   assert.deepEqual(sameAllowed.assignments.map(a => a.intent_id), ['I-2', 'I-4']);
 });
+
+test('ctf_graph: board 分页/状态过滤/summary_only 与 export_writeup 导出', async () => {
+  const files = createCasMemoryFiles();
+  let clock = Date.parse('2026-11-24T01:00:00Z');
+  const now = () => clock;
+
+  await manageGraph({
+    action: 'add_fact', challenge: 'web-01', kind: 'vuln', title: '发现登录接口 SSTI 注入点',
+    detail: '模板参数 name 未转义，{{7*7}} 返回 49', evidence: 'http_request:R-1',
+    spawn_intents: [
+      { title: '构造 Jinja2 RCE payload', priority: 5, budget_minutes: 10 },
+      { title: '检查备用接口', priority: 2, budget_minutes: 10 },
+    ],
+  }, files, { now });
+  await manageGraph({
+    action: 'add_fact', challenge: 'pwn-01', kind: 'binary', title: '栈溢出偏移 72 字节',
+    spawn_intents: [{ title: '泄露 libc 并打 ret2libc', priority: 4, budget_minutes: 10 }],
+  }, files, { now });
+
+  // 认领并完成 I-1，让 I-2 超时，I-3 保持 open
+  await manageGraph({ action: 'claim_intent', intent_id: 'I-1', owner: 'w1' }, files, { now });
+  await manageGraph({
+    action: 'finish_intent', intent_id: 'I-1', owner: 'w1', status: 'done',
+    outcome: '成功读取 /flag 得到 flag{graph_export_ok}',
+    facts: [{ kind: 'flag', title: 'flag{graph_export_ok}', evidence: 'http_request:R-2' }],
+  }, files, { now });
+  await manageGraph({ action: 'claim_intent', intent_id: 'I-2', owner: 'w2' }, files, { now });
+  clock += 15 * 60000;
+
+  // status_filter: active / overdue / done
+  const activeBoard = await manageGraph({ action: 'board', status_filter: 'active' }, files, { now });
+  assert.deepEqual(activeBoard.intents.map(i => i.id).sort(), ['I-2', 'I-3']);
+  const overdueBoard = await manageGraph({ action: 'board', status_filter: 'overdue' }, files, { now });
+  assert.deepEqual(overdueBoard.intents.map(i => i.id), ['I-2']);
+  const doneBoard = await manageGraph({ action: 'board', status_filter: 'done' }, files, { now });
+  assert.deepEqual(doneBoard.intents.map(i => i.id), ['I-1']);
+
+  // 分页 limit + offset
+  const page1 = await manageGraph({ action: 'board', limit: 2, offset: 0 }, files, { now });
+  assert.equal(page1.facts.length, 2);
+  assert.equal(page1.intents.length, 2);
+  assert.equal(page1.paging.total_facts, 3);
+  assert.equal(page1.paging.total_intents, 3);
+  assert.equal(page1.paging.has_more_facts, true);
+  assert.equal(page1.paging.next_offset, 2);
+
+  const page2 = await manageGraph({ action: 'board', limit: 2, offset: 2 }, files, { now });
+  assert.equal(page2.facts.length, 1);
+  assert.equal(page2.paging.has_more_facts, false);
+  assert.equal(page2.paging.next_offset, undefined);
+
+  // summary_only 省略列表细节
+  const summary = await manageGraph({ action: 'board', summary_only: true }, files, { now });
+  assert.equal(summary.summary_only, true);
+  assert.equal(summary.facts, undefined);
+  assert.equal(summary.intents, undefined);
+  assert.equal(summary.counts.facts, 3);
+  assert.equal(summary.counts.done, 1);
+
+  // export_writeup：按单题导出并允许只读权限
+  const readonlyFiles = createCasMemoryFiles({ canWrite: false });
+  readonlyFiles.store.set(GRAPH_FILE, files.store.get(GRAPH_FILE));
+  const exported = await manageGraph({ action: 'export_writeup', challenge: 'web-01' }, readonlyFiles, { now });
+  assert.equal(exported.status, 'ok');
+  assert.equal(exported.challenge, 'web-01');
+  assert.equal(exported.fact_count, 2);
+  assert.equal(exported.intent_count, 2);
+  assert.match(exported.markdown, /# web-01 题解草稿/u);
+  assert.match(exported.markdown, /flag\{graph_export_ok\}/u);
+  assert.match(exported.markdown, /`I-1`/u);
+  assert.ok(!exported.markdown.includes('pwn-01'));
+});

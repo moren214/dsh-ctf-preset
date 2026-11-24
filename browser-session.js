@@ -26,7 +26,7 @@ function pushBounded(list, item) {
   list.push(item);
 }
 
-function handleCdpEvent(browser, payload) {
+export function handleCdpEvent(browser, payload) {
   if (!payload || typeof payload.method !== 'string') return;
   if (browser.sessionId && payload.sessionId && payload.sessionId !== browser.sessionId) return;
   const { method, params = {} } = payload;
@@ -90,6 +90,26 @@ function handleCdpEvent(browser, payload) {
       ...(typeof detail.lineNumber === 'number' ? { line: detail.lineNumber + 1 } : {}),
       at: new Date().toISOString(),
     });
+  } else if (method === 'Page.javascriptDialogOpening') {
+    pushBounded(browser.dialogLogs, {
+      type: String(params.type ?? 'alert'),
+      message: String(params.message ?? '').slice(0, 1024),
+      ...(params.url ? { url: String(params.url).slice(0, 512) } : {}),
+      ...(params.defaultPrompt ? { default_prompt: String(params.defaultPrompt).slice(0, 256) } : {}),
+      handled: 'accepted',
+      at: new Date().toISOString(),
+    });
+    if (browser.socket?.readyState === 1) {
+      const id = ++browser.nextId;
+      try {
+        browser.socket.send(JSON.stringify({
+          id,
+          method: 'Page.handleJavaScriptDialog',
+          params: { accept: true, promptText: '' },
+          ...(browser.sessionId ? { sessionId: browser.sessionId } : {}),
+        }));
+      } catch { /* best-effort auto dismiss */ }
+    }
   }
 }
 const BROWSER_KEYS = Object.freeze({
@@ -217,7 +237,7 @@ export function createBrowserSession({ resolveBinary, authorize, environment, on
     if (typeof WebSocket !== 'function') throw new Error('当前 DSH 的 Node 运行时缺少 WebSocket。');
     if (state) await shutdown();
     onStart();
-    const browser = { pending: new Map(), nextId: 0, exited: false, networkLogs: [], networkById: new Map(), consoleLogs: [] };
+    const browser = { pending: new Map(), nextId: 0, exited: false, networkLogs: [], networkById: new Map(), consoleLogs: [], dialogLogs: [] };
     state = browser;
     try {
       browser.gateway = await browserGateway(authorize);
@@ -266,6 +286,7 @@ export function createBrowserSession({ resolveBinary, authorize, environment, on
       const attached = await send(browser, 'Target.attachToTarget', { targetId, flatten: true }, signal, null);
       browser.targetId = targetId;
       browser.sessionId = attached.sessionId;
+      await send(browser, 'Page.enable', {}, signal);
       await send(browser, 'Network.enable', { maxTotalBufferSize: 4 * 1024 * 1024, maxResourceBufferSize: 512 * 1024 }, signal);
       await send(browser, 'Runtime.enable', {}, signal);
       return browser;
@@ -397,6 +418,58 @@ export function createBrowserSession({ resolveBinary, authorize, environment, on
       const entries = browser.consoleLogs.map(item => ({ ...item }));
       if (clear) browser.consoleLogs.length = 0;
       return entries;
+    },
+    dialogs(browser, clear = false) {
+      const entries = browser.dialogLogs.map(item => ({ ...item }));
+      if (clear) browser.dialogLogs.length = 0;
+      return entries;
+    },
+    async evaluateUser(browser, expression, signal) {
+      const result = await send(browser, 'Runtime.evaluate', {
+        expression,
+        returnByValue: true,
+        awaitPromise: true,
+        userGesture: true,
+      }, signal);
+      if (result.exceptionDetails) {
+        const detail = result.exceptionDetails;
+        const message = detail.exception?.description ?? detail.text ?? 'JS 执行异常';
+        return { status: 'exception', error: String(message).slice(0, 2048) };
+      }
+      const remote = result.result ?? {};
+      let serialized;
+      if (Object.hasOwn(remote, 'value')) {
+        const raw = typeof remote.value === 'string' ? remote.value : JSON.stringify(remote.value);
+        if (typeof raw === 'string' && raw.length > MAX_RESPONSE_BODY_CHARS) {
+          return {
+            status: 'ok',
+            type: remote.type ?? typeof remote.value,
+            value: raw.slice(0, MAX_RESPONSE_BODY_CHARS),
+            truncated: true,
+          };
+        }
+        serialized = remote.value;
+      } else {
+        serialized = remote.description ?? null;
+      }
+      return { status: 'ok', type: remote.type ?? 'undefined', value: serialized };
+    },
+    async setCookie(browser, cookie, signal) {
+      const result = await send(browser, 'Network.setCookie', cookie, signal);
+      return { success: result?.success !== false };
+    },
+    async setExtraHeaders(browser, headers, signal) {
+      await send(browser, 'Network.setExtraHTTPHeaders', { headers }, signal);
+      return { header_count: Object.keys(headers).length };
+    },
+    async uploadFile(browser, selector, filePath, signal) {
+      await send(browser, 'DOM.enable', {}, signal);
+      const { root } = await send(browser, 'DOM.getDocument', { depth: -1 }, signal);
+      const queried = await send(browser, 'DOM.querySelectorAll', { nodeId: root.nodeId, selector }, signal);
+      const nodeIds = Array.isArray(queried?.nodeIds) ? queried.nodeIds : [];
+      if (nodeIds.length !== 1) return { status: 'match_count', count: nodeIds.length };
+      await send(browser, 'DOM.setFileInputFiles', { nodeId: nodeIds[0], files: [filePath] }, signal);
+      return { status: 'uploaded', file: path.basename(filePath) };
     },
     async list(browser, signal) {
       const result = await send(browser, 'Target.getTargets', {}, signal, null);
