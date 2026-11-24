@@ -1,5 +1,5 @@
 import { addAbortSignal } from 'node:stream';
-import { createGunzip, gunzipSync } from 'node:zlib';
+import { createGunzip, createInflate, createInflateRaw, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import { checkRange, inPage, label, MAX_ARCHIVE_MEMBER_BYTES, MAX_ATTACHMENT_BYTES, MAX_MEMBER_NAME, page } from './attachment-layout.js';
 import { inspectZip, isZip } from './zip-directory.js';
 
@@ -143,7 +143,7 @@ function inspectTar(bytes, paging, format) {
   return {
     format,
     status: 'ok',
-    offset_space: format === 'TAR.GZ' ? 'uncompressed' : 'file',
+    offset_space: ['TAR.GZ', 'TAR.ZLIB', 'TAR.DEFLATE', 'TAR.BZIP2', 'TAR.XZ'].includes(format) ? 'uncompressed' : 'file',
     archive_end: end,
     ...(endBlocks === 1 ? { warnings: ['TAR 只有一个全零结束块，按非标准归档读取。'] } : {}),
     ...(trailing < bytes.length ? {
@@ -158,36 +158,69 @@ function isGzip(bytes) {
   return bytes[0] === 0x1f && bytes[1] === 0x8b;
 }
 
-function unpackTarOrGzip(bytes) {
-  if (isTar(bytes)) return { format: 'TAR', payload: bytes };
-  if (!isGzip(bytes)) return undefined;
+function isZlib(bytes) {
+  if (bytes.length < 2) return false;
+  const method = bytes[0] & 0x0f;
+  const windowSize = bytes[0] >>> 4;
+  return method === 8 && windowSize <= 7 && ((bytes[0] << 8) | bytes[1]) % 31 === 0;
+}
+
+function compressionKind(bytes, formatHint) {
+  if (formatHint === 'zlib' || formatHint === 'deflate_raw') return formatHint;
+  if (isGzip(bytes)) return 'gzip';
+  if (isZlib(bytes)) return 'zlib';
+  return undefined;
+}
+
+function compressedFormat(kind, payload) {
+  if (!isTar(payload)) return kind;
+  return { gzip: 'TAR.GZ', zlib: 'TAR.ZLIB', deflate_raw: 'TAR.DEFLATE' }[kind];
+}
+
+function decompressBuffer(bytes, kind) {
+  if (kind === 'gzip') return gunzipSync(bytes, { maxOutputLength: MAX_ATTACHMENT_BYTES });
+  if (kind === 'zlib') return inflateSync(bytes, { maxOutputLength: MAX_ATTACHMENT_BYTES });
+  return inflateRawSync(bytes, { maxOutputLength: MAX_ATTACHMENT_BYTES });
+}
+
+function unpackTarOrCompressed(bytes, formatHint) {
+  if (formatHint === undefined && isTar(bytes)) return { format: 'TAR', payload: bytes };
+  const kind = compressionKind(bytes, formatHint);
+  if (kind === undefined) return undefined;
   let payload;
   try {
-    payload = gunzipSync(bytes, { maxOutputLength: MAX_ATTACHMENT_BYTES });
+    payload = decompressBuffer(bytes, kind);
   } catch (error) {
-    if (error.code === 'ERR_BUFFER_TOO_LARGE') throw new Error('gzip 解压后的数据超过 32 MiB。');
-    throw new Error('附件结构无效：gzip 压缩流无法读取。');
+    if (error.code === 'ERR_BUFFER_TOO_LARGE') throw new Error('解压后的数据超过 32 MiB。');
+    throw new Error('附件结构无效：压缩流无法读取或校验失败。');
   }
-  return { format: isTar(payload) ? 'TAR.GZ' : 'gzip', payload };
+  return { format: compressedFormat(kind, payload), payload };
 }
 
 function gzipMember(payload) {
   return { member_index: 0, name: 'payload', type: 'file', size: payload.length };
 }
 
-export function inspectArchive(bytes, paging) {
-  if (isZip(bytes)) return inspectZip(bytes, paging);
-  const archive = unpackTarOrGzip(bytes);
+export function inspectArchive(bytes, paging, formatHint) {
+  if (formatHint === undefined && isZip(bytes)) return inspectZip(bytes, paging);
+  const archive = unpackTarOrCompressed(bytes, formatHint);
   if (archive === undefined) return undefined;
   const { format, payload } = archive;
-  if (format !== 'gzip') return inspectTar(payload, paging, format);
+  if (!['gzip', 'zlib', 'deflate_raw'].includes(format)) return inspectTar(payload, paging, format);
   const rows = inPage(0, paging) ? [gzipMember(payload)] : [];
   return { format, status: 'ok', offset_space: 'uncompressed', layout: page('members', 1, rows, paging.offset) };
 }
 
-async function unpackGzipMember(bytes, signal) {
+export function inspectDecompressedStream(bytes, paging, format) {
+  if (isTar(bytes)) return inspectTar(bytes, paging, 'TAR.' + format.toUpperCase());
+  const rows = inPage(0, paging) ? [gzipMember(bytes)] : [];
+  return { format, status: 'ok', offset_space: 'uncompressed', layout: page('members', 1, rows, paging.offset) };
+}
+
+async function unpackCompressedMember(bytes, kind, signal) {
   signal?.throwIfAborted();
-  const stream = createGunzip();
+  const stream = kind === 'gzip' ? createGunzip()
+    : kind === 'zlib' ? createInflate() : createInflateRaw();
   if (signal) addAbortSignal(signal, stream);
   let size = 0;
   let format;
@@ -198,27 +231,28 @@ async function unpackGzipMember(bytes, signal) {
       chunks.push(chunk);
       size += chunk.length;
       if (format === undefined && size >= TAR_END.length) {
-        format = isTar(Buffer.concat(chunks, size)) ? 'TAR.GZ' : 'gzip';
+        format = compressedFormat(kind, Buffer.concat(chunks, size));
       }
-      if (format === 'gzip' && size > MAX_ARCHIVE_MEMBER_BYTES) throw new Error('归档成员解压后须在 1 MiB 内。');
-      if (size > MAX_ATTACHMENT_BYTES) throw new Error('TAR.GZ 展开后的 TAR 超过 32 MiB。');
+      if (format === kind && size > MAX_ARCHIVE_MEMBER_BYTES) throw new Error('归档成员解压后须在 1 MiB 内。');
+      if (format !== kind && size > MAX_ATTACHMENT_BYTES) throw new Error('解压后的 TAR 超过 32 MiB。');
     }
   } catch (error) {
     signal?.throwIfAborted();
-    if (error.code?.startsWith('Z_')) throw new Error('附件结构无效：gzip 压缩流无法读取。');
+    if (error.code?.startsWith('Z_')) throw new Error('附件结构无效：压缩流无法读取或校验失败。');
     throw error;
   }
   const payload = Buffer.concat(chunks, size);
-  return { format: format ?? (isTar(payload) ? 'TAR.GZ' : 'gzip'), payload };
+  return { format: format ?? compressedFormat(kind, payload), payload };
 }
 
-export async function readTarOrGzipMember(bytes, memberIndex, signal) {
-  const archive = isTar(bytes) ? { format: 'TAR', payload: bytes }
-    : isGzip(bytes) ? await unpackGzipMember(bytes, signal) : undefined;
+export async function readTarOrCompressedMember(bytes, memberIndex, signal, formatHint) {
+  const kind = compressionKind(bytes, formatHint);
+  const archive = kind !== undefined ? await unpackCompressedMember(bytes, kind, signal)
+    : isTar(bytes) ? { format: 'TAR', payload: bytes } : undefined;
   if (archive === undefined) return undefined;
   const { format, payload } = archive;
-  if (format === 'gzip') {
-    if (memberIndex !== 0) throw new Error('gzip 解压数据使用 member_index 0。');
+  if (format === kind) {
+    if (memberIndex !== 0) throw new Error('压缩的单文件使用 member_index 0。');
     return { format, name: gzipMember(payload).name, bytes: payload };
   }
   const report = inspectTar(payload, { offset: memberIndex, limit: 1 }, format);
@@ -229,4 +263,15 @@ export async function readTarOrGzipMember(bytes, memberIndex, signal) {
   if (member.size > MAX_ARCHIVE_MEMBER_BYTES) throw new Error('归档成员解压后须在 1 MiB 内。');
   const contentOffset = member.header_offset + TAR_BLOCK;
   return { format, name: member.name, bytes: payload.subarray(contentOffset, contentOffset + member.size) };
+}
+
+export async function readDecompressedStreamMember(bytes, memberIndex, signal, format) {
+  if (isTar(bytes)) {
+    const member = await readTarOrCompressedMember(bytes, memberIndex, signal);
+    if (member === undefined) return undefined;
+    return { ...member, format: 'TAR.' + format.toUpperCase() };
+  }
+  if (memberIndex !== 0) throw new Error('压缩的单文件使用 member_index 0。');
+  if (bytes.length > MAX_ARCHIVE_MEMBER_BYTES) throw new Error('压缩的单文件成员解压后须在 1 MiB 内。');
+  return { format, name: gzipMember(bytes).name, bytes };
 }

@@ -77,28 +77,178 @@ export function pinnedLookup(entry) {
   };
 }
 
-export function createNetworkBoundary(config = {}) {
-  const list = value => Array.isArray(value) ? value.filter(item => typeof item === 'string') : [];
-  const origins = new Set();
-  for (const value of list(config.networkOrigins)) {
-    try { origins.add(webUrl(value).origin); } catch { /* Invalid entries authorize nothing. */ }
+function parsePortMatcher(text, defaultPort) {
+  if (text === undefined || text === '') return port => port === defaultPort;
+  if (text === '*') return () => true;
+  const range = /^(\d{1,5})-(\d{1,5})$/u.exec(text);
+  if (range) {
+    const min = Number(range[1]);
+    const max = Number(range[2]);
+    if (min < 1 || max > 65535 || min > max) return undefined;
+    return port => port >= min && port <= max;
   }
-  const tcp = new Set();
-  for (const value of list(config.tcpTargets)) {
+  if (/^\d{1,5}$/u.test(text)) {
+    const exact = Number(text);
+    if (exact < 1 || exact > 65535) return undefined;
+    return port => port === exact;
+  }
+  return undefined;
+}
+
+function parseHostMatcher(rawHost) {
+  if (typeof rawHost !== 'string' || rawHost.length === 0 || rawHost.length > 255) return undefined;
+  if (rawHost.includes('/')) {
+    const slash = rawHost.indexOf('/');
+    const ipPart = hostName(rawHost.slice(0, slash));
+    const prefixText = rawHost.slice(slash + 1);
+    const family = isIP(ipPart);
+    if (family === 0 || !/^\d{1,3}$/u.test(prefixText)) return undefined;
+    const prefix = Number(prefixText);
+    const maxBits = family === 4 ? 32 : 128;
+    if (prefix < 1 || prefix > maxBits) return undefined;
+    const subnet = new BlockList();
+    subnet.addSubnet(ipPart, prefix, familyName(family));
+    return target => {
+      const targetFamily = isIP(target);
+      return targetFamily === family && subnet.check(target, familyName(family));
+    };
+  }
+  const normalized = hostName(rawHost);
+  if (!normalized || normalized === '*' || normalized.includes('%')) return undefined;
+  if (normalized.startsWith('*.')) {
+    const suffix = normalized.slice(1);
+    if (suffix.length < 2 || suffix.includes('*') || !suffix.slice(1).includes('.')) return undefined;
+    return target => target.length > suffix.length && target.endsWith(suffix);
+  }
+  if (normalized.includes('*')) return undefined;
+  return target => target === normalized;
+}
+
+function parseHttpRule(value) {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  const match = /^(https?):\/\/(\[[^\]]+\](?:\/\d{1,3})?|[^/:?#\s]+(?:\/\d{1,3})?)(?::(\*|\d{1,5}(?:-\d{1,5})?))?\/?$/iu.exec(trimmed);
+  if (!match) {
     try {
-      const authority = new URL('tcp://' + value);
-      if (authority.hostname && authority.port && !authority.pathname && !authority.username && !authority.password
-        && !authority.search && !authority.hash) tcp.add(hostName(authority.hostname) + '/' + Number(authority.port));
-    } catch { /* Invalid entries authorize nothing. */ }
+      const url = webUrl(trimmed);
+      const exactOrigin = url.origin;
+      return urlTarget => urlTarget.origin === exactOrigin;
+    } catch {
+      return undefined;
+    }
   }
+  const protocol = match[1].toLowerCase() + ':';
+  const defaultPort = protocol === 'https:' ? 443 : 80;
+  const matchHost = parseHostMatcher(match[2]);
+  const matchPort = parsePortMatcher(match[3], defaultPort);
+  if (!matchHost || !matchPort) return undefined;
+  return urlTarget => {
+    if (urlTarget.protocol !== protocol) return false;
+    const targetPort = urlTarget.port ? Number(urlTarget.port) : (urlTarget.protocol === 'https:' ? 443 : 80);
+    return matchPort(targetPort) && matchHost(hostName(urlTarget.hostname));
+  };
+}
+
+function parseTcpRule(value) {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  const match = /^(\[[^\]]+\](?:\/\d{1,3})?|[^/:?#\s]+(?:\/\d{1,3})?):(\*|\d{1,5}(?:-\d{1,5})?)$/u.exec(trimmed);
+  if (!match) return undefined;
+  const matchHost = parseHostMatcher(match[1]);
+  const matchPort = parsePortMatcher(match[2], undefined);
+  if (!matchHost || !matchPort) return undefined;
+  return (targetHost, targetPort) => matchPort(targetPort) && matchHost(hostName(targetHost));
+}
+
+const MAX_DYNAMIC_GRANTS = 64;
+
+export function createNetworkBoundary(configSource = {}) {
+  const getConfig = typeof configSource === 'function' ? configSource : () => configSource ?? {};
+  const dynamicOrigins = new Set();
+  const dynamicTcp = new Set();
+  const list = value => Array.isArray(value) ? value.filter(item => typeof item === 'string') : [];
+  let cachedOriginsKey = '';
+  let cachedHttpRules = [];
+  let cachedTcpKey = '';
+  let cachedTcpRules = [];
+
+  function httpRules() {
+    const items = list(getConfig()?.networkOrigins);
+    const key = JSON.stringify(items);
+    if (key !== cachedOriginsKey) {
+      cachedOriginsKey = key;
+      cachedHttpRules = items.map(parseHttpRule).filter(Boolean);
+    }
+    return cachedHttpRules;
+  }
+
+  function tcpRules() {
+    const items = list(getConfig()?.tcpTargets);
+    const key = JSON.stringify(items);
+    if (key !== cachedTcpKey) {
+      cachedTcpKey = key;
+      cachedTcpRules = items.map(parseTcpRule).filter(Boolean);
+    }
+    return cachedTcpRules;
+  }
+
+  function isHttpAuthorized(value) {
+    let url;
+    try { url = value instanceof URL ? value : webUrl(value); }
+    catch { return false; }
+    return dynamicOrigins.has(url.origin) || httpRules().some(rule => rule(url));
+  }
+
+  function isTcpAuthorized(host, port) {
+    const key = hostName(host) + '/' + port;
+    return dynamicTcp.has(key) || tcpRules().some(rule => rule(host, port));
+  }
+
+  function grantHttp(value) {
+    let url;
+    try { url = webUrl(value); }
+    catch { return undefined; }
+    const hostname = hostName(url.hostname);
+    const family = isIP(hostname);
+    if (family && (infrastructure.check(hostname, familyName(family)) || (family === 6 && mapped.check(hostname, 'ipv6')))) {
+      return undefined;
+    }
+    if (!dynamicOrigins.has(url.origin) && dynamicOrigins.size >= MAX_DYNAMIC_GRANTS) {
+      dynamicOrigins.delete(dynamicOrigins.values().next().value);
+    }
+    dynamicOrigins.add(url.origin);
+    return url.origin;
+  }
+
+  function grantTcp(host, port) {
+    const numericPort = Number(port);
+    const normalized = hostName(String(host ?? ''));
+    if (!normalized || normalized.includes('%') || /[\s/\\:?#]/u.test(normalized)
+      || !Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65535) return undefined;
+    const family = isIP(normalized);
+    if (family && (infrastructure.check(normalized, familyName(family)) || (family === 6 && mapped.check(normalized, 'ipv6')))) {
+      return undefined;
+    }
+    const key = normalized + '/' + numericPort;
+    if (!dynamicTcp.has(key) && dynamicTcp.size >= MAX_DYNAMIC_GRANTS) {
+      dynamicTcp.delete(dynamicTcp.values().next().value);
+    }
+    dynamicTcp.add(key);
+    return normalized + ':' + numericPort;
+  }
+
   return {
+    isHttpAuthorized,
+    isTcpAuthorized,
+    grantHttp,
+    grantTcp,
     async http(value, signal) {
-      const url = webUrl(value);
-      if (!origins.has(url.origin)) throw new Error('此 HTTP(S) 来源尚未在 networkOrigins 中授权。');
+      const url = value instanceof URL ? webUrl(value.href) : webUrl(value);
+      if (!isHttpAuthorized(url)) throw new Error('此 HTTP(S) 来源尚未在 networkOrigins 中授权。');
       return pinAddress(url.hostname, { signal });
     },
     async tcp(host, port, signal) {
-      if (!tcp.has(hostName(host) + '/' + port)) throw new Error('此 TCP 目标尚未在 tcpTargets 中授权。');
+      if (!isTcpAuthorized(host, port)) throw new Error('此 TCP 目标尚未在 tcpTargets 中授权。');
       return pinAddress(host, { signal });
     },
   };

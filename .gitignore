@@ -1,8 +1,10 @@
 node_modules/
 coverage/
+__pycache__/
 npm-debug.log*
 .DS_Store
 Thumbs.db
 .ctf/
 .ctf-attachments/
+.ctf-cache/
 .ctf-imports/

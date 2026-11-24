@@ -7,19 +7,20 @@ import { WorkbenchDependencyError } from './workbench-config.js';
 const SCRIPT = readFileSync(new URL('./media-reader-worker.py', import.meta.url), 'utf8');
 const MAX_PIXELS_PER_PAGE = 128;
 const MAX_PIXELS_PER_LSB_PAGE = 8192;
+const MAX_BITSTREAM_BITS_PER_PAGE = 32768;
 const CHANNELS = ['L', 'P', 'R', 'G', 'B', 'A'];
 const BIT_ORDERS = ['msb_first', 'lsb_first'];
-const MEDIA_KINDS = ['pdf', 'qr', 'audio', 'image'];
+const MEDIA_KINDS = ['pdf', 'qr', 'audio', 'image', 'sqlite', 'office'];
 const REGION_KEYS = ['x', 'y', 'width', 'height'];
 const MAX_DIMENSION = 16384;
-const FRAME_INDEX = { type: 'integer', minimum: 0, maximum: 255, description: '图像帧或 TIFF 页，从零起算，默认 0。' };
+const FRAME_INDEX = { type: 'integer', minimum: 0, maximum: 255, description: '帧/页序号（从 0 起）。' };
 
 export const PNG_PIXEL_PROPERTIES = {
-  operation: { type: 'string', enum: ['pixels', 'lsb'], description: '读取原始样本或提取单个位平面。默认 pixels。' },
+  operation: { type: 'string', enum: ['pixels', 'lsb', 'bitstream'], description: 'pixels 读像素；lsb 单页位平面；bitstream 连续位流分页。' },
   frame_index: FRAME_INDEX,
   region: {
     type: 'object', additionalProperties: false, required: REGION_KEYS,
-    description: '从零起算的坐标。省略时选取整张图片。区域按先行后列读取。',
+    description: '选区（x/y/width/height），省略为全图。',
     properties: {
       x: { type: 'integer', minimum: 0, maximum: MAX_DIMENSION - 1 },
       y: { type: 'integer', minimum: 0, maximum: MAX_DIMENSION - 1 },
@@ -27,26 +28,29 @@ export const PNG_PIXEL_PROPERTIES = {
       height: { type: 'integer', minimum: 1, maximum: MAX_DIMENSION },
     },
   },
-  pixel_offset: { type: 'integer', minimum: 0, description: '所选区域内从零起算的像素序号。续读用 next_pixel_offset。' },
-  pixel_count: {
-    type: 'integer', minimum: 1, maximum: MAX_PIXELS_PER_LSB_PAGE,
-    description: '每页像素数。pixels 默认 16、最多 128。lsb 默认 256、最多 8192。',
-  },
-  channels: {
-    type: 'array', minItems: 1, maxItems: 4, uniqueItems: true,
-    items: { type: 'string', enum: CHANNELS },
-    description: '按给定顺序读通道。省略时用图像的原始通道顺序，索引色用 P。',
-  },
-  bit_index: { type: 'integer', minimum: 0, maximum: 15, description: '从最低位 0 起算，只用于 lsb。' },
-  bit_order: { type: 'string', enum: BIT_ORDERS, description: '提取位在输出字节内的排列。默认 msb_first。' },
+  pixel_offset: { type: 'integer', minimum: 0 },
+  pixel_count: { type: 'integer', minimum: 1, maximum: MAX_PIXELS_PER_LSB_PAGE },
+  channels: { type: 'array', minItems: 1, maxItems: 4, uniqueItems: true, items: { type: 'string', enum: CHANNELS } },
+  bit_index: { type: 'integer', minimum: 0, maximum: 15 },
+  bit_order: { type: 'string', enum: BIT_ORDERS },
+  bit_offset: { type: 'integer', minimum: 0 },
+  bit_count: { type: 'integer', minimum: 8, maximum: MAX_BITSTREAM_BITS_PER_PAGE },
 };
 
 export const MEDIA_PROPERTIES = {
-  kind: { type: 'string', enum: MEDIA_KINDS, description: '读取 PDF、图像元数据、二维码或音频元数据。' },
+  kind: { type: 'string', enum: MEDIA_KINDS, description: 'pdf/qr/audio/image/sqlite/office。' },
   frame_index: FRAME_INDEX,
-  page_offset: { type: 'integer', minimum: 0, description: 'PDF 的首个页序号，从零起算。默认 0。' },
-  page_limit: { type: 'integer', minimum: 1, maximum: 4, description: '每次检查的 PDF 页数。默认 1。' },
-  include_text: { type: 'boolean', description: '是否返回所选 PDF 页面内嵌的文本预览。默认 false。' },
+  page_offset: { type: 'integer', minimum: 0 },
+  page_limit: { type: 'integer', minimum: 1, maximum: 4 },
+  include_text: { type: 'boolean' },
+  pdf_action: { type: 'string', enum: ['inspect', 'render_page', 'list_attachments', 'read_attachment'] },
+  render_dpi: { type: 'integer', minimum: 36, maximum: 240 },
+  attachment_index: { type: 'integer', minimum: 0, maximum: 63 },
+  sqlite_table: { type: 'string', maxLength: 256 },
+  sqlite_query: { type: 'string', maxLength: 4096, description: '只读 SELECT 查询。' },
+  row_offset: { type: 'integer', minimum: 0, maximum: 1000000 },
+  row_limit: { type: 'integer', minimum: 1, maximum: 100 },
+  office_part: { type: 'string', maxLength: 256 },
 };
 
 function integer(value, fallback, minimum, maximum, name) {
@@ -59,10 +63,16 @@ function integer(value, fallback, minimum, maximum, name) {
 
 export function parsePngRequest(args) {
   const { operation = 'pixels', region, channels, bit_order: bitOrder = 'msb_first' } = args;
-  if (operation !== 'pixels' && operation !== 'lsb') throw new Error('operation 须为 pixels 或 lsb。');
-  const lsb = operation === 'lsb';
-  if (!lsb && (args.bit_index !== undefined || args.bit_order !== undefined)) {
+  if (!['pixels', 'lsb', 'bitstream'].includes(operation)) throw new Error('operation 须为 pixels、lsb 或 bitstream。');
+  const lsb = operation !== 'pixels';
+  if (!lsb && (args.bit_index !== undefined || args.bit_order !== undefined || args.bit_offset !== undefined || args.bit_count !== undefined)) {
     throw new Error('只有 lsb 可指定 bit_index 或 bit_order。');
+  }
+  if (operation !== 'bitstream' && (args.bit_offset !== undefined || args.bit_count !== undefined)) {
+    throw new Error('bit_offset 和 bit_count 只适用于 bitstream。');
+  }
+  if (operation === 'bitstream' && (args.pixel_offset !== undefined || args.pixel_count !== undefined)) {
+    throw new Error('bitstream 使用 bit_offset 和 bit_count 分页。');
   }
   if (!BIT_ORDERS.includes(bitOrder)) throw new Error('bit_order 须为 msb_first 或 lsb_first。');
   if (channels !== undefined && (!Array.isArray(channels) || channels.length < 1 || channels.length > 4
@@ -82,31 +92,72 @@ export function parsePngRequest(args) {
       height: integer(region.height, undefined, 1, MAX_DIMENSION, 'region.height'),
     };
   }
+  const bitOffset = operation === 'bitstream' ? integer(args.bit_offset, 0, 0, Number.MAX_SAFE_INTEGER, 'bit_offset') : undefined;
+  const bitCount = operation === 'bitstream'
+    ? integer(args.bit_count, MAX_BITSTREAM_BITS_PER_PAGE, 8, MAX_BITSTREAM_BITS_PER_PAGE, 'bit_count') : undefined;
+  if (operation === 'bitstream' && (bitOffset % 8 !== 0 || bitCount % 8 !== 0)) {
+    throw new Error('bitstream 的 bit_offset 和 bit_count 必须按整字节对齐。');
+  }
   return {
     kind: 'png', operation, region: bounds, channels,
     frame_index: integer(args.frame_index, 0, 0, 255, 'frame_index'),
-    pixel_offset: integer(args.pixel_offset, 0, 0, Number.MAX_SAFE_INTEGER, 'pixel_offset'),
-    pixel_count: integer(args.pixel_count, lsb ? 256 : 16, 1, lsb ? MAX_PIXELS_PER_LSB_PAGE : MAX_PIXELS_PER_PAGE, 'pixel_count'),
+    ...(operation === 'bitstream' ? {
+      bit_offset: bitOffset,
+      bit_count: bitCount,
+    } : {
+      pixel_offset: integer(args.pixel_offset, 0, 0, Number.MAX_SAFE_INTEGER, 'pixel_offset'),
+      pixel_count: integer(args.pixel_count, lsb ? 256 : 16, 1, lsb ? MAX_PIXELS_PER_LSB_PAGE : MAX_PIXELS_PER_PAGE, 'pixel_count'),
+    }),
     ...(lsb ? { bit_index: integer(args.bit_index, 0, 0, 15, 'bit_index'), bit_order: bitOrder } : {}),
   };
 }
 
 export function parseMediaRequest(args) {
   const { kind, page_offset: offset, page_limit: limit, include_text: includeText = false } = args;
-  if (!MEDIA_KINDS.includes(kind)) throw new Error('kind 须为 pdf、qr、audio 或 image。');
+  if (!MEDIA_KINDS.includes(kind)) throw new Error('kind 须为 pdf、qr、audio、image、sqlite 或 office。');
   if (kind !== 'image' && args.frame_index !== undefined) throw new Error('frame_index 只适用于 image。');
-  if (kind !== 'pdf') {
-    if (offset !== undefined || limit !== undefined || args.include_text !== undefined) {
-      throw new Error('page_offset、page_limit 和 include_text 只适用于 PDF。');
-    }
-    return kind === 'image' ? { kind, frame_index: integer(args.frame_index, 0, 0, 255, 'frame_index') } : { kind };
+  if (kind === 'pdf') {
+    if (args.sqlite_table !== undefined || args.sqlite_query !== undefined || args.row_offset !== undefined
+      || args.row_limit !== undefined || args.office_part !== undefined) throw new Error('PDF 不能使用 SQLite 或 Office 参数。');
+    if (typeof includeText !== 'boolean') throw new Error('include_text 须为布尔值。');
+    const action = args.pdf_action ?? 'inspect';
+    if (!['inspect', 'render_page', 'list_attachments', 'read_attachment'].includes(action)) throw new Error('pdf_action 不受支持。');
+    if (action === 'read_attachment' && args.attachment_index === undefined) throw new Error('read_attachment 必须提供 attachment_index。');
+    if (action !== 'read_attachment' && args.attachment_index !== undefined) throw new Error('attachment_index 只适用于 read_attachment。');
+    return { kind, pdf_action: action, include_text: includeText,
+      page_offset: integer(offset, 0, 0, Number.MAX_SAFE_INTEGER, 'page_offset'),
+      page_limit: integer(limit, 1, 1, 4, 'page_limit'),
+      render_dpi: integer(args.render_dpi, 144, 36, 240, 'render_dpi'),
+      ...(args.attachment_index === undefined ? {} : { attachment_index: integer(args.attachment_index, undefined, 0, 63, 'attachment_index') }),
+    };
   }
-  if (typeof includeText !== 'boolean') throw new Error('include_text 须为布尔值。');
-  return {
-    kind, include_text: includeText,
-    page_offset: integer(offset, 0, 0, Number.MAX_SAFE_INTEGER, 'page_offset'),
-    page_limit: integer(limit, 1, 1, 4, 'page_limit'),
-  };
+  if (kind === 'sqlite') {
+    if (offset !== undefined || limit !== undefined || args.include_text !== undefined || args.pdf_action !== undefined
+      || args.attachment_index !== undefined || args.render_dpi !== undefined || args.office_part !== undefined) {
+      throw new Error('SQLite 不能使用 PDF 或 Office 参数。');
+    }
+    if (args.sqlite_table !== undefined && (typeof args.sqlite_table !== 'string' || args.sqlite_table.length > 256)) throw new Error('sqlite_table 须是不超过 256 字符的字符串。');
+    if (args.sqlite_query !== undefined && (typeof args.sqlite_query !== 'string' || args.sqlite_query.trim().length === 0 || args.sqlite_query.length > 4096)) throw new Error('sqlite_query 须为 1 至 4096 字符。');
+    return { kind, ...(args.sqlite_table === undefined ? {} : { table: args.sqlite_table }),
+      ...(args.sqlite_query === undefined ? {} : { query: args.sqlite_query }),
+      row_offset: integer(args.row_offset, 0, 0, 1000000, 'row_offset'),
+      row_limit: integer(args.row_limit, 25, 1, 100, 'row_limit') };
+  }
+  if (kind === 'office') {
+    if (offset !== undefined || limit !== undefined || args.include_text !== undefined || args.pdf_action !== undefined
+      || args.attachment_index !== undefined || args.render_dpi !== undefined || args.sqlite_table !== undefined
+      || args.sqlite_query !== undefined || args.row_offset !== undefined || args.row_limit !== undefined) {
+      throw new Error('Office 参数只支持 office_part。');
+    }
+    if (args.office_part !== undefined && (typeof args.office_part !== 'string' || args.office_part.length === 0 || args.office_part.length > 256)) {
+      throw new Error('office_part 须为 1 至 256 字符的部件路径。');
+    }
+    return { kind, ...(args.office_part === undefined ? {} : { part: args.office_part }) };
+  }
+  const allowed = kind === 'image' ? ['frame_index'] : [];
+  if (Object.keys(args).some(key => !['kind', 'file_path', 'source_result_id', 'source_result_ids', 'expected_sha256'].includes(key)
+    && !allowed.includes(key))) throw new Error(`${kind} 不支持传入的专用参数。`);
+  return kind === 'image' ? { kind, frame_index: integer(args.frame_index, 0, 0, 255, 'frame_index') } : { kind };
 }
 
 export async function inspectMedia(bytes, request, signal, workbench) {
@@ -121,8 +172,8 @@ export async function inspectMedia(bytes, request, signal, workbench) {
   }
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
-    const child = execFile(python, ['-I', '-B', '-X', 'utf8', '-c', SCRIPT, JSON.stringify(request)], {
-      cwd: dirname(python), maxBuffer: 256 * 1024, timeout: 15000, encoding: 'utf8', windowsHide: true, signal,
+    const child = execFile(python, ['-E', '-P', '-B', '-X', 'utf8', '-c', SCRIPT, JSON.stringify(request)], {
+      cwd: dirname(python), maxBuffer: 20 * 1024 * 1024, timeout: 30000, encoding: 'utf8', windowsHide: true, signal,
     }, (error, stdout) => {
       if (signal?.aborted) return reject(signal.reason);
       if (error) {
@@ -131,6 +182,11 @@ export async function inspectMedia(bytes, request, signal, workbench) {
       try {
         const report = JSON.parse(stdout);
         if (typeof report?.status !== 'string') throw new Error();
+        if (typeof report.artifact_base64 === 'string') {
+          const artifact = Buffer.from(report.artifact_base64, 'base64');
+          delete report.artifact_base64;
+          report.__artifact_bytes = artifact;
+        }
         resolve(report);
       } catch {
         reject(new Error('本机媒体读取器未返回有效结果。'));

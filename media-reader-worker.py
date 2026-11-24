@@ -1,9 +1,14 @@
 """Inspect a local attachment snapshot read from standard input."""
 
 import hashlib
+import base64
 import io
 import json
+import re
+import sqlite3
 import sys
+import zipfile
+import xml.etree.ElementTree as ET
 import zlib
 
 MAX_INPUT_BYTES = 32 * 1024 * 1024
@@ -179,10 +184,20 @@ def read_png(data, request):
         if bounds["x"] + bounds["width"] > width or bounds["y"] + bounds["height"] > height:
             raise InvalidMedia("所选像素区域超出 PNG 尺寸。")
         count = bounds["width"] * bounds["height"]
-        start = request["pixel_offset"]
-        if start > count:
-            raise InvalidMedia("pixel_offset 超出所选像素区域。")
-        end = min(start + request["pixel_count"], count)
+        bitstream = request["operation"] == "bitstream"
+        if bitstream:
+            total_bits = count * len(channels)
+            bit_start = request["bit_offset"]
+            if bit_start > total_bits:
+                raise InvalidMedia("bit_offset 超出所选像素位流。")
+            bit_end = min(bit_start + request["bit_count"], total_bits)
+            start = bit_start // len(channels)
+            end = min((bit_end + len(channels) - 1) // len(channels), count)
+        else:
+            start = request["pixel_offset"]
+            if start > count:
+                raise InvalidMedia("pixel_offset 超出所选像素区域。")
+            end = min(start + request["pixel_count"], count)
         indices = [native_channels.index(channel) for channel in channels]
         if raw16:
             samples = selected_png16(data, width, height, len(native_channels), bounds, start, end, indices)
@@ -190,11 +205,14 @@ def read_png(data, request):
             samples = selected_pixels(view if composite else image, bounds, start, end, indices, divisor)
         report = {
             "status": "ok", "format": "PNG", "width": width, "height": height,
+            "operation": request["operation"],
             "frame_index": frame_index, "frame_count": frames, "bit_depth": sample_depth, "source_bit_depth": depth,
             "frame_semantics": "composited_rgba" if composite else "default_image" if default_image else "native_samples",
             "region": bounds, "channels": channels,
-            "pixel_offset": start, "pixel_count": end - start,
-            "next_pixel_offset": end if end < count else None,
+            **({} if bitstream else {
+                "pixel_offset": start, "pixel_count": end - start,
+                "next_pixel_offset": end if end < count else None,
+            }),
         }
         if request["operation"] == "pixels":
             report["pixels"] = [{"x": x, "y": y, "values": values} for x, y, values in samples]
@@ -204,6 +222,25 @@ def read_png(data, request):
         if bit_index >= sample_depth:
             raise InvalidMedia("bit_index 必须小于当前帧的样本位深。")
         bit_order = request["bit_order"]
+        if bitstream:
+            bit_count = bit_end - bit_start
+            packed = bytearray((bit_count + 7) // 8)
+            logical = start * len(channels)
+            for _, _, values in samples:
+                for sample in values:
+                    if bit_start <= logical < bit_end:
+                        local = logical - bit_start
+                        byte_index, bit = divmod(local, 8)
+                        shift = 7 - bit if bit_order == "msb_first" else bit
+                        packed[byte_index] |= ((sample >> bit_index) & 1) << shift
+                    logical += 1
+            return {
+                **report, "bit_index": bit_index, "bit_order": bit_order,
+                "bit_offset": bit_start, "bit_count": bit_count, "total_bit_count": total_bits,
+                "next_bit_offset": bit_end if bit_end < total_bits else None,
+                "padding_bits": (-bit_count) % 8, "hex": packed.hex(),
+                "packed_sha256": hashlib.sha256(packed).hexdigest(),
+            }
         bit_count = (end - start) * len(channels)
         packed = bytearray((bit_count + 7) // 8)
         for index, sample in enumerate(value for _, _, values in samples for value in values):
@@ -248,6 +285,47 @@ def read_pdf(data, request):
         metadata = document.metadata or {}
         fields = {key: value[:512] for key, value in metadata.items() if isinstance(value, str) and value}
         count = document.page_count
+        action = request.get("pdf_action", "inspect")
+        if action == "list_attachments":
+            total = document.embfile_count()
+            rows = []
+            for index in range(min(total, 64)):
+                info = document.embfile_info(index) or {}
+                rows.append({"attachment_index": index, "name": str(info.get("filename") or info.get("ufilename") or f"attachment-{index}")[:256],
+                             "description": str(info.get("desc") or "")[:256], "size": int(info.get("size", 0))})
+            return {"status": "ok", "format": "PDF", "attachment_count": total,
+                    "attachments": rows, "attachments_truncated": total > len(rows), "metadata": fields}
+        if action == "read_attachment":
+            index = request["attachment_index"]
+            total = document.embfile_count()
+            if index >= total:
+                raise InvalidMedia("attachment_index 超出 PDF 附件数量。")
+            info = document.embfile_info(index) or {}
+            if int(info.get("size", 0)) > 1024 * 1024:
+                raise InvalidMedia("PDF 嵌入附件超过 1 MiB 派生结果上限。")
+            content = document.embfile_get(index)
+            if len(content) > 1024 * 1024:
+                raise InvalidMedia("PDF 嵌入附件超过 1 MiB 派生结果上限。")
+            return {"status": "ok", "format": "PDF", "attachment_index": index,
+                    "name": str(info.get("filename") or info.get("ufilename") or f"attachment-{index}")[:256],
+                    "size": len(content), "artifact_sha256": hashlib.sha256(content).hexdigest(),
+                    "artifact_base64": base64.b64encode(content).decode("ascii")}
+        if action == "render_page":
+            index = request["page_offset"]
+            if index >= count:
+                raise InvalidMedia("page_offset 超出 PDF 页数。")
+            page = document.load_page(index)
+            dpi = request.get("render_dpi", 144)
+            pixmap = page.get_pixmap(matrix=pymupdf.Matrix(dpi / 72, dpi / 72), alpha=False, annots=True)
+            if pixmap.width > 4096 or pixmap.height > 4096 or pixmap.width * pixmap.height > 4 * 1024 * 1024:
+                raise InvalidMedia("PDF 页面渲染超过 4096 单边像素或 4 MP 上限，请降低 render_dpi。")
+            content = pixmap.tobytes("png")
+            if len(content) > 12 * 1024 * 1024:
+                raise InvalidMedia("渲染 PNG 超过 12 MiB 派生结果上限。")
+            return {"status": "ok", "format": "PDF", "page_index": index, "page_count": count,
+                    "render_width": pixmap.width, "render_height": pixmap.height, "render_dpi": dpi,
+                    "artifact_sha256": hashlib.sha256(content).hexdigest(),
+                    "artifact_base64": base64.b64encode(content).decode("ascii")}
         start = request["page_offset"]
         if start > count:
             raise InvalidMedia("page_offset 超出 PDF 页数。")
@@ -267,6 +345,161 @@ def read_pdf(data, request):
             "is_repaired": bool(document.is_repaired),
             "next_page_offset": end if end < count else None,
         }
+
+
+def limited_value(value):
+    if isinstance(value, bytes):
+        return {"type": "blob", "length": len(value), "sha256": hashlib.sha256(value).hexdigest(),
+                "hex_preview": value[:32].hex(), "truncated": len(value) > 32}
+    if isinstance(value, str):
+        return value[:1024] + ("…" if len(value) > 1024 else "")
+    if value is None or isinstance(value, (int, float)):
+        return value
+    return str(value)[:1024]
+
+
+def read_sqlite(data, request):
+    if not data.startswith(b"SQLite format 3\x00"):
+        raise InvalidMedia("未找到有效的 SQLite 3 文件头。")
+    connection = sqlite3.connect(":memory:")
+    try:
+        if not hasattr(connection, "deserialize"):
+            raise MissingDependency("Python sqlite3 deserialize")
+        connection.deserialize(data)
+        connection.execute("PRAGMA query_only=ON")
+        forbidden = {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE,
+                     sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_TRIGGER,
+                     sqlite3.SQLITE_CREATE_VIEW, sqlite3.SQLITE_DROP_INDEX, sqlite3.SQLITE_DROP_TABLE,
+                     sqlite3.SQLITE_DROP_TRIGGER, sqlite3.SQLITE_DROP_VIEW, sqlite3.SQLITE_ALTER_TABLE,
+                     sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_PRAGMA,
+                     sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT, sqlite3.SQLITE_REINDEX,
+                     sqlite3.SQLITE_ANALYZE}
+        def authorize(action, arg1, arg2, database, trigger):
+            return sqlite3.SQLITE_DENY if action in forbidden else sqlite3.SQLITE_OK
+        connection.set_authorizer(authorize)
+        ticks = [0]
+        def progress():
+            ticks[0] += 1
+            return 1 if ticks[0] > 5000 else 0
+        connection.set_progress_handler(progress, 1000)
+        query = request.get("query")
+        offset, limit = request.get("row_offset", 0), request.get("row_limit", 25)
+        if query is not None:
+            if not re.match(r"(?is)^\s*(?:select|with)\b", query):
+                raise InvalidMedia("只允许单条只读 SELECT 查询。")
+            cursor = connection.execute(query)
+            columns = [item[0][:256] for item in cursor.description or []]
+            cursor.fetchmany(offset) if offset else None
+            rows = [[limited_value(value) for value in row] for row in cursor.fetchmany(limit + 1)]
+            more = len(rows) > limit
+            rows = rows[:limit]
+            return {"status": "ok", "format": "SQLite", "query": query[:512], "columns": columns,
+                    "row_offset": offset, "rows": rows, "next_row_offset": offset + len(rows) if more else None}
+        tables = [row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        result = {"status": "ok", "format": "SQLite", "table_count": len(tables), "tables": tables[:128],
+                  "tables_truncated": len(tables) > 128}
+        table = request.get("table")
+        if table is None:
+            return result
+        if table not in tables:
+            raise InvalidMedia("sqlite_table 不存在于该数据库。")
+        escaped = table.replace('"', '""')
+        cursor = connection.execute(f'SELECT * FROM "{escaped}" LIMIT ? OFFSET ?', (limit + 1, offset))
+        columns = [item[0][:256] for item in cursor.description or []]
+        rows = [[limited_value(value) for value in row] for row in cursor.fetchall()]
+        more = len(rows) > limit
+        rows = rows[:limit]
+        return {**result, "table": table, "columns": columns, "row_offset": offset, "rows": rows,
+                "next_row_offset": offset + len(rows) if more else None}
+    except sqlite3.Error as error:
+        raise InvalidMedia("SQLite 查询被只读规则拒绝，或数据库结构无效。") from error
+    finally:
+        connection.close()
+
+
+def read_office(data, request):
+    if not data.startswith(b"PK"):
+        raise InvalidMedia("仅支持基于 ZIP 的 DOCX、XLSX、PPTX、ODT、ODS 和 ODP。")
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except (zipfile.BadZipFile, OSError) as error:
+        raise InvalidMedia("Office ZIP 容器无效。") from error
+    with archive:
+        infos = archive.infolist()
+        if len(infos) > 512 or sum(info.file_size for info in infos) > 128 * 1024 * 1024:
+            raise InvalidMedia("Office 文档超过 512 个部件或 128 MiB 展开上限。")
+        names = {info.filename for info in infos if not info.is_dir()}
+        natural_sheet = lambda name: int(re.search(r"sheet(\d+)", name).group(1)) if re.search(r"sheet(\d+)", name) else 0
+        natural_slide = lambda name: int(re.search(r"slide(\d+)", name).group(1)) if re.search(r"slide(\d+)", name) else 0
+        part = request.get("part")
+        if part is not None:
+            if part.startswith(("/", "\\")) or ".." in part.replace("\\", "/").split("/") or part not in names:
+                raise InvalidMedia("office_part 必须是归档内存在的相对部件路径。")
+            selected = [part]
+        elif "word/document.xml" in names:
+            selected = ["word/document.xml"]
+        elif "xl/sharedStrings.xml" in names or any(name.startswith("xl/worksheets/") for name in names):
+            selected = sorted((name for name in names if name.startswith("xl/worksheets/")), key=natural_sheet)[:16]
+            if not selected and "xl/sharedStrings.xml" in names: selected = ["xl/sharedStrings.xml"]
+        elif any(name.startswith("ppt/slides/slide") for name in names):
+            selected = sorted((name for name in names if re.match(r"ppt/slides/slide\d+\.xml$", name)), key=natural_slide)[:32]
+        elif "content.xml" in names:
+            selected = ["content.xml"]
+        else:
+            raise InvalidMedia("未找到受支持的 Office 文档主体。")
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            if archive.getinfo("xl/sharedStrings.xml").file_size > 8 * 1024 * 1024:
+                raise InvalidMedia("XLSX sharedStrings.xml 超过 8 MiB 读取上限。")
+            try:
+                root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                shared = ["".join(node.itertext())[:2048] for node in root if node.tag.endswith("}si")]
+            except ET.ParseError:
+                raise InvalidMedia("XLSX sharedStrings.xml 无法解析。")
+        sections = []
+        remaining = 32 * 1024
+        for name in selected:
+            info = archive.getinfo(name)
+            if info.file_size > 16 * 1024 * 1024:
+                continue
+            try:
+                root = ET.fromstring(archive.read(name))
+            except (ET.ParseError, RuntimeError, zipfile.BadZipFile):
+                continue
+            values = []
+            if "/worksheets/" in name:
+                for cell in root.iter():
+                    if not cell.tag.endswith("}c"):
+                        continue
+                    ref = cell.attrib.get("r", "")[:16]
+                    value_node = next((node for node in cell if node.tag.endswith("}v")), None)
+                    inline = "".join("".join(node.itertext()) for node in cell if node.tag.endswith("}is"))
+                    value = inline or (value_node.text if value_node is not None else "")
+                    if cell.attrib.get("t") == "s" and value.isdigit() and int(value) < len(shared):
+                        value = shared[int(value)]
+                    if value != "": values.append(f"{ref}={value}")
+                    if len(values) >= 512: break
+            elif name == "content.xml":
+                for node in root.iter():
+                    if node.tag.endswith("}p"):
+                        text = "".join(node.itertext()).strip()
+                        if text: values.append(text)
+                        if sum(len(value) for value in values) >= remaining: break
+            else:
+                for node in root.iter():
+                    if node.tag.endswith("}t") and node.text:
+                        values.append(node.text)
+                        if sum(len(value) for value in values) >= remaining: break
+            raw_content = "\n".join(values)
+            content = raw_content[:remaining]
+            remaining -= len(content)
+            sections.append({"part": name, "text": content, "truncated": len(content) < len(raw_content)})
+            if remaining <= 0: break
+        if not sections:
+            raise InvalidMedia("未找到可读取的 Office 文本或单元格。")
+        return {"status": "ok", "format": "Office", "container_parts": len(infos), "sections": sections,
+                "text_truncated": remaining <= 0}
 
 
 def qr_payload(value, corners):
@@ -331,6 +564,10 @@ def main():
             report = inspect_image(data, request)
         elif kind == "pdf":
             report = read_pdf(data, request)
+        elif kind == "sqlite":
+            report = read_sqlite(data, request)
+        elif kind == "office":
+            report = read_office(data, request)
         else:
             report = read_qr(data)
     except MissingDependency as error:

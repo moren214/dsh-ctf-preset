@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { pinnedLookup } from './network-boundary.js';
 import http from 'node:http';
 import https from 'node:https';
@@ -39,59 +39,35 @@ const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const EMPTY_SHA256 = createHash('sha256').update(Buffer.alloc(0)).digest('hex');
 
 export const HTTP_REQUEST_PROPERTIES = {
-  url: {
-    type: 'string',
-    minLength: 1,
-    maxLength: MAX_URL_LENGTH,
-    description: '目标 URL，必须是带主机名的绝对地址，只允许 http 或 https 协议。',
-  },
-  method: {
-    type: 'string',
-    enum: METHODS,
-    default: DEFAULT_METHOD,
-    description: 'HTTP 方法，默认 GET。',
-  },
+  url: { type: 'string', minLength: 1, maxLength: MAX_URL_LENGTH, description: '目标 http(s) URL。' },
+  method: { type: 'string', enum: METHODS, default: DEFAULT_METHOD },
   headers: {
-    type: 'object',
-    maxProperties: MAX_HEADERS,
+    type: 'object', maxProperties: MAX_HEADERS,
     additionalProperties: { type: 'string', maxLength: MAX_HEADER_VALUE_CHARS },
-    description: '请求头对象，最多 32 个。名称必须是合法 HTTP token，值不能含控制字符或 CR/LF，单值不超过 4096 字符，名称与值合计不超过 16384 字符。',
+    description: '自定义请求头（支持 Host/Cookie/Authorization）。',
   },
-  body: {
-    type: 'string',
-    maxLength: MAX_BODY_BYTES * 2,
-    description: '请求体文本，按 body_encoding 解码后最多 1 MiB。GET/HEAD 也可携带 body，但部分服务器会忽略。',
+  body: { type: 'string', maxLength: MAX_BODY_BYTES * 2, description: '请求体（与 multipart 互斥，限 1 MiB）。' },
+  body_encoding: { type: 'string', enum: BODY_ENCODINGS, default: DEFAULT_BODY_ENCODING },
+  multipart: {
+    type: 'array', minItems: 1, maxItems: 16,
+    description: 'multipart/form-data 表单/文件上传项（与 body 互斥）。',
+    items: {
+      type: 'object', additionalProperties: false, required: ['name'],
+      properties: {
+        name: { type: 'string', minLength: 1, maxLength: 256 },
+        value: { type: 'string', maxLength: MAX_BODY_BYTES * 2 },
+        value_encoding: { type: 'string', enum: BODY_ENCODINGS, default: DEFAULT_BODY_ENCODING },
+        file_path: { type: 'string', maxLength: 1024 },
+        filename: { type: 'string', maxLength: 256 },
+        content_type: { type: 'string', maxLength: 256 },
+      },
+    },
   },
-  body_encoding: {
-    type: 'string',
-    enum: BODY_ENCODINGS,
-    default: DEFAULT_BODY_ENCODING,
-    description: 'body 的编码，默认 utf8；hex 与 base64 会在发送前解码。',
-  },
-  timeout_ms: {
-    type: 'integer',
-    minimum: MIN_TIMEOUT_MS,
-    maximum: MAX_TIMEOUT_MS,
-    default: DEFAULT_TIMEOUT_MS,
-    description: '单次请求的超时毫秒数，默认 10000，范围 1000 至 30000。',
-  },
-  max_bytes: {
-    type: 'integer',
-    minimum: MIN_MAX_BYTES,
-    maximum: MAX_MAX_BYTES,
-    default: DEFAULT_MAX_BYTES,
-    description: '响应体（解压后）最多读取的字节数，默认 262144，范围 1024 至 1048576。',
-  },
-  follow_redirects: {
-    type: 'boolean',
-    default: true,
-    description: '是否跟随同源或同主机 HTTP 到 HTTPS 的无请求体 GET/HEAD 跳转，默认 true，最多 5 跳。',
-  },
-  allow_insecure: {
-    type: 'boolean',
-    default: false,
-    description: '是否跳过 HTTPS 证书校验，默认 false；仅用于 CTF 自签名证书目标。',
-  },
+  cookie_jar: { type: 'string', minLength: 1, maxLength: 64, description: '会话 Cookie 容器名。' },
+  timeout_ms: { type: 'integer', minimum: MIN_TIMEOUT_MS, maximum: MAX_TIMEOUT_MS, default: DEFAULT_TIMEOUT_MS },
+  max_bytes: { type: 'integer', minimum: MIN_MAX_BYTES, maximum: MAX_MAX_BYTES, default: DEFAULT_MAX_BYTES },
+  follow_redirects: { type: 'boolean', default: true },
+  allow_insecure: { type: 'boolean', default: false },
 };
 
 function namedError(message, name) {
@@ -250,10 +226,15 @@ function parseOptions(options) {
     throw new Error('options 必须是对象。');
   }
   for (const key of Object.keys(options)) {
-    if (key !== 'signal' && key !== 'authorize') throw new Error(`options 不支持 ${key}。`);
+    if (!['signal', 'authorize', 'cookieJar', 'readFile'].includes(key)) throw new Error(`options 不支持 ${key}。`);
   }
-  const { signal, authorize } = options;
+  const { signal, authorize, cookieJar, readFile } = options;
   if (authorize !== undefined && typeof authorize !== 'function') throw new Error('options.authorize 须为函数。');
+  if (readFile !== undefined && typeof readFile !== 'function') throw new Error('options.readFile 须为函数。');
+  if (cookieJar !== undefined && (cookieJar === null || typeof cookieJar !== 'object'
+    || typeof cookieJar.headerFor !== 'function' || typeof cookieJar.store !== 'function')) {
+    throw new Error('options.cookieJar 无效。');
+  }
   if (signal !== undefined) {
     if (signal === null || typeof signal !== 'object' || typeof signal.addEventListener !== 'function'
       || typeof signal.removeEventListener !== 'function' || typeof signal.aborted !== 'boolean') {
@@ -261,6 +242,201 @@ function parseOptions(options) {
     }
   }
   return signal;
+}
+
+function defaultCookiePath(pathname) {
+  if (!pathname || !pathname.startsWith('/')) return '/';
+  const slash = pathname.lastIndexOf('/');
+  return slash <= 0 ? '/' : pathname.slice(0, slash);
+}
+
+function cookiePathMatches(requestPath, cookiePath) {
+  if (requestPath === cookiePath) return true;
+  if (!requestPath.startsWith(cookiePath)) return false;
+  return cookiePath.endsWith('/') || requestPath[cookiePath.length] === '/';
+}
+
+function cookieDomainMatches(hostname, cookie) {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/gu, '');
+  if (cookie.hostOnly) return host === cookie.domain;
+  return host === cookie.domain || host.endsWith('.' + cookie.domain);
+}
+
+function parseSetCookie(header, url) {
+  if (typeof header !== 'string' || header.length === 0 || header.length > 8192) return undefined;
+  const segments = header.split(';');
+  const pair = segments[0];
+  const eq = pair.indexOf('=');
+  if (eq <= 0) return undefined;
+  const name = pair.slice(0, eq).trim();
+  const value = pair.slice(eq + 1).trim();
+  if (!name || /[\x00-\x1f\x7f;=]/u.test(name)) return undefined;
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/gu, '');
+  const cookie = {
+    name, value, domain: host, hostOnly: true, path: defaultCookiePath(url.pathname),
+    secure: false, httpOnly: false, expiresAt: undefined,
+  };
+  for (let index = 1; index < segments.length; index += 1) {
+    const raw = segments[index].trim();
+    if (!raw) continue;
+    const sep = raw.indexOf('=');
+    const attr = (sep === -1 ? raw : raw.slice(0, sep)).trim().toLowerCase();
+    const attrVal = sep === -1 ? '' : raw.slice(sep + 1).trim();
+    if (attr === 'secure') cookie.secure = true;
+    else if (attr === 'httponly') cookie.httpOnly = true;
+    else if (attr === 'path' && attrVal.startsWith('/')) cookie.path = attrVal;
+    else if (attr === 'domain' && attrVal) {
+      const cleaned = attrVal.replace(/^\.+/u, '').toLowerCase();
+      if (cleaned && (host === cleaned || host.endsWith('.' + cleaned))) {
+        cookie.domain = cleaned;
+        cookie.hostOnly = false;
+      } else {
+        return undefined;
+      }
+    } else if (attr === 'max-age' && /^-?\d+$/u.test(attrVal)) {
+      const seconds = Number(attrVal);
+      cookie.expiresAt = seconds <= 0 ? 0 : Date.now() + seconds * 1000;
+    } else if (attr === 'expires' && cookie.expiresAt === undefined) {
+      const parsed = Date.parse(attrVal);
+      if (Number.isFinite(parsed)) cookie.expiresAt = parsed;
+    }
+  }
+  return cookie;
+}
+
+export function createCookieJarStore({ maxJars = 16, maxCookiesPerJar = 64 } = {}) {
+  const jars = new Map();
+  function getJar(name) {
+    let jar = jars.get(name);
+    if (jar === undefined) {
+      if (jars.size >= maxJars) jars.delete(jars.keys().next().value);
+      jar = new Map();
+      jars.set(name, jar);
+    }
+    return jar;
+  }
+  return {
+    forJar(name) {
+      return {
+        headerFor(url) {
+          const jar = jars.get(name);
+          if (!jar || jar.size === 0) return '';
+          const now = Date.now();
+          const matched = [];
+          for (const [key, cookie] of jar) {
+            if (cookie.expiresAt !== undefined && cookie.expiresAt <= now) {
+              jar.delete(key);
+              continue;
+            }
+            if (cookie.secure && url.protocol !== 'https:') continue;
+            if (!cookieDomainMatches(url.hostname, cookie)) continue;
+            if (!cookiePathMatches(url.pathname || '/', cookie.path)) continue;
+            matched.push(cookie);
+          }
+          matched.sort((a, b) => b.path.length - a.path.length);
+          return matched.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
+        },
+        store(url, setCookies) {
+          if (!Array.isArray(setCookies) || setCookies.length === 0) return [];
+          const jar = getJar(name);
+          const now = Date.now();
+          const updated = [];
+          for (const raw of setCookies) {
+            const cookie = parseSetCookie(raw, url);
+            if (!cookie) continue;
+            const key = `${cookie.domain}|${cookie.path}|${cookie.name}`;
+            if (cookie.expiresAt !== undefined && cookie.expiresAt <= now) {
+              jar.delete(key);
+              updated.push({ name: cookie.name, domain: cookie.domain, path: cookie.path, action: 'deleted' });
+            } else {
+              if (!jar.has(key) && jar.size >= maxCookiesPerJar) jar.delete(jar.keys().next().value);
+              jar.set(key, cookie);
+              updated.push({ name: cookie.name, domain: cookie.domain, path: cookie.path, action: 'set' });
+            }
+          }
+          return updated;
+        },
+      };
+    },
+  };
+}
+
+function escapeMultipartParam(value, label) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 256 || /[\r\n\0]/u.test(value)) {
+    throw new Error(`multipart.${label} 须为 1 至 256 字符的单行文本。`);
+  }
+  return value.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+}
+
+async function buildMultipartBody(parts, readFile) {
+  if (!Array.isArray(parts) || parts.length < 1 || parts.length > 16) {
+    throw new Error('multipart 须包含 1 至 16 个字段。');
+  }
+  const boundary = '----dshCtfBoundary' + randomBytes(12).toString('hex');
+  const chunks = [];
+  let total = 0;
+  for (const part of parts) {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) throw new Error('multipart 每项须是对象。');
+    for (const key of Object.keys(part)) {
+      if (!['name', 'value', 'value_encoding', 'file_path', 'filename', 'content_type'].includes(key)) {
+        throw new Error(`multipart 不支持字段 ${key}。`);
+      }
+    }
+    const fieldName = escapeMultipartParam(part.name, 'name');
+    const hasValue = part.value !== undefined;
+    const hasFile = part.file_path !== undefined;
+    if (hasValue === hasFile) throw new Error(`multipart 字段 ${part.name} 须在 value 和 file_path 中二选一。`);
+    let payload;
+    let filename = part.filename;
+    if (hasFile) {
+      if (typeof part.file_path !== 'string' || part.file_path.length === 0 || part.file_path.length > 1024) {
+        throw new Error('multipart.file_path 无效。');
+      }
+      if (typeof readFile !== 'function') throw new Error('当前环境不支持 multipart.file_path 文件上传。');
+      payload = await readFile(part.file_path, MAX_BODY_BYTES);
+      filename ??= part.file_path.split(/[\\/]/u).pop() || 'upload.bin';
+    } else {
+      if (typeof part.value !== 'string') throw new Error('multipart.value 必须是字符串。');
+      const encoding = part.value_encoding ?? DEFAULT_BODY_ENCODING;
+      if (!BODY_ENCODINGS.includes(encoding)) throw new Error(`value_encoding 必须是 ${BODY_ENCODINGS.join('、')} 之一。`);
+      payload = decodeBody(part.value, encoding);
+    }
+    let disposition = `Content-Disposition: form-data; name="${fieldName}"`;
+    if (filename !== undefined) disposition += `; filename="${escapeMultipartParam(filename, 'filename')}"`;
+    const partLines = [`--${boundary}`, disposition];
+    if (part.content_type !== undefined) {
+      if (typeof part.content_type !== 'string' || !HEADER_VALUE.test(part.content_type) || part.content_type.length > 256) {
+        throw new Error('multipart.content_type 格式无效。');
+      }
+      partLines.push(`Content-Type: ${part.content_type}`);
+    } else if (hasFile) {
+      partLines.push('Content-Type: application/octet-stream');
+    }
+    const headerBuf = Buffer.from(partLines.join('\r\n') + '\r\n\r\n', 'utf8');
+    const trailerBuf = Buffer.from('\r\n', 'utf8');
+    total += headerBuf.length + payload.length + trailerBuf.length;
+    if (total > MAX_BODY_BYTES) throw new Error(`multipart 请求体超过 ${MAX_BODY_BYTES} 字节（1 MiB）。`);
+    chunks.push(headerBuf, payload, trailerBuf);
+  }
+  const closing = Buffer.from(`--${boundary}--\r\n`, 'utf8');
+  if (total + closing.length > MAX_BODY_BYTES) throw new Error(`multipart 请求体超过 ${MAX_BODY_BYTES} 字节（1 MiB）。`);
+  chunks.push(closing);
+  return { body: Buffer.concat(chunks), contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+function mergeCookieHeader(headers, jarHeader) {
+  if (!jarHeader) return headers;
+  const existingKey = Object.keys(headers).find(key => key.toLowerCase() === 'cookie');
+  if (!existingKey) return { ...headers, Cookie: jarHeader };
+  const merged = new Map();
+  for (const part of [jarHeader, headers[existingKey]]) {
+    for (const item of String(part).split(';')) {
+      const trimmed = item.trim();
+      const eq = trimmed.indexOf('=');
+      if (eq > 0) merged.set(trimmed.slice(0, eq).trim(), trimmed);
+    }
+  }
+  return { ...headers, [existingKey]: [...merged.values()].join('; ') };
 }
 
 function parseInput(input) {
@@ -272,11 +448,20 @@ function parseInput(input) {
       throw new Error(`不支持的参数：${key}。`);
     }
   }
+  if (input.body !== undefined && input.multipart !== undefined) {
+    throw new Error('body 和 multipart 不能同时提供。');
+  }
+  if (input.cookie_jar !== undefined && (typeof input.cookie_jar !== 'string'
+    || input.cookie_jar.length < 1 || input.cookie_jar.length > 64 || /[\r\n\0]/u.test(input.cookie_jar))) {
+    throw new Error('cookie_jar 须为 1 至 64 字符的单行标识。');
+  }
   return {
     url: parseUrl(input.url),
     method: parseMethod(input.method),
     headers: parseHeaders(input.headers),
-    body: parseBody(input),
+    body: input.multipart === undefined ? parseBody(input) : null,
+    multipart: input.multipart,
+    cookieJarName: input.cookie_jar,
     timeoutMs: parseInteger(input.timeout_ms, DEFAULT_TIMEOUT_MS, MIN_TIMEOUT_MS, MAX_TIMEOUT_MS, 'timeout_ms'),
     maxBytes: parseInteger(input.max_bytes, DEFAULT_MAX_BYTES, MIN_MAX_BYTES, MAX_MAX_BYTES, 'max_bytes'),
     followRedirects: parseBoolean(input.follow_redirects, true, 'follow_redirects'),
@@ -572,10 +757,20 @@ export async function httpRequest(input, options = {}) {
   const startedAt = Date.now();
   const redirects = [];
   const notes = [];
+  const cookiesStored = [];
   const visited = new Set([config.url.href]);
   let currentUrl = config.url;
-  const { method, body } = config;
-  let headers = buildHeaders(config.headers, body);
+  const { method } = config;
+  const givenHeaders = { ...config.headers };
+  let body = config.body;
+  if (config.multipart !== undefined) {
+    const built = await buildMultipartBody(config.multipart, options.readFile);
+    body = built.body;
+    if (!Object.keys(givenHeaders).some(name => name.toLowerCase() === 'content-type')) {
+      givenHeaders['Content-Type'] = built.contentType;
+    }
+  }
+  let baseHeaders = buildHeaders(givenHeaders, body);
   let address = await options.authorize?.(currentUrl, signal);
 
   if (body.length > 0 && (method === 'GET' || method === 'HEAD')) {
@@ -587,6 +782,9 @@ export async function httpRequest(input, options = {}) {
 
   for (;;) {
     if (signal !== undefined && signal.aborted) throw abortError(currentUrl);
+    const headers = options.cookieJar
+      ? mergeCookieHeader(baseHeaders, options.cookieJar.headerFor(currentUrl))
+      : baseHeaders;
 
     const hop = await requestOnce({
       url: currentUrl,
@@ -599,6 +797,9 @@ export async function httpRequest(input, options = {}) {
       allowInsecure: config.allowInsecure,
       signal,
     });
+    if (options.cookieJar && Array.isArray(hop.headers['set-cookie'])) {
+      cookiesStored.push(...options.cookieJar.store(currentUrl, hop.headers['set-cookie']));
+    }
 
     const location = hop.headers.location;
     const isRedirect = REDIRECT_STATUSES.has(hop.status)
@@ -621,7 +822,7 @@ export async function httpRequest(input, options = {}) {
       }
       if (redirectBlocked === undefined) {
         if (currentUrl.origin !== target.origin) {
-          headers = buildHeaders({}, body);
+          baseHeaders = buildHeaders({}, body);
           notes.push('同主机升级为 HTTPS，已清除原请求自定义头。');
         }
         visited.add(target.href);
@@ -658,6 +859,7 @@ export async function httpRequest(input, options = {}) {
       ...(hop.body_error ? { body_error: hop.body_error } : {}),
       sha256: hop.buffer.length === 0 ? EMPTY_SHA256 : sha256Hex(hop.buffer),
       ...(redirectBlocked === undefined ? {} : { redirect_blocked: redirectBlocked }),
+      ...(config.cookieJarName === undefined ? {} : { cookie_jar: config.cookieJarName, cookies_stored: cookiesStored }),
       remote_address: hop.remoteAddress,
     };
     if (hop.contentEncoding !== undefined) result.content_encoding = hop.contentEncoding;

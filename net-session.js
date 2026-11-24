@@ -32,63 +32,16 @@ const OPERATION_KEYS = {
 };
 
 export const NET_SESSION_PROPERTIES = {
-  operation: {
-    type: 'string',
-    enum: NET_SESSION_OPERATIONS,
-    description: '操作类型。connect 建立 TCP 会话，send 发送数据，recv 读取数据，read_until 读到分隔符，close 关闭会话，list 列出当前会话。',
-  },
-  session_id: {
-    type: 'string',
-    minLength: 1,
-    maxLength: MAX_SESSION_ID_LENGTH,
-    description: 'connect 返回的会话标识，如 net-1。',
-  },
-  host: {
-    type: 'string',
-    minLength: 1,
-    maxLength: MAX_HOST_LENGTH,
-    description: '目标主机名或 IP 地址，不能含空白字符。',
-  },
-  port: {
-    type: 'integer',
-    minimum: 1,
-    maximum: 65535,
-    description: '目标 TCP 端口，1 至 65535。',
-  },
-  data: {
-    type: 'string',
-    minLength: 1,
-    maxLength: MAX_DATA_CHARS,
-    description: '要发送的数据，按 data_encoding 解码；解码后最多 1 MiB。',
-  },
-  data_encoding: {
-    type: 'string',
-    enum: DATA_ENCODINGS,
-    description: 'data 的编码，默认 utf8。',
-  },
-  timeout_ms: {
-    type: 'integer',
-    minimum: 1,
-    maximum: MAX_TIMEOUT_MS,
-    description: '超时毫秒数。connect 默认 5000，recv 与 read_until 默认 2000；上限 30000。',
-  },
-  max_bytes: {
-    type: 'integer',
-    minimum: 1,
-    maximum: MAX_RECV_BYTES,
-    description: 'recv 单次最多返回的字节数，默认 4096，上限 65536。',
-  },
-  delimiter: {
-    type: 'string',
-    minLength: 1,
-    maxLength: MAX_DELIMITER_CHARS,
-    description: 'read_until 的目标分隔符，按 delimiter_encoding 解码，最多 4096 字节。',
-  },
-  delimiter_encoding: {
-    type: 'string',
-    enum: DELIMITER_ENCODINGS,
-    description: 'delimiter 的编码，默认 utf8。',
-  },
+  operation: { type: 'string', enum: NET_SESSION_OPERATIONS, description: 'connect/send/recv/read_until/close/list。' },
+  session_id: { type: 'string', minLength: 1, maxLength: MAX_SESSION_ID_LENGTH },
+  host: { type: 'string', minLength: 1, maxLength: MAX_HOST_LENGTH },
+  port: { type: 'integer', minimum: 1, maximum: 65535 },
+  data: { type: 'string', minLength: 1, maxLength: MAX_DATA_CHARS },
+  data_encoding: { type: 'string', enum: DATA_ENCODINGS },
+  timeout_ms: { type: 'integer', minimum: 1, maximum: MAX_TIMEOUT_MS },
+  max_bytes: { type: 'integer', minimum: 1, maximum: MAX_RECV_BYTES },
+  delimiter: { type: 'string', minLength: 1, maxLength: MAX_DELIMITER_CHARS },
+  delimiter_encoding: { type: 'string', enum: DELIMITER_ENCODINGS },
 };
 
 function parseOptions(options) {

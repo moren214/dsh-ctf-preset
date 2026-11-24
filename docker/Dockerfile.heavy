@@ -1,0 +1,77 @@
+# DSH CTF Preset 重型扩展兵器库镜像（dsh-ctf-sandbox:heavy）
+# 基于基础全栈镜像增量叠加，共享底层存储，按构建参数自由开关重型工具：
+#
+#   # 1) 先构建基础全栈镜像（若尚未构建）
+#   docker build -t dsh-ctf-sandbox:latest docker/
+#
+#   # 2) 构建重型扩展镜像（默认含 Ghidra Headless + angr + jadx + apktool，不含 SageMath）
+#   docker build -f docker/Dockerfile.heavy -t dsh-ctf-sandbox:heavy docker/
+#
+#   # 如需叠加 SageMath（额外约 3 GB）：
+#   docker build -f docker/Dockerfile.heavy --build-arg WITH_SAGE=1 -t dsh-ctf-sandbox:heavy docker/
+#
+# 构建完成后无需修改配置，ctf_sandbox 默认 profile="auto" 会自动发现并按需启用（亦可通过 sandboxHeavyImage 自定义重型镜像名）。
+ARG BASE_IMAGE=dsh-ctf-sandbox:latest
+FROM ${BASE_IMAGE}
+
+ARG WITH_GHIDRA=1
+ARG WITH_ANGR=1
+ARG WITH_APK=1
+ARG WITH_SAGE=0
+ARG PIP_INDEX_URL=""
+
+ARG GHIDRA_VERSION=11.3.1
+ARG GHIDRA_DATE=20250219
+ARG JADX_VERSION=1.5.1
+ARG APKTOOL_VERSION=2.11.1
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    GHIDRA_HOME=/opt/ghidra
+
+# 1. Java 运行时（Ghidra / jadx / apktool 共享同一份 OpenJDK 21 JRE）
+RUN if [ "$WITH_GHIDRA" = "1" ] || [ "$WITH_APK" = "1" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends openjdk-21-jre-headless \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# 2. Ghidra Headless（ctf_sandbox action=decompile 会自动探测 GHIDRA_HOME / analyzeHeadless）
+RUN if [ "$WITH_GHIDRA" = "1" ]; then \
+        GHIDRA_ZIP="ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip" \
+        && curl -fsSL "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/${GHIDRA_ZIP}" -o /tmp/ghidra.zip \
+        && unzip -q /tmp/ghidra.zip -d /opt \
+        && mv "/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" /opt/ghidra \
+        && ln -sf /opt/ghidra/support/analyzeHeadless /usr/local/bin/analyzeHeadless \
+        && rm -f /tmp/ghidra.zip; \
+    fi
+
+# 3. Android APK 逆向（jadx + apktool）
+RUN if [ "$WITH_APK" = "1" ]; then \
+        curl -fsSL "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" -o /tmp/jadx.zip \
+        && mkdir -p /opt/jadx \
+        && unzip -q /tmp/jadx.zip -d /opt/jadx \
+        && chmod +x /opt/jadx/bin/jadx /opt/jadx/bin/jadx-gui \
+        && ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx \
+        && rm -f /tmp/jadx.zip \
+        && mkdir -p /opt/apktool \
+        && curl -fsSL "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" -o /opt/apktool/apktool.jar \
+        && printf '#!/bin/sh\nexec java -jar /opt/apktool/apktool.jar "$@"\n' > /usr/local/bin/apktool \
+        && chmod +x /usr/local/bin/apktool; \
+    fi
+
+# 4. 符号执行引擎 angr
+RUN if [ "$WITH_ANGR" = "1" ]; then \
+        PIP_ARGS="--no-cache-dir" \
+        && if [ -n "$PIP_INDEX_URL" ]; then PIP_ARGS="$PIP_ARGS -i $PIP_INDEX_URL"; fi \
+        && pip3 install $PIP_ARGS angr; \
+    fi
+
+# 5. 高阶数学/格密码引擎 SageMath（默认关闭，传 --build-arg WITH_SAGE=1 启用）
+RUN if [ "$WITH_SAGE" = "1" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends sagemath \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+WORKDIR /work
+CMD ["bash"]

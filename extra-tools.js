@@ -1,7 +1,7 @@
 // CTF preset 的扩展工具：浏览器会话、gdb 调试、压缩包口令、音频隐写、APK 检查、
 // 云元数据探测、密码学模板。全部工具遵守有界读取，失败时返回结构化错误。
 import { spawn } from 'node:child_process';
-import { readFileSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -9,11 +9,29 @@ import { deflateSync, inflateRawSync } from 'node:zlib';
 import { BROWSER_TIMEOUT_MS, createBrowserSession } from './browser-session.js';
 import { isLocalWorkbenchPath } from './workbench-config.js';
 import { describeToolError, ToolError } from './tool-errors.js';
+import { detectSandbox, runSandboxCommand } from './sandbox-runner.js';
+import { CRYPTO_SOLVE_OPERATIONS, runCryptoSolve } from './crypto-toolbox.js';
 
 const MAX_INPUT_BYTES = 256 * 1024 * 1024;
 const MAX_TEXT_OUTPUT = 64 * 1024;
+const GDB_ATOM = '(?:\\$[A-Za-z][A-Za-z0-9_]*|0x[0-9a-f]{1,16}|[0-9]{1,16}|[A-Za-z_][A-Za-z0-9_.@$]*)';
+const GDB_EXPR = `${GDB_ATOM}(?:\\s*[+-]\\s*${GDB_ATOM}){0,3}`;
+const GDB_CAST = '(?:\\((?:void|char|int|long|unsigned\\s+long|uint64_t|uint32_t|int64_t|int32_t)\\s*\\*{1,2}\\))';
+const GDB_VALUE = `(?:\\*(?:${GDB_CAST})?\\s*)?(?:${GDB_EXPR}|\\(${GDB_EXPR}\\))`;
+const GDB_COMMAND_PATTERNS = [
+  new RegExp(`^(?:break|b)\\s+\\*?${GDB_EXPR}$`, 'iu'),
+  /^(?:run|start|starti|continue|c|step|s|stepi|si|next|n|nexti|ni|finish|fin|kill)$/iu,
+  /^(?:bt|backtrace)(?:\s+[0-9]{1,3})?$/iu,
+  /^(?:info|i)\s+(?:registers|reg|r)(?:\s+[A-Za-z0-9_]+){0,8}$/iu,
+  /^(?:info|i)\s+(?:all-registers|frame|files|proc\s+mappings|args|locals|functions|variables|breakpoints|b)$/iu,
+  new RegExp(`^(?:info|i)\\s+symbol\\s+${GDB_EXPR}$`, 'iu'),
+  /^frame(?:\s+[0-9]{1,4})?$/iu,
+  new RegExp(`^x\\/(?:[1-9][0-9]{0,2})?(?:[bghw][xduoctafis]?|[xduoctafis][bghw]?)?\\s+${GDB_VALUE}$`, 'iu'),
+  new RegExp(`^(?:disassemble|disas)(?:\\s+${GDB_EXPR}(?:\\s*,\\s*${GDB_EXPR})?)?$`, 'iu'),
+  new RegExp(`^(?:p|print)(?:\\/[xduoctafs]|\\s+\\/[xduoctafs])?\\s+${GDB_VALUE}$`, 'iu'),
+];
 
-function registerTool(ctx, toolName, description, properties, run, required = ['file_path'], observe, config) {
+function registerTool(ctx, toolName, description, properties, run, required = ['file_path'], observe, getConfig) {
   const schema = required.includes('file_path') && !Object.hasOwn(properties, 'file_path')
     ? { file_path: { type: 'string', description: '本题工作区内的相对附件路径。' }, ...properties } : properties;
   ctx.tools.register({
@@ -23,6 +41,7 @@ function registerTool(ctx, toolName, description, properties, run, required = ['
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
     async execute(args, execution) {
       const askedFile = typeof args?.file_path === 'string' ? args.file_path : undefined;
+      const spacing = () => (getConfig()?.compact === false ? 2 : 0);
       try {
         if (!args || typeof args !== 'object' || Array.isArray(args)
           || Object.keys(args).some(key => !Object.hasOwn(schema, key))
@@ -30,19 +49,16 @@ function registerTool(ctx, toolName, description, properties, run, required = ['
           throw new ToolError('unsupported', '参数缺失或含工具未声明的字段。');
         }
         const report = await run(args, execution);
+        const artifactBytes = Buffer.isBuffer(report?.__artifact_bytes) ? report.__artifact_bytes : undefined;
+        if (artifactBytes !== undefined) delete report.__artifact_bytes;
         const output = { file: askedFile, ...report };
-        const capture = await observe?.(toolName, args, execution, output);
-        return JSON.stringify({ ...output, ...capture }, null, config?.compact === false ? 2 : 0);
+        const capture = await observe?.(toolName, args, execution, output, artifactBytes);
+        return JSON.stringify({ ...output, ...capture }, null, spacing());
       } catch (error) {
-        return JSON.stringify({ ok: false, file: askedFile, error: describeToolError(error) }, null, config?.compact === false ? 2 : 0);
+        return JSON.stringify({ ok: false, file: askedFile, error: describeToolError(error) }, null, spacing());
       }
     },
   });
-}
-
-function resolveInput(cwd, value, label = 'file_path') {
-  if (typeof value !== 'string' || value.length === 0) throw new ToolError('path', `需要提供 ${label}。`);
-  return path.isAbsolute(value) ? value : path.resolve(cwd, value);
 }
 
 function childEnvironment() {
@@ -53,7 +69,7 @@ function childEnvironment() {
 
 function requireWritable(ctx, execution) {
   const policy = ctx.sandboxPolicy?.resolve?.({ session: execution.agent?.session });
-  if (policy?.mode === 'read-only') throw new ToolError('path', '当前会话是只读权限，无法写入文件。');
+  if (policy?.mode === 'read-only') throw new ToolError('permission', '当前会话是只读权限，无法写入文件。');
 }
 
 function truncate(text, limit = MAX_TEXT_OUTPUT) {
@@ -63,11 +79,16 @@ function truncate(text, limit = MAX_TEXT_OUTPUT) {
 }
 
 function spawnCapture(command, args, options = {}) {
-  const { timeoutMs = 30000, cwd, env = childEnvironment(), maxBytes = 256 * 1024, signal } = options;
+  const { timeoutMs = 30000, cwd, env = childEnvironment(), maxBytes = 256 * 1024, signal, killTree = false } = options;
   return new Promise((resolve, reject) => {
+    if (killTree && signal?.aborted) {
+      reject(signal.reason ?? new Error('子进程已取消。'));
+      return;
+    }
     let child;
     try {
-      child = spawn(command, args, { cwd, env, windowsHide: true, signal, stdio: ['ignore', 'pipe', 'pipe'] });
+      child = spawn(command, args, { cwd, env, windowsHide: true, ...(killTree && process.platform !== 'win32' ? { detached: true } : {}),
+        ...(!killTree && signal ? { signal } : {}), stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (error) {
       reject(error);
       return;
@@ -76,6 +97,28 @@ function spawnCapture(command, args, options = {}) {
     let stderr = '';
     let timedOut = false;
     let settled = false;
+    let abortReason;
+    const terminate = () => {
+      if (killTree && child.pid) {
+        if (process.platform === 'win32') {
+          const taskkill = process.env.SystemRoot ? path.join(process.env.SystemRoot, 'System32', 'taskkill.exe') : 'taskkill';
+          try {
+            const killer = spawn(taskkill, ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+            killer.on('error', () => {});
+            killer.unref();
+          }
+          catch { /* Fall back to killing the debugger process below. */ }
+        } else {
+          try { process.kill(-child.pid, 'SIGKILL'); } catch { /* Process group may already have exited. */ }
+        }
+      }
+      try { child.kill(); } catch { /* Process may already have exited. */ }
+    };
+    const abort = () => {
+      if (settled) return;
+      abortReason = signal?.reason ?? new Error('子进程已取消。');
+      terminate();
+    };
     const collect = (chunk, target) => {
       const next = target + chunk.toString('utf8');
       return next.length > maxBytes ? next.slice(0, maxBytes) : next;
@@ -83,23 +126,83 @@ function spawnCapture(command, args, options = {}) {
     const timer = setTimeout(() => {
       if (settled) return;
       timedOut = true;
-      try { child.kill(); } catch { /* ignore */ }
+      terminate();
     }, timeoutMs);
+    if (killTree && signal) {
+      signal.addEventListener('abort', abort, { once: true });
+      if (signal.aborted) abort();
+    }
     child.stdout?.on('data', chunk => { stdout = collect(chunk, stdout); });
     child.stderr?.on('data', chunk => { stderr = collect(chunk, stderr); });
     child.on('error', error => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      reject(error);
+      signal?.removeEventListener('abort', abort);
+      reject(abortReason ?? error);
     });
     child.on('close', code => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ code: code ?? -1, stdout, stderr, timedOut });
+      signal?.removeEventListener('abort', abort);
+      if (abortReason !== undefined) reject(abortReason);
+      else resolve({ code: code ?? -1, stdout, stderr, timedOut });
     });
   });
+}
+
+function validatedGdbCommands(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 24) {
+    throw new ToolError('unsupported', 'debug 需要 1 至 24 条 GDB 命令。');
+  }
+  return value.map(command => {
+    if (typeof command !== 'string' || command.length > 256 || /[\0\r\n;]/u.test(command)) {
+      throw new ToolError('unsupported', 'GDB 命令须为单行文本且不超过 256 字符。');
+    }
+    const normalized = command.trim();
+    if (!GDB_COMMAND_PATTERNS.some(pattern => pattern.test(normalized))) {
+      throw new ToolError('unsupported', `GDB 命令不在只读调试白名单内：${normalized.slice(0, 80)}。`);
+    }
+    return normalized;
+  });
+}
+
+function validatedGdbArgs(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 16) {
+    throw new ToolError('unsupported', 'args 须为最多 16 项的字符串数组。');
+  }
+  return value.map((item, idx) => {
+    if (typeof item !== 'string' || item.length > 256 || /[\0\r\n]/u.test(item)) {
+      throw new ToolError('unsupported', `args[${idx}] 须为不超过 256 字符的单行字符串。`);
+    }
+    return item;
+  });
+}
+
+function quoteGdbPath(value) {
+  return '"' + value.replaceAll('\\', '/').replaceAll('"', '\\"') + '"';
+}
+
+function quoteGdbArg(value, posix) {
+  return posix ? "'" + value.replaceAll("'", "'\\''") + "'" : quoteGdbPath(value);
+}
+
+function isElfBinary(filePath) {
+  let fd;
+  try {
+    fd = openSync(filePath, 'r');
+    const head = Buffer.alloc(4);
+    const n = readSync(fd, head, 0, 4, 0);
+    return n === 4 && head[0] === 0x7f && head[1] === 0x45 && head[2] === 0x4c && head[3] === 0x46;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  }
 }
 
 function commandCandidates(name) {
@@ -295,18 +398,14 @@ function* maskCandidates(slots, minimum, maximum) {
   }
 }
 
-function* candidatesFor(args, cwd) {
+function* candidatesFor(args, wordlistText) {
   if (Array.isArray(args.passwords)) {
     for (const password of args.passwords) {
       if (typeof password === 'string' && password.length <= 64) yield password;
     }
   }
-  if (typeof args.wordlist === 'string') {
-    const file = resolveInput(cwd, args.wordlist, 'wordlist');
-    const info = fileInfo(file);
-    if (info.size > 64 * 1024 * 1024) throw new ToolError('size', '字典超过 64 MiB。');
-    const text = readFileSync(file, 'utf8');
-    for (const line of text.split(/\r?\n/u)) {
+  if (typeof wordlistText === 'string') {
+    for (const line of wordlistText.split(/\r?\n/u)) {
       if (line.length > 0 && line.length <= 64) yield line;
     }
   }
@@ -320,17 +419,20 @@ function* candidatesFor(args, cwd) {
   yield* COMMON_PASSWORDS;
 }
 
-function crackZip(buffer, entry, args, cwd) {
+async function crackZip(buffer, entry, args, wordlistText, signal) {
   const timeoutMs = Math.min(Math.max(args.timeout_ms ?? 30000, 1000), 120000);
   const deadline = Date.now() + timeoutMs;
   let tried = 0;
-  for (const password of candidatesFor(args, cwd)) {
-    if ((tried & 0x3ff) === 0 && Date.now() > deadline) {
-      return { status: 'not_found', timed_out: true, tried };
+  for (const password of candidatesFor(args, wordlistText)) {
+    if ((tried & 0xff) === 0) {
+      signal?.throwIfAborted();
+      if (Date.now() > deadline) return { status: 'not_found', timed_out: true, tried };
+      if (tried > 0) await new Promise(resolve => setImmediate(resolve));
     }
     tried += 1;
     if (tryZipCrypto(buffer, entry, password)) return { status: 'found', password, tried };
   }
+  signal?.throwIfAborted();
   return { status: 'not_found', timed_out: false, tried };
 }
 
@@ -389,16 +491,25 @@ function parseWav(buffer) {
   if (fmt.size < 16 || fmt.dataOffset + fmt.size > buffer.length || data.dataOffset + data.size > buffer.length) {
     throw new ToolError('unsupported', 'WAV 的 fmt 或 data 块被截断。');
   }
-  const format = buffer.readUInt16LE(fmt.dataOffset);
+  let format = buffer.readUInt16LE(fmt.dataOffset);
+  if (format === 0xfffe) {
+    const pcmGuid = Buffer.from('0100000000001000800000aa00389b71', 'hex');
+    if (fmt.size < 40 || !buffer.subarray(fmt.dataOffset + 24, fmt.dataOffset + 40).equals(pcmGuid)) {
+      throw new ToolError('unsupported', 'WAVEFORMATEXTENSIBLE 只支持标准 PCM 子格式。');
+    }
+    format = buffer.readUInt16LE(fmt.dataOffset + 24);
+  }
   const channels = buffer.readUInt16LE(fmt.dataOffset + 2);
   const sampleRate = buffer.readUInt32LE(fmt.dataOffset + 4);
+  const blockAlign = buffer.readUInt16LE(fmt.dataOffset + 12);
   const bitsPerSample = buffer.readUInt16LE(fmt.dataOffset + 14);
   if (channels < 1 || channels > 32 || sampleRate < 1) throw new ToolError('unsupported', 'WAV 声道数或采样率无效。');
-  if (![8, 16].includes(bitsPerSample)) {
-    throw new ToolError('unsupported', `暂不支持 ${bitsPerSample} 位 PCM，仅支持 8/16 位。`);
+  if (![8, 16, 24].includes(bitsPerSample)) {
+    throw new ToolError('unsupported', `暂不支持 ${bitsPerSample} 位 PCM，支持 8/16/24 位。`);
   }
   if (format !== 1) throw new ToolError('unsupported', '只支持 PCM（format=1）的 WAV。');
   const frameSize = channels * (bitsPerSample / 8);
+  if (blockAlign !== frameSize) throw new ToolError('unsupported', 'WAV block_align 与声道数及位深不匹配。');
   const frames = Math.floor(data.size / frameSize);
   const tags = {};
   for (const chunk of chunks) {
@@ -421,7 +532,38 @@ function sampleAt(buffer, wav, frame, channel) {
   const bytes = wav.fmt.bitsPerSample / 8;
   const offset = wav.data.dataOffset + (frame * wav.fmt.channels + channel) * bytes;
   if (wav.fmt.bitsPerSample === 8) return (buffer[offset] - 128) / 128;
-  return buffer.readInt16LE(offset) / 32768;
+  if (wav.fmt.bitsPerSample === 16) return buffer.readInt16LE(offset) / 32768;
+  let value = buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+  if (value & 0x800000) value -= 0x1000000;
+  return value / 8388608;
+}
+
+function rawSampleAt(buffer, wav, frame, channel) {
+  const bytes = wav.fmt.bitsPerSample / 8;
+  const offset = wav.data.dataOffset + (frame * wav.fmt.channels + channel) * bytes;
+  if (wav.fmt.bitsPerSample === 8) return buffer[offset];
+  if (wav.fmt.bitsPerSample === 16) return buffer.readUInt16LE(offset);
+  return buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+}
+
+function audioSelection(wav, args) {
+  if (args.start_frame !== undefined && args.start_seconds !== undefined) throw new ToolError('unsupported', 'start_frame 和 start_seconds 只能选一个。');
+  if (args.frame_count !== undefined && args.duration_seconds !== undefined) throw new ToolError('unsupported', 'frame_count 和 duration_seconds 只能选一个。');
+  const start = args.start_frame ?? Math.floor((args.start_seconds ?? 0) * wav.fmt.sampleRate);
+  const count = args.frame_count ?? (args.duration_seconds === undefined
+    ? wav.frames - start : Math.ceil(args.duration_seconds * wav.fmt.sampleRate));
+  if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count < 1 || start + count > wav.frames) {
+    throw new ToolError('unsupported', '音频选段必须落在完整 PCM 帧范围内。');
+  }
+  const channels = args.channels ?? Array.from({ length: wav.fmt.channels }, (_, index) => index);
+  if (!Array.isArray(channels) || channels.length < 1 || channels.length > wav.fmt.channels
+    || new Set(channels).size !== channels.length || channels.some(channel => !Number.isInteger(channel) || channel < 0 || channel >= wav.fmt.channels)) {
+    throw new ToolError('unsupported', 'channels 须是 WAV 中有效且不重复的声道编号。');
+  }
+  const sampleOffset = args.sample_offset ?? 0;
+  if (!Number.isSafeInteger(sampleOffset) || sampleOffset < 0 || sampleOffset % 8 !== 0
+    || sampleOffset > count * channels.length) throw new ToolError('unsupported', 'sample_offset 须按字节对齐并位于所选音频段内。');
+  return { start, count, end: start + count, channels, sampleOffset };
 }
 
 function fftMagnitudes(samples) {
@@ -554,75 +696,151 @@ function findJavaTool(candidates) {
 
 const TEMPLATES = {
   'z3_bitvec': [
-    '# z3 位向量模板：把题目的约束逐条改成 BitVec 表达式，解出 chars。',
-    'from z3 import *',
+    '# Z3 位向量求解脚手架：将字节约束写成 BitVec 等式后求解。',
+    'from z3 import BitVec, Solver, sat',
     '',
-    'n = 16  # 已知字符数，按题目修改',
-    'chars = [BitVec(f"c{i}", 8) for i in range(n)]',
-    'solver = Solver()',
-    'for c in chars:',
-    '    solver.add(32 <= c, c <= 126)',
+    'def solve_bytes(length=8):',
+    '    chars = [BitVec(f"c{i}", 8) for i in range(length)]',
+    '    solver = Solver()',
+    '    for c in chars:',
+    '        solver.add(c >= 0x20, c <= 0x7e)',
+    '    # 示例约束（解题时替换为题目真实方程）',
+    '    target = b"CTF_TEST"[:length]',
+    '    for i, b in enumerate(target):',
+    '        solver.add((chars[i] ^ 0x2A) == (b ^ 0x2A))',
+    '    if solver.check() != sat:',
+    '        return None',
+    '    model = solver.model()',
+    '    return bytes(model[c].as_long() for c in chars)',
     '',
-    '# TODO：把题目里的等式、异或、移位关系写成 solver.add(...)',
-    '# 例如 solver.add(chars[0] ^ chars[1] == 0x33)',
-    '',
-    'print(solver.check())',
-    'model = solver.model()',
-    'print("".join(chr(model[c].as_long()) for c in chars))',
+    'if __name__ == "__main__":',
+    '    ans = solve_bytes()',
+    '    print("result:", ans.decode("ascii", "replace") if ans else "unsat")',
     '',
   ].join('\n'),
   'coppersmith': [
-    '# Coppersmith 模板（需要 fpylll 和 sympy）：一元小根。',
+    '# Coppersmith 一元小根求解脚手架（依赖 fpylll 与 sympy）：Howgrave-Graham + LLL。',
     'from fpylll import IntegerMatrix, LLL',
-    'from sympy import Poly, symbols, RR',
+    'from sympy import Poly, ZZ, symbols',
     '',
-    'x = symbols("x")',
-    '# TODO：把题目的模方程写成 f(x) = (known + x)^e - c mod n',
-    'n = 0',
-    'f = 0',
+    'def coppersmith_univariate(coeffs_desc, modulus, bound_x, m=2, t=2):',
+    '    """对首一多项式 f(x) = sum(c_i * x^i) mod modulus 寻找 |x| <= bound_x 的整数根。"""',
+    '    x = symbols("x")',
+    '    f = Poly(coeffs_desc, x, domain=ZZ)',
+    '    d = f.degree()',
+    '    if d <= 0:',
+    '        raise ValueError("多项式次数必须大于 0")',
+    '    polys = []',
+    '    for i in range(m):',
+    '        for j in range(d):',
+    '            polys.append(Poly((modulus ** (m - i)) * (x ** j) * (f.as_expr() ** i), x, domain=ZZ))',
+    '    for k in range(t):',
+    '        polys.append(Poly((x ** k) * (f.as_expr() ** m), x, domain=ZZ))',
+    '    dim = len(polys)',
+    '    mat = IntegerMatrix(dim, dim)',
+    '    for row, p in enumerate(polys):',
+    '        for col in range(dim):',
+    '            mat[row, col] = int(p.nth(col)) * (bound_x ** col)',
+    '    LLL.reduction(mat)',
+    '    roots = set()',
+    '    for row in range(dim):',
+    '        scaled = [int(mat[row, col]) // (bound_x ** col) for col in range(dim)]',
+    '        if all(c == 0 for c in scaled):',
+    '            continue',
+    '        cand_poly = Poly(list(reversed(scaled)), x, domain=ZZ)',
+    '        for r in cand_poly.ground_roots().keys():',
+    '            r_int = int(r)',
+    '            if abs(r_int) <= bound_x and int(f.eval(r_int)) % modulus == 0:',
+    '                roots.add(r_int)',
+    '    return sorted(roots)',
     '',
-    'def coppersmith(poly, modulus, beta=0.5, mm=3, tt=4):',
-    '    """教学版：只演示构造，实际题按已知位宽调整 mm/tt/epsilon。"""',
-    '    raise NotImplementedError("按题目补全多项式与上界，再跑 LLL")',
-    '',
-    'print("修改 f 与 n 后运行 coppersmith(f, n)")',
+    'if __name__ == "__main__":',
+    '    # 示例：解 (known + x)^3 - c == 0 (mod n)',
+    '    n = 1000003 * 1000033',
+    '    known = 123456000',
+    '    secret_x = 42',
+    '    c = pow(known + secret_x, 3, n)',
+    '    x = symbols("x")',
+    '    poly = Poly((known + x) ** 3 - c, x, domain=ZZ)',
+    '    print("roots:", coppersmith_univariate(poly.all_coeffs(), n, bound_x=1000, m=2, t=2))',
     '',
   ].join('\n'),
   'lattice': [
-    '# 格/HNP 模板（需要 fpylll）：把已知点构造进矩阵后做 LLL/BKZ。',
+    '# 格规约 / 线性同余小解求解脚手架（依赖 fpylll）：Kannan 嵌入 + LLL/BKZ。',
     'from fpylll import IntegerMatrix, LLL, BKZ',
     '',
-    'dim = 4',
-    'matrix = IntegerMatrix(dim, dim)',
-    '# TODO：按题目填入已知关系 a_i * k + b_i mod n 的格基',
-    'for i in range(dim):',
-    '    matrix[i, i] = 1',
+    'def solve_linear_modular(a_list, b_list, modulus, bound, use_bkz=False):',
+    '    """求解 k * a_i + b_i == e_i (mod modulus)，其中 |e_i| <= bound。"""',
+    '    n = len(a_list)',
+    '    dim = n + 2',
+    '    mat = IntegerMatrix(dim, dim)',
+    '    for i in range(n):',
+    '        mat[i, i] = modulus',
+    '        mat[n, i] = a_list[i] % modulus',
+    '        mat[n + 1, i] = b_list[i] % modulus',
+    '    mat[n, n] = 1',
+    '    mat[n + 1, n + 1] = bound',
+    '    if use_bkz:',
+    '        BKZ.reduction(mat, BKZ.Param(block_size=min(20, dim)))',
+    '    else:',
+    '        LLL.reduction(mat)',
+    '    candidates = []',
+    '    for row in range(dim):',
+    '        if abs(mat[row, n + 1]) == bound:',
+    '            sign = 1 if mat[row, n + 1] > 0 else -1',
+    '            k = (sign * int(mat[row, n])) % modulus',
+    '            candidates.append(k)',
+    '    return sorted(set(candidates))',
     '',
-    'LLL.reduction(matrix)',
-    'print(matrix)',
+    'if __name__ == "__main__":',
+    '    modulus = 65537',
+    '    secret_k = 1337',
+    '    a_vals = [101, 211, 307, 409, 503]',
+    '    errors = [3, -2, 5, -1, 4]',
+    '    b_vals = [(e - secret_k * a) % modulus for a, e in zip(a_vals, errors)]',
+    '    print("candidates:", solve_linear_modular(a_vals, b_vals, modulus, bound=16))',
     '',
   ].join('\n'),
   'aes_mode': [
-    '# AES 模式分析模板：根据 oracle 行为判断 ECB/CBC/CTR。',
-    'from Crypto.Cipher import AES  # 需要 pycryptodome',
+    '# AES 分组模式诊断脚手架（依赖 pycryptodome）：块长探测、ECB 重复块检测与 CBC/CTR 属性验证。',
+    'from Crypto.Cipher import AES',
+    'from Crypto.Util.Padding import pad, unpad',
     '',
-    'def oracle(data):',
-    '    """TODO：把题目给的加密接口包在这里，返回密文 bytes。"""',
-    '    raise NotImplementedError',
+    'def detect_block_size(encrypt_fn, max_len=64):',
+    '    base = len(encrypt_fn(b""))',
+    '    for i in range(1, max_len + 1):',
+    '        size = len(encrypt_fn(b"A" * i))',
+    '        if size > base:',
+    '            return size - base',
+    '    return None',
     '',
-    'c1 = oracle(b"A" * 16)',
-    'c2 = oracle(b"B" * 16)',
-    'print("长度:", len(c1))',
-    'print("ECB 可能:", oracle(b"A" * 16) == oracle(b"A" * 16))',
+    'def is_ecb_like(encrypt_fn, block_size=16):',
+    '    sample = encrypt_fn(b"A" * (block_size * 4))',
+    '    blocks = [sample[i:i + block_size] for i in range(0, len(sample), block_size)]',
+    '    return len(blocks) != len(set(blocks))',
+    '',
+    'def demo_local_oracle():',
+    '    key = b"0123456789abcdef"',
+    '    ecb = lambda pt: AES.new(key, AES.MODE_ECB).encrypt(pad(pt, 16))',
+    '    cbc = lambda pt: AES.new(key, AES.MODE_CBC, iv=b"fedcba9876543210").encrypt(pad(pt, 16))',
+    '    print("ECB block_size:", detect_block_size(ecb), "ecb_detected:", is_ecb_like(ecb))',
+    '    print("CBC block_size:", detect_block_size(cbc), "ecb_detected:", is_ecb_like(cbc))',
+    '    ct = cbc(b"hello_ctf_block_mode")',
+    '    pt = unpad(AES.new(key, AES.MODE_CBC, iv=b"fedcba9876543210").decrypt(ct), 16)',
+    '    print("CBC roundtrip ok:", pt == b"hello_ctf_block_mode")',
+    '',
+    'if __name__ == "__main__":',
+    '    demo_local_oracle()',
     '',
   ].join('\n'),
 };
 
 // ── 注册 ─────────────────────────────────────────────────────────────────────
 
-export function registerExtraTools(ctx, config, access) {
+export function registerExtraTools(ctx, configSource, access) {
+  const getConfig = typeof configSource === 'function' ? configSource : () => configSource ?? {};
   const register = (name, description, properties, run, required) =>
-    registerTool(ctx, name, description, properties, run, required, access.observe, config);
+    registerTool(ctx, name, description, properties, run, required, access.observe, getConfig);
   const browsers = new WeakMap();
   const activeBrowsers = new Set();
   ctx.effect(() => () => Promise.allSettled([...activeBrowsers].map(browser => browser.close())), 'CTF browser sessions');
@@ -635,7 +853,7 @@ export function registerExtraTools(ctx, config, access) {
     let browser = byWorkspace.get(key);
     if (browser === undefined) {
       browser = createBrowserSession({
-        resolveBinary: () => detectBrowser(config),
+        resolveBinary: () => detectBrowser(getConfig()),
         authorize: access.authorize,
         environment: childEnvironment,
         onStart() {
@@ -650,17 +868,58 @@ export function registerExtraTools(ctx, config, access) {
   }
 
   register('browser_session',
-    '在可信 Chrome/Edge 中查看已授权来源的页面、DOM、Cookie 属性和截图。',
+    '隔离 Chrome/Edge 会话：open/dom/screenshot/cookies/storage/network/console 及可写交互（click/fill/select/press/wait_for）。',
     {
-      action: { type: 'string', enum: ['open', 'dom', 'screenshot', 'cookies', 'title', 'close', 'status', 'list'], description: '操作类型。' },
-      url: { type: 'string', description: 'open 时要打开的 http(s) 地址。' },
-      selector: { type: 'string', description: 'dom 时可选的 CSS 选择器。' },
-      path: { type: 'string', description: 'screenshot 的保存路径，默认当前工作目录下的 screenshot-时间戳.png。' },
-      timeout_ms: { type: 'integer', minimum: 1000, maximum: 60000, description: '本次操作含浏览器启动的等待上限，默认 15000。' },
+      action: { type: 'string', enum: ['open', 'dom', 'screenshot', 'cookies', 'title', 'close', 'status', 'list', 'click', 'fill', 'select', 'press', 'wait_for', 'storage', 'network', 'console'] },
+      url: { type: 'string' },
+      selector: { type: 'string', maxLength: 1024 },
+      value: { type: 'string', maxLength: 16384 },
+      key: { type: 'string', enum: ['Enter', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Backspace', 'Delete'] },
+      storage_type: { type: 'string', enum: ['local', 'session'] },
+      include_values: { type: 'boolean', default: true },
+      request_id: { type: 'string', maxLength: 256, description: 'network 读指定请求响应体。' },
+      clear_logs: { type: 'boolean', default: false },
+      wait_ms: { type: 'integer', minimum: 250, maximum: 30000 },
+      path: { type: 'string' },
+      timeout_ms: { type: 'integer', minimum: 1000, maximum: 60000 },
     },
     async (args, execution) => {
       const location = await access.location(execution);
       const action = args.action;
+      if (['click', 'fill', 'select', 'press'].includes(action)) requireWritable(ctx, execution);
+      if (args.selector !== undefined && (typeof args.selector !== 'string' || args.selector.length === 0 || args.selector.length > 1024)) {
+        throw new ToolError('unsupported', 'selector 须为不超过 1024 字符的 CSS 选择器。');
+      }
+      if (['click', 'fill', 'select', 'press', 'wait_for'].includes(action)
+        && (typeof args.selector !== 'string' || args.selector.length === 0)) {
+        throw new ToolError('unsupported', `${action} 需要非空 CSS selector。`);
+      }
+      if (args.value !== undefined && (typeof args.value !== 'string' || args.value.length > 16384)) {
+        throw new ToolError('unsupported', 'value 须为不超过 16384 字符的文本。');
+      }
+      if (['fill', 'select'].includes(action) && typeof args.value !== 'string') {
+        throw new ToolError('unsupported', `${action} 需要字符串 value。`);
+      }
+      if (action === 'press' && !['Enter', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Backspace', 'Delete'].includes(args.key)) {
+        throw new ToolError('unsupported', 'press 的 key 须为 Enter、Tab、Escape、方向键、Space、Backspace 或 Delete。');
+      }
+      const waitMs = args.wait_ms ?? 10000;
+      if (action === 'wait_for' && (!Number.isSafeInteger(waitMs) || waitMs < 250 || waitMs > 30000)) {
+        throw new ToolError('unsupported', 'wait_ms 须在 250 至 30000 内。');
+      }
+      const storageType = args.storage_type ?? 'local';
+      if (action === 'storage' && !['local', 'session'].includes(storageType)) {
+        throw new ToolError('unsupported', 'storage_type 须为 local 或 session。');
+      }
+      if (args.include_values !== undefined && typeof args.include_values !== 'boolean') {
+        throw new ToolError('unsupported', 'include_values 须为布尔值。');
+      }
+      if (args.clear_logs !== undefined && typeof args.clear_logs !== 'boolean') {
+        throw new ToolError('unsupported', 'clear_logs 须为布尔值。');
+      }
+      if (args.request_id !== undefined && (typeof args.request_id !== 'string' || args.request_id.length === 0 || args.request_id.length > 256)) {
+        throw new ToolError('unsupported', 'request_id 须为非空字符串。');
+      }
       const browser = getBrowser(execution.agent.session, location.directoryKey);
       if (action === 'close') {
         const closed = await browser.close();
@@ -689,16 +948,58 @@ export function registerExtraTools(ctx, config, access) {
           return { status: 'dom', title: await evaluate('document.title'), html: truncate(await evaluate(expression) ?? '', 256 * 1024) };
         }
         if (action === 'title') return { status: 'title', title: await evaluate('document.title') };
+        if (action === 'press') {
+          const result = await browser.press(target, args.selector, args.key, signal);
+          if (result.status === 'invalid_selector') throw new ToolError('unsupported', 'CSS selector 语法无效。');
+          if (result.status === 'match_count') throw new ToolError('missing', `CSS selector 匹配 ${result.count} 个元素，交互要求恰好一个。`);
+          if (result.status !== 'pressed') throw new ToolError('unsupported', `无法向页面元素发送按键：${result.status}。`);
+          return { ...result, selector: args.selector };
+        }
+        if (['click', 'fill', 'select'].includes(action)) {
+          const result = await browser.interact(target, action, args.selector, args.value, signal);
+          const expected = { click: 'clicked', fill: 'filled', select: 'selected' }[action];
+          if (result.status === 'invalid_selector') throw new ToolError('unsupported', 'CSS selector 语法无效。');
+          if (result.status === 'match_count') throw new ToolError('missing', `CSS selector 匹配 ${result.count} 个元素，交互要求恰好一个。`);
+          if (result.status !== expected) throw new ToolError('unsupported', `页面元素无法执行 ${action}：${result.status}。`);
+          return { ...result, selector: args.selector };
+        }
+        if (action === 'wait_for') {
+          const result = await browser.waitFor(target, args.selector, waitMs, signal);
+          if (result.status === 'invalid_selector') throw new ToolError('unsupported', 'CSS selector 语法无效。');
+          return { ...result, selector: args.selector, wait_ms: waitMs };
+        }
+        if (action === 'storage') return { ...await browser.storage(target, storageType, signal), storage_type: storageType };
         if (action === 'screenshot') {
           const file = await access.output(location, args.path ?? ('screenshot-' + Date.now() + '.png'));
           return { status: 'screenshot', file, ...await browser.screenshot(target, file, signal) };
         }
         if (action === 'cookies') {
+          const includeValues = args.include_values !== false;
+          const token = access.platformToken?.() ?? '';
+          const hide = text => token && typeof text === 'string' ? text.replaceAll(token, '[已脱敏]') : text;
           const cookies = await browser.cookies(target, args.url, signal);
-          return { status: 'cookies', cookies: cookies.map(cookie => ({
-            name: cookie.name, domain: cookie.domain, path: cookie.path,
+          return { status: 'cookies', include_values: includeValues, cookies: cookies.map(cookie => ({
+            name: cookie.name,
+            ...(includeValues ? {
+              value: hide(String(cookie.value ?? '').slice(0, 4096)),
+              ...(String(cookie.value ?? '').length > 4096 ? { value_truncated: true } : {}),
+            } : {}),
+            domain: cookie.domain, path: cookie.path,
             secure: cookie.secure, httpOnly: cookie.httpOnly,
+            ...(cookie.sameSite ? { sameSite: cookie.sameSite } : {}),
+            ...(typeof cookie.expires === 'number' && cookie.expires > 0 ? { expires: cookie.expires } : {}),
           })) };
+        }
+        if (action === 'network') {
+          if (args.request_id !== undefined) {
+            return { status: 'network_body', ...await browser.responseBody(target, args.request_id, signal) };
+          }
+          const requests = browser.network(target, args.clear_logs === true);
+          return { status: 'network', count: requests.length, requests };
+        }
+        if (action === 'console') {
+          const entries = browser.console(target, args.clear_logs === true);
+          return { status: 'console', count: entries.length, entries };
         }
         if (action === 'list') return { status: 'targets', targets: await browser.list(target, signal) };
         throw new ToolError('unsupported', `未知操作：${action}。`);
@@ -708,47 +1009,104 @@ export function registerExtraTools(ctx, config, access) {
   );
 
   register('gdb_driver',
-    '用本机 GDB 对题目附件做预设的静态文件检查。',
+    '用 GDB 检查或调试工作区二进制（Windows 下遇 Linux ELF 自动桥接 Docker/WSL2 Linux GDB）；严格只读白名单，禁用 shell/Python/init。',
     {
-      action: { type: 'string', enum: ['inspect'] },
-      kind: { type: 'string', enum: ['files', 'sections'], description: '查看文件或节。' },
+      action: { type: 'string', enum: ['inspect', 'debug'] },
+      kind: { type: 'string', enum: ['files', 'sections'] },
+      commands: { type: 'array', minItems: 1, maxItems: 24, items: { type: 'string', maxLength: 256 }, description: 'GDB 白名单命令列表。' },
+      args: { type: 'array', maxItems: 16, items: { type: 'string', maxLength: 256 }, description: '程序命令行参数。' },
+      stdin_file: { type: 'string', maxLength: 1024 },
       timeout_ms: { type: 'integer', minimum: 1000, maximum: 120000 },
     },
     async (args, execution) => {
-      if (args.action !== 'inspect' || !['files', 'sections'].includes(args.kind ?? 'files')) {
-        throw new ToolError('unsupported', 'GDB 只开放预设的静态文件检查。');
+      if (!['inspect', 'debug'].includes(args.action)) throw new ToolError('unsupported', 'action 须为 inspect 或 debug。');
+      if (args.action === 'inspect' && !['files', 'sections'].includes(args.kind ?? 'files')) {
+        throw new ToolError('unsupported', 'inspect 的 kind 须为 files 或 sections。');
       }
+      if (args.action === 'debug') requireWritable(ctx, execution);
       const location = await access.location(execution);
       const binary = await access.input(location, args.file_path);
-      const gdb = await detectGdb(config);
-      if (!gdb || !path.isAbsolute(gdb)) throw new ToolError('dependency', '配置本机 GDB 的绝对路径，或通过系统 PATH 安装。');
-      const command = args.kind === 'sections' ? 'maintenance info sections' : 'info files';
-      const result = await spawnCapture(gdb, ['-q', '-batch', '-nx', '-nh', '-iex', 'set auto-load off',
-        '-iex', 'set debuginfod enabled off', '--se=' + binary, '-ex', command], {
-        cwd: path.dirname(gdb), timeoutMs: Math.min(Math.max(args.timeout_ms ?? 30000, 1000), 120000),
-        signal: execution.signal,
-      });
-      return { status: result.timedOut ? 'timeout' : result.code === 0 ? 'ok' : 'failed',
-        exit_code: result.code, stdout: truncate(result.stdout), stderr: truncate(result.stderr) };
+      const timeoutMs = args.timeout_ms ?? 30000;
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 120000) {
+        throw new ToolError('unsupported', 'timeout_ms 须在 1000 至 120000 内。');
+      }
+      const config = getConfig();
+      const useSandbox = process.platform === 'win32' && isElfBinary(binary)
+        ? await detectSandbox(config, execution.signal) : undefined;
+      const sandboxActive = Boolean(useSandbox?.available);
+      let gdb;
+      if (!sandboxActive) {
+        gdb = await detectGdb(config);
+        if (!gdb || !path.isAbsolute(gdb)) {
+          throw new ToolError('dependency', '配置本机 GDB 的绝对路径，或启用 Docker/WSL2 Linux 沙箱内的 GDB。');
+        }
+      }
+      const sandboxRel = abs => './' + path.relative(location.cwd, abs).replaceAll('\\', '/');
+      const targetBinary = sandboxActive ? sandboxRel(binary) : binary;
+      const runGdb = (commandArgs, { ptrace = false, killTree = false } = {}) => sandboxActive
+        ? runSandboxCommand(['gdb', ...commandArgs], {
+          cwd: location.cwd, config, signal: execution.signal, timeoutMs, ptrace, detected: useSandbox,
+        })
+        : spawnCapture(gdb, commandArgs, {
+          cwd: location.cwd, timeoutMs, maxBytes: MAX_TEXT_OUTPUT / 2, signal: execution.signal, killTree,
+        });
+
+      if (args.action === 'inspect') {
+        const command = args.kind === 'sections' ? 'maintenance info sections' : 'info files';
+        const result = await runGdb(['-q', '-batch', '-nx', '-nh', '-iex', 'set auto-load off',
+          '-iex', 'set debuginfod enabled off', '--se=' + targetBinary, '-ex', command]);
+        return { action: 'inspect', status: result.timedOut ? 'timeout' : result.code === 0 ? 'ok' : 'failed',
+          ...(sandboxActive ? { backend: result.backend, target: result.target } : { backend: 'host' }),
+          exit_code: result.code, stdout: truncate(result.stdout), stderr: truncate(result.stderr) };
+      }
+      const commands = validatedGdbCommands(args.commands);
+      const progArgs = validatedGdbArgs(args.args);
+      let stdinFile;
+      if (args.stdin_file !== undefined) {
+        if (typeof args.stdin_file !== 'string' || args.stdin_file.length === 0 || args.stdin_file.length > 1024) {
+          throw new ToolError('unsupported', 'stdin_file 须为工作区内的相对文件路径。');
+        }
+        if (!commands.some(command => command.toLowerCase() === 'run')) {
+          throw new ToolError('unsupported', '传入 stdin_file 时 commands 必须包含 run。');
+        }
+        const resolvedStdin = await access.input(location, args.stdin_file);
+        stdinFile = sandboxActive ? sandboxRel(resolvedStdin) : resolvedStdin;
+      }
+      const effectiveCommands = commands.map(command => command.toLowerCase() === 'run' && stdinFile
+        ? 'run < ' + quoteGdbPath(stdinFile) : command);
+      const commandArgs = ['-q', '-batch', '-nx', '-nh', '-iex', 'set auto-load off',
+        '-iex', 'set debuginfod enabled off', '-e', targetBinary, '-ex', 'set confirm off'];
+      if (progArgs.length > 0) {
+        const posix = sandboxActive || process.platform !== 'win32';
+        commandArgs.push('-ex', 'set args ' + progArgs.map(item => quoteGdbArg(item, posix)).join(' '));
+      }
+      for (const command of effectiveCommands) commandArgs.push('-ex', command);
+      const result = await runGdb(commandArgs, { ptrace: true, killTree: true });
+      return { action: 'debug', status: result.timedOut ? 'timeout' : result.code === 0 ? 'ok' : 'failed',
+        ...(sandboxActive ? { backend: result.backend, target: result.target } : { backend: 'host' }),
+        binary: args.file_path, ...(args.stdin_file === undefined ? {} : { stdin_file: args.stdin_file }),
+        ...(progArgs.length > 0 ? { args: progArgs } : {}),
+        commands: effectiveCommands, exit_code: result.code,
+        stdout: truncate(result.stdout), stderr: truncate(result.stderr) };
     },
     ['file_path', 'action'],
   );
 
   register('archive_crack',
-    '检查 ZIP 结构并尝试破解 ZipCrypto 口令（字典、内置弱口令、掩码）。命中后校验解压 CRC。支持 john/hashcat 存在性提示。',
+    '检查 ZIP 结构并尝试破解 ZipCrypto 口令（字典/掩码/弱口令），命中后校验 CRC。',
     {
-      action: { type: 'string', enum: ['info', 'crack'], description: 'info 列出条目；crack 尝试口令。' },
-      wordlist: { type: 'string', description: '字典文件路径（工作区相对或绝对）。' },
-      mask: { type: 'string', description: '掩码，例如 ?l?l?l?d；支持 ?l ?u ?d ?h ?s ?a 和字面字符。' },
-      passwords: { type: 'array', items: { type: 'string' }, maxItems: 256, description: '直接给出的候选口令。' },
-      min_length: { type: 'integer', minimum: 0, maximum: 64, description: '掩码生成口令的最小长度。' },
-      max_length: { type: 'integer', minimum: 1, maximum: 64, description: '掩码生成口令的最大长度。' },
-      timeout_ms: { type: 'integer', minimum: 1000, maximum: 120000, description: '破解时间上限，默认 30000。' },
+      action: { type: 'string', enum: ['info', 'crack'] },
+      wordlist: { type: 'string' },
+      mask: { type: 'string', description: '掩码，如 ?l?l?l?d。' },
+      passwords: { type: 'array', items: { type: 'string' }, maxItems: 256 },
+      min_length: { type: 'integer', minimum: 0, maximum: 64 },
+      max_length: { type: 'integer', minimum: 1, maximum: 64 },
+      timeout_ms: { type: 'integer', minimum: 1000, maximum: 120000 },
     },
     async (args, execution) => {
+      if (!['info', 'crack'].includes(args.action)) throw new ToolError('unsupported', 'action 须为 info 或 crack。');
       const location = await access.location(execution);
-      const cwd = location.cwd;
-      const file = await access.input(location, args.file_path);
+      await access.input(location, args.file_path);
       if (args.wordlist !== undefined) await access.input(location, args.wordlist);
       const { bytes: buffer } = await access.read(location, args.file_path, MAX_INPUT_BYTES);
       const entries = parseZipEntries(buffer);
@@ -767,52 +1125,68 @@ export function registerExtraTools(ctx, config, access) {
       const target = entries.find(entry => entry.encrypted && !entry.directory);
       if (!target) return { status: 'not_encrypted', message: '没有加密条目。' };
       if (target.method === 99) throw new ToolError('unsupported', '该条目是 AES 加密（WinZip AE），暂不支持；可用 john/hashcat 或 shell 处理。');
-      const result = crackZip(buffer, target, args, cwd);
+      let wordlistText;
+      if (typeof args.wordlist === 'string') {
+        const { bytes: wordlistBytes } = await access.read(location, args.wordlist, 64 * 1024 * 1024);
+        wordlistText = wordlistBytes.toString('utf8');
+      }
+      const result = await crackZip(buffer, target, args, wordlistText, execution.signal);
       return { ...result, entry: { name: target.name, method: target.method }, timeout_ms: args.timeout_ms ?? 30000 };
     },
     ['file_path', 'action'],
   );
 
   register('stego_audio',
-    '检查 WAV 元数据并进行 LSB 提取或频谱图渲染（PNG）。二进制位提取会返回 Hex 与可打印文本。',
+    'WAV（8/16/24 位 PCM）元数据、选段/声道 LSB 提取与 FFT 时频谱 PNG 渲染。',
     {
-      action: { type: 'string', enum: ['info', 'lsb', 'spectrum'], description: '操作类型。' },
-      bit_index: { type: 'integer', minimum: 0, maximum: 15, description: '提取第几位，默认 0。' },
-      bit_order: { type: 'string', enum: ['lsb_first', 'msb_first'], description: '位序，默认 lsb_first。' },
-      max_bytes: { type: 'integer', minimum: 1, maximum: 65536, description: '最多输出字节数，默认 4096。' },
-      fft_size: { type: 'integer', minimum: 256, maximum: 8192, description: '每个时间窗的 FFT 点数，须为 2 的幂，默认 2048。' },
-      path: { type: 'string', description: '时频谱图保存路径，默认工作目录 spectrum-*.png。' },
+      action: { type: 'string', enum: ['info', 'lsb', 'spectrum'] },
+      bit_index: { type: 'integer', minimum: 0, maximum: 23 },
+      bit_order: { type: 'string', enum: ['lsb_first', 'msb_first'] },
+      max_bytes: { type: 'integer', minimum: 1, maximum: 65536 },
+      start_seconds: { type: 'number', minimum: 0, maximum: 86400 },
+      duration_seconds: { type: 'number', exclusiveMinimum: 0, maximum: 86400 },
+      start_frame: { type: 'integer', minimum: 0 },
+      frame_count: { type: 'integer', minimum: 1 },
+      channels: { type: 'array', minItems: 1, maxItems: 32, uniqueItems: true, items: { type: 'integer', minimum: 0, maximum: 31 } },
+      sample_offset: { type: 'integer', minimum: 0 },
+      fft_size: { type: 'integer', minimum: 256, maximum: 8192 },
+      path: { type: 'string' },
     },
     async (args, execution) => {
       const location = await access.location(execution);
       const { bytes: buffer } = await access.read(location, args.file_path, MAX_INPUT_BYTES);
       const wav = parseWav(buffer);
       const inputHash = createHash('sha256').update(buffer).digest('hex');
+      const selection = args.action === 'info' && wav.frames === 0
+        ? { start: 0, count: 0, end: 0, channels: Array.from({ length: wav.fmt.channels }, (_, index) => index), sampleOffset: 0 }
+        : audioSelection(wav, args);
       const base = {
         input_sha256: inputHash, format: 'wav', channels: wav.fmt.channels, sample_rate: wav.fmt.sampleRate,
         bits_per_sample: wav.fmt.bitsPerSample, frames: wav.frames,
         duration_s: Number((wav.frames / wav.fmt.sampleRate).toFixed(3)),
+        selected_channels: selection.channels, start_frame: selection.start, end_frame: selection.end,
+        selected_duration_s: Number((selection.count / wav.fmt.sampleRate).toFixed(3)),
         tags: wav.tags, chunks: wav.chunks.map(chunk => ({ id: chunk.id, size: chunk.size, offset: chunk.dataOffset })),
       };
       if (args.action === 'info') return { status: 'ok', ...base };
       if (args.action === 'lsb') {
         const bitIndex = args.bit_index ?? 0;
+        const bitOrder = args.bit_order ?? 'lsb_first';
+        if (!['lsb_first', 'msb_first'].includes(bitOrder)) throw new ToolError('unsupported', 'bit_order 须为 lsb_first 或 msb_first。');
         const maxBytes = Math.min(Math.max(args.max_bytes ?? 4096, 1), 65536);
         if (bitIndex >= wav.fmt.bitsPerSample) throw new ToolError('unsupported', `bit_index 超出 ${wav.fmt.bitsPerSample} 位采样范围。`);
-        const samples = wav.frames * wav.fmt.channels;
         const bits = [];
-        const limit = Math.min(samples, maxBytes * 8);
-        for (let frame = 0; frame < wav.frames && bits.length < limit; frame += 1) {
-          for (let channel = 0; channel < wav.fmt.channels && bits.length < limit; channel += 1) {
-            const byteOffset = wav.data.dataOffset + (frame * wav.fmt.channels + channel) * (wav.fmt.bitsPerSample / 8);
-            const sample = wav.fmt.bitsPerSample === 8 ? buffer[byteOffset] : buffer.readUInt16LE(byteOffset);
-            bits.push((sample >> bitIndex) & 1);
-          }
+        const totalSamples = selection.count * selection.channels.length;
+        const sampleEnd = Math.min(totalSamples, selection.sampleOffset + maxBytes * 8);
+        for (let logical = selection.sampleOffset; logical < sampleEnd; logical += 1) {
+          const frame = selection.start + Math.floor(logical / selection.channels.length);
+          const channel = selection.channels[logical % selection.channels.length];
+          bits.push((rawSampleAt(buffer, wav, frame, channel) >> bitIndex) & 1);
         }
         const bytes = [];
         for (let index = 0; index + 8 <= bits.length; index += 8) {
           let value = 0;
-          if ((args.bit_order ?? 'lsb_first') === 'lsb_first') {
+          if (bitOrder === 'lsb_first') {
             for (let offset = 0; offset < 8; offset += 1) value |= bits[index + offset] << offset;
           } else {
             for (let offset = 0; offset < 8; offset += 1) value = (value << 1) | bits[index + offset];
@@ -822,9 +1196,12 @@ export function registerExtraTools(ctx, config, access) {
         const data = Buffer.from(bytes);
         const printable = data.toString('utf8').replace(/[^\x20-\x7e\u4e00-\u9fff]/gu, '.');
         return {
-          status: 'ok', input_sha256: inputHash, bit_index: bitIndex, bits_read: bits.length, bytes: data.length,
+          status: 'ok', ...base, input_sha256: inputHash, bit_index: bitIndex, bits_read: bits.length, bytes: data.length,
+          sample_offset: selection.sampleOffset, next_sample_offset: sampleEnd < totalSamples ? sampleEnd - (sampleEnd % 8) : null,
+          padding_bits: bits.length % 8,
+          total_samples: totalSamples, artifact_sha256: createHash('sha256').update(data).digest('hex'),
           hex: data.toString('hex'), text: truncate(printable, 4096),
-          sha256: createHash('sha256').update(data).digest('hex'),
+          sha256: createHash('sha256').update(data).digest('hex'), __artifact_bytes: data,
         };
       }
       if (args.action === 'spectrum') {
@@ -833,132 +1210,153 @@ export function registerExtraTools(ctx, config, access) {
         if (!Number.isInteger(fftSize) || fftSize < 256 || fftSize > 8192 || (fftSize & (fftSize - 1)) !== 0) {
           throw new ToolError('unsupported', 'fft_size 须为 256 至 8192 内的 2 的幂。');
         }
-        if (wav.frames === 0) throw new ToolError('unsupported', 'WAV 没有完整 PCM 帧。');
+        if (selection.count === 0) throw new ToolError('unsupported', '所选 WAV 范围没有完整 PCM 帧。');
         const maxWindows = 192;
-        const hopSize = Math.max(fftSize / 4, Math.ceil(Math.max(0, wav.frames - fftSize) / (maxWindows - 1)));
-        const windowCount = 1 + Math.ceil(Math.max(0, wav.frames - fftSize) / hopSize);
+        const hopSize = Math.max(fftSize / 4, Math.ceil(Math.max(0, selection.count - fftSize) / (maxWindows - 1)));
+        const windowCount = 1 + Math.ceil(Math.max(0, selection.count - fftSize) / hopSize);
         const coefficients = Float64Array.from({ length: fftSize }, (_, index) =>
           0.5 - 0.5 * Math.cos((2 * Math.PI * index) / (fftSize - 1)));
         const windows = [];
         for (let column = 0; column < windowCount; column += 1) {
           execution.signal?.throwIfAborted();
           const mono = new Float64Array(fftSize);
-          const start = column * hopSize;
-          for (let index = 0; index < fftSize && start + index < wav.frames; index += 1) {
+          const localStart = column * hopSize;
+          for (let index = 0; index < fftSize && localStart + index < selection.count; index += 1) {
             let sum = 0;
-            for (let channel = 0; channel < wav.fmt.channels; channel += 1) sum += sampleAt(buffer, wav, start + index, channel);
-            mono[index] = sum / wav.fmt.channels * coefficients[index];
+            for (const channel of selection.channels) sum += sampleAt(buffer, wav, selection.start + localStart + index, channel);
+            mono[index] = sum / selection.channels.length * coefficients[index];
           }
           windows.push(fftMagnitudes(mono));
           if (column % 8 === 7) await new Promise(resolve => setImmediate(resolve));
         }
         const fileOut = await access.output(location, args.path ?? ('spectrum-' + Date.now() + '.png'));
         const rendered = renderSpectrum(fileOut, windows, wav.fmt.sampleRate, fftSize, hopSize);
-        return { status: 'ok', ...rendered, input_sha256: inputHash, sha256: createHash('sha256').update(readFileSync(fileOut)).digest('hex') };
+        return { status: 'ok', ...rendered, input_sha256: inputHash, sha256: createHash('sha256').update(readFileSync(fileOut)).digest('hex'),
+          start_frame: selection.start, end_frame: selection.end, selected_channels: selection.channels,
+          selected_duration_s: Number((selection.count / wav.fmt.sampleRate).toFixed(3)) };
       }
       throw new ToolError('unsupported', `未知操作：${args.action}。`);
     },
     ['file_path', 'action'],
   );
 
-  register('mobile_apk',
-    '检查 APK 结构（manifest、dex、ABI、签名块），或在安装 apktool/jadx 时反编译，在安装 apksigner/jarsigner 时校验签名。',
-    {
-      action: { type: 'string', enum: ['info', 'decompile', 'signature'], description: '操作类型。' },
-      output_dir: { type: 'string', description: 'decompile 输出目录，默认工作区 .apk-<文件名>。' },
-      timeout_ms: { type: 'integer', minimum: 1000, maximum: 300000, description: '反编译上限，默认 120000。' },
-    },
-    async (args, execution) => {
-      const location = await access.location(execution);
-      const cwd = location.cwd;
-      const file = await access.input(location, args.file_path);
-      if (args.wordlist !== undefined) await access.input(location, args.wordlist);
-      const { bytes: buffer } = await access.read(location, args.file_path, MAX_INPUT_BYTES);
-      const entries = parseZipEntries(buffer);
-      const directoryEntries = entries.filter(entry => !entry.directory);
-      const signingBlock = buffer.includes(Buffer.from('APK Sig Block 42', 'ascii'));
-      if (args.action === 'info') {
-        const abis = [...new Set(entries.map(entry => /^lib\/([^/]+)\//u.exec(entry.name)?.[1]).filter(Boolean))];
-        return {
-          status: 'ok', input_sha256: createHash('sha256').update(buffer).digest('hex'),
-          entries: directoryEntries.slice(0, 200).map(entry => ({ name: entry.name, size: entry.size })),
-          entry_count: directoryEntries.length,
-          has_manifest: entries.some(entry => entry.name === 'AndroidManifest.xml'),
-          dex_files: entries.filter(entry => /^classes\d*\.dex$/u.test(entry.name)).map(entry => entry.name),
-          dex_total_size: entries.filter(entry => /^classes\d*\.dex$/u.test(entry.name)).reduce((sum, entry) => sum + entry.size, 0),
-          abis,
-          native_libs: entries.filter(entry => entry.name.startsWith('lib/')).length,
-          assets: entries.filter(entry => entry.name.startsWith('assets/')).length,
-          signature_files: entries.filter(entry => /^META-INF\/.*\.(RSA|DSA|EC)$/iu.test(entry.name)).map(entry => entry.name),
-          signing_block: signingBlock,
-          tools: {
-            apktool: Boolean(findJavaTool(['apktool', 'apktool.bat'])),
-            jadx: Boolean(findJavaTool(['jadx', 'jadx.bat'])),
-            apksigner: Boolean(findJavaTool(['apksigner', 'apksigner.bat'])),
-            jarsigner: Boolean(findJavaTool(['jarsigner'])),
-          },
-          hint: '反编译用 action=decompile；签名校验用 action=signature。未安装工具时按提示安装或改用 shell。',
-        };
-      }
-      if (args.action === 'decompile') {
-        requireWritable(ctx, execution);
-        const jadx = findJavaTool(['jadx', 'jadx.bat']);
-        const apktool = findJavaTool(['apktool', 'apktool.bat']);
-        if (!jadx && !apktool) throw new ToolError('dependency', '没有找到 jadx 或 apktool。', '安装 jadx（https://github.com/skylot/jadx）或 apktool 后重试。');
-        const output = await access.output(location, args.output_dir ?? ('.apk-' + path.basename(file, path.extname(file))), true);
-        const command = jadx
-          ? { bin: jadx.path, args: ['-d', output, '--no-res', file] }
-          : { bin: apktool.path, args: ['d', '-f', '-o', output, file] };
-        const result = await spawnCapture(command.bin, command.args, {
-          cwd, signal: execution.signal, timeoutMs: Math.min(Math.max(args.timeout_ms ?? 120000, 1000), 300000),
-        });
-        return {
-          status: result.timedOut ? 'timeout' : (result.code === 0 ? 'ok' : 'failed'),
-          tool: jadx ? 'jadx' : 'apktool', output_dir: output, exit_code: result.code,
-          stdout: truncate(result.stdout), stderr: truncate(result.stderr),
-        };
-      }
-      if (args.action === 'signature') {
-        const apksigner = findJavaTool(['apksigner', 'apksigner.bat']);
-        const jarsigner = findJavaTool(['jarsigner']);
-        if (!apksigner && !jarsigner) throw new ToolError('dependency', '没有找到 apksigner 或 jarsigner。', '安装 Android SDK build-tools 或 JDK 后重试；也可以直接读 META-INF 签名文件。');
-        const command = apksigner
-          ? { bin: apksigner.path, args: ['verify', '--print-certs', file] }
-          : { bin: jarsigner.path, args: ['-verify', '-verbose', '-certs', file] };
-        const result = await spawnCapture(command.bin, command.args, { cwd, timeoutMs: 60000 });
-        return {
-          status: result.code === 0 ? 'ok' : 'failed',
-          tool: apksigner ? 'apksigner' : 'jarsigner', exit_code: result.code,
-          stdout: truncate(result.stdout), stderr: truncate(result.stderr),
-        };
-      }
-      throw new ToolError('unsupported', `未知操作：${args.action}。`);
-    },
-    ['file_path', 'action'],
-  );
+  if (access.extendedAudit !== false) {
+    register('mobile_apk',
+      '检查 APK 结构（manifest、dex、ABI、签名块），或在安装 apktool/jadx 时反编译，在安装 apksigner/jarsigner 时校验签名。',
+      {
+        action: { type: 'string', enum: ['info', 'decompile', 'signature'], description: '操作类型。' },
+        output_dir: { type: 'string', description: 'decompile 输出目录，默认工作区 .apk-<文件名>。' },
+        timeout_ms: { type: 'integer', minimum: 1000, maximum: 300000, description: '反编译上限，默认 120000。' },
+      },
+      async (args, execution) => {
+        const location = await access.location(execution);
+        const cwd = location.cwd;
+        const file = await access.input(location, args.file_path);
+        const { bytes: buffer } = await access.read(location, args.file_path, MAX_INPUT_BYTES);
+        const entries = parseZipEntries(buffer);
+        const directoryEntries = entries.filter(entry => !entry.directory);
+        const signingBlock = buffer.includes(Buffer.from('APK Sig Block 42', 'ascii'));
+        if (args.action === 'info') {
+          const abis = [...new Set(entries.map(entry => /^lib\/([^/]+)\//u.exec(entry.name)?.[1]).filter(Boolean))];
+          return {
+            status: 'ok', input_sha256: createHash('sha256').update(buffer).digest('hex'),
+            entries: directoryEntries.slice(0, 200).map(entry => ({ name: entry.name, size: entry.size })),
+            entry_count: directoryEntries.length,
+            has_manifest: entries.some(entry => entry.name === 'AndroidManifest.xml'),
+            dex_files: entries.filter(entry => /^classes\d*\.dex$/u.test(entry.name)).map(entry => entry.name),
+            dex_total_size: entries.filter(entry => /^classes\d*\.dex$/u.test(entry.name)).reduce((sum, entry) => sum + entry.size, 0),
+            abis,
+            native_libs: entries.filter(entry => entry.name.startsWith('lib/')).length,
+            assets: entries.filter(entry => entry.name.startsWith('assets/')).length,
+            signature_files: entries.filter(entry => /^META-INF\/.*\.(RSA|DSA|EC)$/iu.test(entry.name)).map(entry => entry.name),
+            signing_block: signingBlock,
+            tools: {
+              apktool: Boolean(findJavaTool(['apktool', 'apktool.bat'])),
+              jadx: Boolean(findJavaTool(['jadx', 'jadx.bat'])),
+              apksigner: Boolean(findJavaTool(['apksigner', 'apksigner.bat'])),
+              jarsigner: Boolean(findJavaTool(['jarsigner'])),
+            },
+            hint: '反编译用 action=decompile；签名校验用 action=signature。未安装工具时按提示安装或改用 shell。',
+          };
+        }
+        if (args.action === 'decompile') {
+          requireWritable(ctx, execution);
+          const jadx = findJavaTool(['jadx', 'jadx.bat']);
+          const apktool = findJavaTool(['apktool', 'apktool.bat']);
+          if (!jadx && !apktool) throw new ToolError('dependency', '没有找到 jadx 或 apktool。', '安装 jadx（https://github.com/skylot/jadx）或 apktool 后重试。');
+          const output = await access.output(location, args.output_dir ?? ('.apk-' + path.basename(file, path.extname(file))), true);
+          const command = jadx
+            ? { bin: jadx.path, args: ['-d', output, '--no-res', file] }
+            : { bin: apktool.path, args: ['d', '-f', '-o', output, file] };
+          const result = await spawnCapture(command.bin, command.args, {
+            cwd, signal: execution.signal, timeoutMs: Math.min(Math.max(args.timeout_ms ?? 120000, 1000), 300000),
+          });
+          return {
+            status: result.timedOut ? 'timeout' : (result.code === 0 ? 'ok' : 'failed'),
+            tool: jadx ? 'jadx' : 'apktool', output_dir: output, exit_code: result.code,
+            stdout: truncate(result.stdout), stderr: truncate(result.stderr),
+          };
+        }
+        if (args.action === 'signature') {
+          const apksigner = findJavaTool(['apksigner', 'apksigner.bat']);
+          const jarsigner = findJavaTool(['jarsigner']);
+          if (!apksigner && !jarsigner) throw new ToolError('dependency', '没有找到 apksigner 或 jarsigner。', '安装 Android SDK build-tools 或 JDK 后重试；也可以直接读 META-INF 签名文件。');
+          const command = apksigner
+            ? { bin: apksigner.path, args: ['verify', '--print-certs', file] }
+            : { bin: jarsigner.path, args: ['-verify', '-verbose', '-certs', file] };
+          const result = await spawnCapture(command.bin, command.args, { cwd, signal: execution.signal, timeoutMs: 60000 });
+          return {
+            status: result.code === 0 ? 'ok' : 'failed',
+            tool: apksigner ? 'apksigner' : 'jarsigner', exit_code: result.code,
+            stdout: truncate(result.stdout), stderr: truncate(result.stderr),
+          };
+        }
+        throw new ToolError('unsupported', `未知操作：${args.action}。`);
+      },
+      ['file_path', 'action'],
+    );
 
-  register('cloud_metadata',
-    '保留旧工具入口，提示使用工作区中的脱敏日志。',
-    { action: { type: 'string', description: '旧入口操作。' } },
-    async () => { throw new ToolError('unsupported', '宿主元数据与凭据探测已关闭。可读取题目目录里的脱敏记录。'); },
-    ['action'],
-  );
+    register('cloud_metadata',
+      '保留旧工具入口，提示使用工作区中的脱敏日志。',
+      { action: { type: 'string', description: '旧入口操作。' } },
+      async () => { throw new ToolError('unsupported', '宿主元数据与凭据探测已关闭。可读取题目目录里的脱敏记录。'); },
+      ['action'],
+    );
+  }
 
   register('crypto_solver',
-    '检查可信工作台 Python 的依赖，生成工作区内的已有计算模板。',
+    '检查 Python 密码库（check）、生成求解脚手架（template）或直接执行内置无依赖求解（solve：JWT/Flask Session/LCG/MT19937）。',
     {
-      action: { type: 'string', enum: ['check', 'template'], description: '操作类型。' },
-      kind: { type: 'string', enum: ['z3_bitvec', 'coppersmith', 'lattice', 'aes_mode'], description: 'template 的模板种类。' },
-
+      action: { type: 'string', enum: ['check', 'template', 'solve'] },
+      kind: { type: 'string', enum: ['z3_bitvec', 'coppersmith', 'lattice', 'aes_mode'] },
+      operation: { type: 'string', enum: CRYPTO_SOLVE_OPERATIONS },
+      token: { type: 'string', maxLength: 32768 },
+      salt: { type: 'string', maxLength: 256 },
+      crack: { type: 'boolean' },
+      passwords: { type: 'array', maxItems: 512, items: { type: 'string', maxLength: 256 } },
+      wordlist: { type: 'string', maxLength: 1024 },
+      outputs: { type: 'array', maxItems: 624, items: { anyOf: [{ type: 'string', maxLength: 512 }, { type: 'integer' }] } },
+      modulus: { anyOf: [{ type: 'string', maxLength: 512 }, { type: 'integer' }] },
+      predict_count: { type: 'integer', minimum: 1, maximum: 64 },
+      timeout_ms: { type: 'integer', minimum: 1000, maximum: 120000 },
     },
     async (args, execution) => {
-      const location = await access.location(execution);
-      const python = await access.python(execution.signal);
+      if (args.action === 'solve') {
+        const readWordlist = async rel => {
+          const location = await access.location(execution);
+          await access.input(location, rel);
+          return (await access.read(location, rel, 16 * 1024 * 1024)).bytes.toString('utf8');
+        };
+        return runCryptoSolve(args, { readWordlist, signal: execution.signal });
+      }
       if (args.action === 'check') {
+        const python = await access.python(execution.signal);
         const probe = async imports => {
           const code = imports.map(name => `import ${name}`).join('; ');
           try {
-            const result = await spawnCapture(python, ['-I', '-B', '-c', `${code}; print("ok")`], { timeoutMs: 8000 });
+            const result = await spawnCapture(python, ['-E', '-P', '-B', '-c', `${code}; print("ok")`], {
+              timeoutMs: 8000, signal: execution.signal,
+            });
             return { ok: /ok/u.test(result.stdout), exit_code: result.code };
           } catch (error) {
             return { ok: false, error: describeToolError(error).kind };
@@ -967,12 +1365,32 @@ export function registerExtraTools(ctx, config, access) {
         const [z3, fpylll, crypto, sympy] = await Promise.all([
           probe(['z3']), probe(['fpylll']), probe(['Crypto']), probe(['sympy']),
         ]);
-        return { status: 'ok', python, modules: { z3, fpylll, pycryptodome: crypto, sympy } };
+        const modules = { z3, fpylll, pycryptodome: crypto, sympy };
+        const missing = Object.entries(modules).filter(([, state]) => !state.ok).map(([name]) => name);
+        let sandboxFallback;
+        if (missing.length > 0) {
+          const sb = await detectSandbox(getConfig(), execution.signal);
+          sandboxFallback = sb.available
+            ? {
+              available: true,
+              backend: sb.backend,
+              target: sb.image ?? sb.distro,
+              missing_on_host: missing,
+              hint: `宿主机 Python 缺少 ${missing.join('、')}；可直接改用 ctf_sandbox(action: "exec", script_path: "...") 在 ${sb.backend} 沙箱中运行求解脚本。`,
+            }
+            : {
+              available: false,
+              missing_on_host: missing,
+              hint: `宿主机 Python 缺少 ${missing.join('、')} 且 Linux 沙箱不可用；可先在宿主机安装依赖或构建 dsh-ctf-sandbox:latest 镜像。`,
+            };
+        }
+        return { status: 'ok', python, modules, ...(sandboxFallback ? { sandbox_fallback: sandboxFallback } : {}) };
       }
       if (args.action === 'template') {
         const kind = args.kind;
         if (typeof kind !== 'string' || !Object.hasOwn(TEMPLATES, kind)) throw new ToolError('unsupported', `未知模板：${kind}。`);
         requireWritable(ctx, execution);
+        const location = await access.location(execution);
         const file = await access.output(location, '.ctf-templates/' + kind + '.py');
         writeFileSync(file, TEMPLATES[kind], { flag: 'wx' });
         return { status: 'ok', file, kind, preview: TEMPLATES[kind].split('\n').slice(0, 6).join('\n') };

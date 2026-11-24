@@ -77,30 +77,25 @@ export async function appendStatus(files, summary) {
 }
 
 function minutesSince(entry) {
-  return Math.max(0, Math.floor((Date.now() - Date.parse(entry.at)) / 60000));
+  return Math.max(0, Math.round((Date.now() - Date.parse(entry.at)) / 60000));
 }
 
 export function summarizeStatus(entries) {
   const warnings = [];
+  const add = (code, severity, message, action, thresholdMinutes) =>
+    warnings.push({ code, severity, message, action, ...(thresholdMinutes === undefined ? {} : { threshold_minutes: thresholdMinutes }) });
   const last = entries.at(-1);
   if (last) {
-    const elapsed = minutesSince(last);
-    const thresholds = [
-      [60, 'timebox_escalate', 'escalate', '整理卡点并求助，带上候选路径与排除证据。'],
-      [30, 'timebox_review', 'warning', '列出三条候选路径及各自的验证代价。'],
-      [15, 'timebox_switch', 'info', '检查有无新假设，并排除一条已经尝试的路径。'],
-    ];
-    const threshold = thresholds.find(([minutes]) => elapsed >= minutes);
-    if (threshold) {
-      const [minutes, code, severity, message] = threshold;
-      warnings.push({ code, severity, elapsed_minutes: elapsed, threshold_minutes: minutes, message });
+    const minutes = minutesSince(last);
+    if (minutes >= 60) add('timebox_60', 'urgent', '距上一条状态已 ' + minutes + ' 分钟：整理卡点并升级求助，给出三条候选路径和排除证据。', '升级求助并比较三条路径。', 60);
+    else if (minutes >= 30) add('timebox_30', 'warning', '距上一条状态已 ' + minutes + ' 分钟：列出三条候选路径，写清各自的验证代价。', '列出三条候选路径并选择验证成本最低的一条。', 30);
+    else if (minutes >= 15) add('timebox_15', 'info', '距上一条状态已 ' + minutes + ' 分钟：没有新假设就换方向，先排除一条已走路径。', '核对新假设或排除一条已走路径。', 15);
+    if (!last.next_step && last.phase !== 'scoreboard') {
+      add('next_step_missing', 'warning', '本条状态没有写 next_step：补一条具体可执行的下一步。', '保存一个可执行的下一步。');
     }
-    if (!last.next_step && last.phase !== 'scoreboard') warnings.push({
-      code: 'next_step_missing', severity: 'info', message: '补一条具体可执行的下一步。',
-    });
   }
-  if (entries.length < 2) warnings.push({
-    code: 'too_few_records', severity: 'info', message: '本题状态记录不足 2 条。',
-  });
+  if (entries.length < 2) {
+    add('status_records_low', 'info', '本题状态记录不足 2 条，收尾前至少再记录一次。', '收尾前补一条状态记录。');
+  }
   return { records: entries.length, elapsed_minutes: entries.length ? minutesSince(entries[0]) : 0, last, warnings };
 }

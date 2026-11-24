@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { open, readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { inspectCapture as inspectCaptureLayout, pcapngPacketBlock } from './capture.js';
 import { interfaceClock, formatTimestamp, pcapngPacketTicks } from './pcapng-statistics.js';
@@ -7,7 +7,10 @@ import { ipv4Fragments } from './pcap-fragments.js';
 import { dnsDetails } from './pcap-dns.js';
 
 const MAX_FILE_SIZE = 64 * 1024 * 1024;
+const MAX_STREAMED_FILE_SIZE = 1024 * 1024 * 1024;
+const STREAM_BUFFER_SIZE = 1024 * 1024;
 const MAX_PACKET_CAPTURE = 16 * 1024 * 1024;
+const MAX_PCAPNG_BLOCK = MAX_PACKET_CAPTURE + 1024 * 1024;
 const DEFAULT_MAX_FLOWS = 8;
 const MAX_FLOWS_LIMIT = 16;
 const DEFAULT_MAX_BYTES_PER_FLOW = 65536;
@@ -48,25 +51,20 @@ for (const byte of [0x09, 0x0a, 0x0d]) PRINTABLE[byte] = 1;
 for (let byte = 0x20; byte <= 0x7e; byte += 1) PRINTABLE[byte] = 1;
 
 export const PCAP_STREAM_PROPERTIES = {
-  file_path: {
-    type: 'string',
-    description: '题目目录内的 PCAP/PCAPNG 附件路径，相对于会话工作目录，不能是绝对路径。',
-  },
-  max_flows: {
-    type: 'integer',
-    minimum: 1,
-    maximum: MAX_FLOWS_LIMIT,
-    description: '按四元组方向保留的 TCP 流数量上限，默认 8；其余方向计入 truncated_flows。',
-  },
-  max_bytes_per_flow: {
-    type: 'integer',
-    minimum: MIN_BYTES_PER_FLOW,
-    maximum: MAX_BYTES_PER_FLOW_LIMIT,
-    description: '每个方向流最多重组的 TCP 载荷字节数，默认 65536。',
-  },
-  include_hex: {
-    type: 'boolean',
-    description: '为每条流附带重组载荷的十六进制，默认 false。',
+  file_path: { type: 'string', description: '相对工作区 PCAP/PCAPNG 路径。' },
+  max_flows: { type: 'integer', minimum: 1, maximum: MAX_FLOWS_LIMIT },
+  max_bytes_per_flow: { type: 'integer', minimum: MIN_BYTES_PER_FLOW, maximum: MAX_BYTES_PER_FLOW_LIMIT },
+  include_hex: { type: 'boolean' },
+  filter: {
+    type: 'object', additionalProperties: false,
+    description: '按协议、IP/端口与 UTC 时间筛选。',
+    properties: {
+      protocol: { type: 'string', enum: ['tcp', 'udp', 'dns'] },
+      src_ip: { type: 'string', maxLength: 15 }, dst_ip: { type: 'string', maxLength: 15 },
+      src_port: { type: 'integer', minimum: 1, maximum: 65535 }, dst_port: { type: 'integer', minimum: 1, maximum: 65535 },
+      start_utc: { type: 'string', maxLength: 40 },
+      end_utc: { type: 'string', maxLength: 40 },
+    },
   },
 };
 
@@ -116,7 +114,52 @@ function parseArguments(input) {
   }
   const includeHex = input.include_hex === undefined ? false : input.include_hex;
   if (typeof includeHex !== 'boolean') throw new Error('include_hex 必须是布尔值。');
-  return { filePath: input.file_path, maxFlows, maxBytes, includeHex };
+  const filter = input.filter;
+  if (filter !== undefined && (filter === null || typeof filter !== 'object' || Array.isArray(filter)
+    || Object.keys(filter).some(key => !['protocol', 'src_ip', 'dst_ip', 'src_port', 'dst_port', 'start_utc', 'end_utc'].includes(key)))) {
+    throw new Error('filter 必须是包含已声明字段的对象。');
+  }
+  const normalizeIp = (value, field) => {
+    if (value === undefined) return undefined;
+    const pieces = typeof value === 'string' ? value.split('.') : [];
+    if (pieces.length !== 4 || pieces.some(piece => !/^\d{1,3}$/u.test(piece) || Number(piece) > 255)) {
+      throw new Error(`filter.${field} 必须是 IPv4 地址。`);
+    }
+    return pieces.map(Number).join('.');
+  };
+  const parseTime = (value, field) => {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string' || value.length > 40
+      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/u.test(value)) {
+      throw new Error(`filter.${field} 须为 UTC ISO 8601 时间并以 Z 结尾。`);
+    }
+    const time = Date.parse(value);
+    const whole = value.slice(0, 19);
+    if (!Number.isFinite(time) || new Date(value).toISOString().slice(0, 19) !== whole) throw new Error(`filter.${field} 时间无效。`);
+    return time;
+  };
+  let normalizedFilter;
+  if (filter !== undefined) {
+    if (filter.protocol !== undefined && !['tcp', 'udp', 'dns'].includes(filter.protocol)) throw new Error('filter.protocol 须为 tcp、udp 或 dns。');
+    for (const field of ['src_port', 'dst_port']) {
+      if (filter[field] !== undefined && (!Number.isInteger(filter[field]) || filter[field] < 1 || filter[field] > 65535)) {
+        throw new Error(`filter.${field} 须在 1 至 65535 之间。`);
+      }
+    }
+    const startTime = parseTime(filter.start_utc, 'start_utc');
+    const endTime = parseTime(filter.end_utc, 'end_utc');
+    if (startTime !== undefined && endTime !== undefined && startTime > endTime) throw new Error('filter.start_utc 不能晚于 end_utc。');
+    normalizedFilter = {
+      ...(filter.protocol === undefined ? {} : { protocol: filter.protocol }),
+      ...(normalizeIp(filter.src_ip, 'src_ip') === undefined ? {} : { src_ip: normalizeIp(filter.src_ip, 'src_ip') }),
+      ...(normalizeIp(filter.dst_ip, 'dst_ip') === undefined ? {} : { dst_ip: normalizeIp(filter.dst_ip, 'dst_ip') }),
+      ...(filter.src_port === undefined ? {} : { src_port: filter.src_port }),
+      ...(filter.dst_port === undefined ? {} : { dst_port: filter.dst_port }),
+      ...(startTime === undefined ? {} : { start_utc: new Date(startTime).toISOString() }),
+      ...(endTime === undefined ? {} : { end_utc: new Date(endTime).toISOString() }),
+    };
+  }
+  return { filePath: input.file_path, maxFlows, maxBytes, includeHex, filter: normalizedFilter };
 }
 
 function normalizeFilePath(value) {
@@ -241,15 +284,17 @@ function parseUdp(bytes) {
   if (bytes.length < 8) return { skip: 'invalid_udp' };
   const length = bytes.readUInt16BE(4);
   if (length < 8 || length > bytes.length) return { skip: 'invalid_udp' };
-  const port53 = bytes.readUInt16BE(0) === 53 || bytes.readUInt16BE(2) === 53;
-  if (!port53) return { udp: true };
-  if (length < 20) return { udp: true, shortDnsHeader: true };
+  const srcPort = bytes.readUInt16BE(0);
+  const dstPort = bytes.readUInt16BE(2);
+  const port53 = srcPort === 53 || dstPort === 53;
+  if (!port53) return { udp: true, srcPort, dstPort, port53: false };
+  if (length < 20) return { udp: true, srcPort, dstPort, port53: true, shortDnsHeader: true };
   const flags = bytes.readUInt16BE(10);
-  return { udp: true, dns: { response: (flags & 0x8000) !== 0, truncated: (flags & 0x0200) !== 0, rcode: flags & 15,
+  return { udp: true, srcPort, dstPort, port53: true, dns: { response: (flags & 0x8000) !== 0, truncated: (flags & 0x0200) !== 0, rcode: flags & 15,
     message: bytes.subarray(8, length) } };
 }
 
-function createCollector(maxFlows, maxBytes, includeHex) {
+function createCollector(maxFlows, maxBytes, includeHex, filter) {
   const skipped = { non_ipv4: 0, non_tcp: 0, fragmented: 0, truncated_capture: 0, invalid_udp: 0,
     invalid_packet: 0, unsupported_link: 0 };
   const fragments = ipv4Fragments();
@@ -262,6 +307,29 @@ function createCollector(maxFlows, maxBytes, includeHex) {
   let truncatedFlows = 0;
   let tcpPackets = 0;
   let udpPackets = 0;
+  let filteredPackets = 0;
+
+  function timeMatches(packet) {
+    if (filter?.start_utc === undefined && filter?.end_utc === undefined) return true;
+    const timestamp = Date.parse(packet.timestamp_utc ?? '');
+    if (!Number.isFinite(timestamp)) return false;
+    return (filter.start_utc === undefined || timestamp >= Date.parse(filter.start_utc))
+      && (filter.end_utc === undefined || timestamp <= Date.parse(filter.end_utc));
+  }
+
+  function addressMatches(ip, packet) {
+    if (!timeMatches(packet) || (filter?.src_ip !== undefined && ip.src !== filter.src_ip)
+      || (filter?.dst_ip !== undefined && ip.dst !== filter.dst_ip)) return false;
+    if (filter?.protocol === 'tcp' && ip.protocol !== 6) return false;
+    if ((filter?.protocol === 'udp' || filter?.protocol === 'dns') && ip.protocol !== 17) return false;
+    return true;
+  }
+
+  function portsMatch(parsed) {
+    return (filter?.src_port === undefined || parsed.srcPort === filter.src_port)
+      && (filter?.dst_port === undefined || parsed.dstPort === filter.dst_port)
+      && (filter?.protocol !== 'dns' || (parsed.udp && parsed.port53));
+  }
 
   function peekFlowKey(info) {
     return `${info.src}:${info.srcPort}->${info.dst}:${info.dstPort}`;
@@ -361,12 +429,14 @@ function createCollector(maxFlows, maxBytes, includeHex) {
       let iface = interfaceKey;
       const ip = parseFrame(frame, linkType, packetIndex);
       if (ip.skip !== undefined) { skip(ip.skip); return; }
+      if (!addressMatches(ip, packet)) { filteredPackets += 1; return; }
       if (ip.interfaceIndex !== undefined) iface += '/' + ip.interfaceIndex;
       const key = JSON.stringify([iface, ip.src, ip.dst, ip.protocol, ip.identifier]);
       const bytes = ip.offset > 0 || ip.more ? fragments.add(key, ip, packetIndex) : ip.bytes;
       if (bytes === null) return;
       const parsed = parseTransport(ip, bytes, packetIndex);
       if (parsed.skip !== undefined) { skip(parsed.skip); return; }
+      if (!portsMatch(parsed)) { filteredPackets += 1; return; }
       if (parsed.tcp) { addTcp(parsed, iface, packet); return; }
       addUdp(parsed, packet, ip);
     } catch (error) {
@@ -483,7 +553,7 @@ function createCollector(maxFlows, maxBytes, includeHex) {
     }
     const ipFragments = fragments.stats();
     skipped.fragmented = ipFragments.unresolved;
-    return { flows, skipped, tcpPackets, udpPackets, dns, truncatedFlows, ipFragments };
+    return { flows, skipped, tcpPackets, udpPackets, dns, truncatedFlows, filteredPackets, ipFragments };
   }
 
   return { addTcp, skip, consume, finalize };
@@ -689,6 +759,171 @@ function parsePcapng(bytes, collector) {
   return { format: 'PCAPNG', linkType: firstLinkType ?? 0, packets, linkTypes, packetBlockCounts, invalidClocks };
 }
 
+async function streamLargeCapture(filePath, size, collector, signal) {
+  const handle = await open(filePath, 'r');
+  const hash = createHash('sha256');
+  let readPosition = 0;
+  let consumed = 0;
+  let pending = Buffer.alloc(0);
+  let reachedEof = false;
+  let partial = false;
+  let issue;
+  async function exact(length) {
+    while (pending.length < length && readPosition < size) {
+      throwIfAborted(signal);
+      const amount = Math.min(STREAM_BUFFER_SIZE, size - readPosition);
+      const chunk = Buffer.allocUnsafe(amount);
+      const { bytesRead } = await handle.read(chunk, 0, amount, readPosition);
+      if (bytesRead === 0) { reachedEof = true; break; }
+      const useful = chunk.subarray(0, bytesRead);
+      hash.update(useful);
+      pending = pending.length ? Buffer.concat([pending, useful], pending.length + useful.length) : useful;
+      readPosition += bytesRead;
+    }
+    const count = Math.min(length, pending.length);
+    const result = pending.subarray(0, count);
+    pending = pending.subarray(count);
+    consumed += count;
+    return result;
+  }
+  async function drain() {
+    while (readPosition < size && !reachedEof) await exact(Math.min(STREAM_BUFFER_SIZE, size - consumed));
+    if (pending.length) await exact(pending.length);
+  }
+  try {
+    if (size < 4) throw new Error('不支持的抓包格式：只支持经典 PCAP 和 PCAPNG。');
+    const prefix = await exact(4);
+    if (prefix.length !== 4) throw new Error('抓包文件头被截断。');
+    const firstMagic = prefix.readUInt32BE(0);
+    let parseInfo;
+    if (firstMagic !== SECTION_HEADER) {
+      const rest = await exact(20);
+      if (rest.length !== 20) throw new Error('PCAP 文件头被截断。');
+      const header = Buffer.concat([prefix, rest], 24);
+      const info = PCAP_MAGICS.get(header.readUInt32BE(0));
+      if (info === undefined) throw new Error('不支持的抓包格式：只支持经典 PCAP 和 PCAPNG。');
+      const read = createReader(header, info.littleEndian);
+      const major = read.u16(4);
+      if (major !== 2) throw new Error(`不支持的 PCAP 版本 ${major}.${read.u16(6)}。`);
+      const linkType = read.u32(20) & 0xffff;
+      if (!SUPPORTED_LINK_TYPES.has(linkType)) throw new Error('不支持的链路类型：' + linkType + '。');
+      const snapshot = read.u32(16);
+      const exponent = info.timestampUnit === 'nanoseconds' ? 9 : 6;
+      const units = 10 ** exponent;
+      const clock = { exponent, ticksPerSecond: BigInt(units), offsetSeconds: 0n, decimalMultiplier: 1n };
+      let packets = 0;
+      while (consumed < size) {
+        const recordOffset = consumed;
+        const record = await exact(16);
+        if (record.length === 0) break;
+        if (record.length < 16) { partial = true; issue = 'truncated_record_header'; break; }
+        const recordRead = createReader(record, info.littleEndian);
+        const captured = recordRead.u32(8);
+        if (captured > MAX_PACKET_CAPTURE) throw new Error(`PCAP 包数据长度 ${captured} 超过 16 MiB 上限。`);
+        const packetBytes = await exact(captured);
+        packets += 1;
+        if (packetBytes.length < captured) {
+          collector.consume(packetBytes, linkType, { index: packets, offset: recordOffset }, true);
+          partial = true; issue = 'truncated_packet'; break;
+        }
+        const original = recordRead.u32(12);
+        if ((snapshot !== 0 && captured > snapshot) || captured > original) collector.skip('invalid_packet');
+        else {
+          const fraction = recordRead.u32(4);
+          const seconds = recordRead.u32(0);
+          const ticks = fraction < units ? BigInt(seconds) * clock.ticksPerSecond + BigInt(fraction) : undefined;
+          collector.consume(packetBytes, linkType, { index: packets, offset: recordOffset, ticks, clock }, captured < original);
+        }
+      }
+      parseInfo = { format: 'PCAP', linkType, packets, linkTypes: [linkType] };
+    } else {
+      let sectionReady = false;
+      let littleEndian;
+      let interfaces = [];
+      let sectionNumber = 0;
+      let firstLinkType;
+      let packets = 0;
+      let invalidClocks = 0;
+      const linkTypes = [];
+      const packetBlockCounts = { enhanced_packet: 0, packet: 0, simple_packet: 0 };
+      let blockPrefix = prefix;
+      while (consumed < size) {
+        throwIfAborted(signal);
+        const recordOffset = blockPrefix.length === 4 ? 0 : consumed;
+        const first = blockPrefix.length === 4 ? Buffer.concat([blockPrefix, await exact(4)], 8) : await exact(8);
+        if (first.length === 0) break;
+        if (first.length < 8) { partial = true; issue = 'truncated_block_header'; break; }
+        const rawType = first.readUInt32BE(0);
+        let leading = first;
+        let blockSize;
+        if (rawType === SECTION_HEADER) {
+          const bom = await exact(4);
+          if (bom.length < 4) { partial = true; issue = 'truncated_section_header'; break; }
+          const byteOrder = bom.readUInt32BE(0);
+          if (byteOrder === 0x1a2b3c4d) littleEndian = false;
+          else if (byteOrder === 0x4d3c2b1a) littleEndian = true;
+          else throw new Error(`PCAPNG 节头块在偏移 ${recordOffset} 处的字节序标记无效。`);
+          const firstRead = createReader(first, littleEndian);
+          blockSize = firstRead.u32(4);
+          leading = Buffer.concat([first, bom], 12);
+        } else {
+          if (!sectionReady || littleEndian === undefined) throw new Error('PCAPNG 文件必须以节头块开始。');
+          blockSize = createReader(first, littleEndian).u32(4);
+        }
+        if (blockSize < 12 || blockSize % 4 !== 0 || blockSize > MAX_PCAPNG_BLOCK) {
+          throw new Error(`PCAPNG 块在偏移 ${recordOffset} 处的长度无效或超过解析上限。`);
+        }
+        if (blockSize > size - recordOffset) { partial = true; issue = 'truncated_block'; break; }
+        const tail = await exact(blockSize - leading.length);
+        if (tail.length < blockSize - leading.length) { partial = true; issue = 'truncated_block'; break; }
+        const block = Buffer.concat([leading, tail], blockSize);
+        const read = createReader(block, littleEndian);
+        if (read.u32(blockSize - 4) !== blockSize) throw new Error(`PCAPNG 块在偏移 ${recordOffset} 处的块头与块尾长度不一致。`);
+        if (rawType === SECTION_HEADER) {
+          if (read.u16(12) !== 1) throw new Error('不支持的 PCAPNG 主版本。');
+          sectionReady = true;
+          interfaces = [];
+          sectionNumber++;
+        } else {
+          const type = read.u32(0);
+          if (type === INTERFACE_DESCRIPTION) {
+            if (blockSize < 20) throw new Error(`PCAPNG 接口描述块在偏移 ${recordOffset} 处的长度无效。`);
+            const linkType = read.u16(8);
+            let clock;
+            try { clock = interfaceClock(block, read, 0); } catch { invalidClocks++; }
+            interfaces.push({ link_type: linkType, snapshot_length: read.u32(12), clock });
+            linkTypes.push(linkType);
+            firstLinkType ??= linkType;
+          } else {
+            let packet;
+            try { packet = pcapngPacketBlock(type, 0, blockSize, read, interfaces); }
+            catch {
+              packets++;
+              collector.skip('invalid_packet');
+            }
+            if (packet !== undefined) {
+              const { captured, dataOffset, info, name, original, interfaceId, simple } = packet;
+              if (captured > MAX_PACKET_CAPTURE) throw new Error(`PCAPNG 包数据长度 ${captured} 超过 16 MiB 上限。`);
+              packetBlockCounts[name]++;
+              packets++;
+              const ticks = simple || !info.clock ? undefined : pcapngPacketTicks(read, 0);
+              collector.consume(block.subarray(dataOffset, dataOffset + captured), info.link_type,
+                { index: packets, offset: recordOffset, iface: sectionNumber + '/' + interfaceId, ticks, clock: info.clock }, captured < original);
+            }
+          }
+        }
+        blockPrefix = Buffer.alloc(0);
+      }
+      if (!sectionReady) throw new Error('PCAPNG 文件缺少完整节头块。');
+      parseInfo = { format: 'PCAPNG', linkType: firstLinkType ?? 0, packets, linkTypes, packetBlockCounts, invalidClocks };
+    }
+    await drain();
+    return { parseInfo, sha256: hash.digest('hex'), partial, issue };
+  } finally {
+    await handle.close();
+  }
+}
+
 function enforceOutputLimit(report) {
   if (Buffer.byteLength(JSON.stringify(report)) <= MAX_OUTPUT_BYTES) return report;
   report.output_truncated = true;
@@ -796,7 +1031,7 @@ function trimFlowPayloads(report, limit) {
  * @returns {Promise<object>} 可直接并入工具报告的对象
  */
 export async function pcapStream(input, options = {}) {
-  const { filePath, maxFlows, maxBytes, includeHex } = parseArguments(input);
+  const { filePath, maxFlows, maxBytes, includeHex, filter } = parseArguments(input);
   const { signal, cwd } = parseOptions(options);
   throwIfAborted(signal);
   const { display, parts } = normalizeFilePath(filePath);
@@ -810,8 +1045,8 @@ export async function pcapStream(input, options = {}) {
     throw new Error(`无法读取文件 ${display}。`);
   }
   if (!info.isFile()) throw new Error(`${display} 不是普通文件。`);
-  if (info.size > MAX_FILE_SIZE) {
-    throw new Error(`${display} 超过 64 MiB，PCAP 流提取最多处理 64 MiB。`);
+  if (info.size > MAX_STREAMED_FILE_SIZE) {
+    throw new Error(`${display} 超过 1 GiB，PCAP 流式分析上限为 1 GiB。`);
   }
   throwIfAborted(signal);
   let realCwd;
@@ -825,32 +1060,44 @@ export async function pcapStream(input, options = {}) {
   }
   if (!insideDirectory(realCwd, realFile)) throw new Error('file_path 解析后越出会话工作目录。');
 
-  let bytes;
-  try {
-    bytes = await readFile(absolute, { signal });
-  } catch (error) {
-    if (error?.name === 'AbortError') throw error;
-    throw new Error(`无法读取文件 ${display}。`);
-  }
-  if (bytes.length > MAX_FILE_SIZE) {
-    throw new Error(`${display} 超过 64 MiB，PCAP 流提取最多处理 64 MiB。`);
-  }
-  throwIfAborted(signal);
-  if (bytes.length < 4) throw new Error('不支持的抓包格式：只支持经典 PCAP 和 PCAPNG。');
-
-  const collector = createCollector(maxFlows, maxBytes, includeHex);
-  const captureLayout = inspectCaptureLayout(bytes, { offset: 0, limit: 0 });
+  const collector = createCollector(maxFlows, maxBytes, includeHex, filter);
   let parseInfo;
-  const magic = bytes.readUInt32BE(0);
-  if (magic === SECTION_HEADER) parseInfo = parsePcapng(bytes, collector);
-  else parseInfo = parseClassicPcap(bytes, collector);
+  let captureLayout;
+  let sha256;
+  if (info.size > MAX_FILE_SIZE) {
+    const streamed = await streamLargeCapture(absolute, info.size, collector, signal);
+    parseInfo = streamed.parseInfo;
+    sha256 = streamed.sha256;
+    captureLayout = { status: streamed.partial ? 'partial' : 'ok', complete: !streamed.partial,
+      packet_count: parseInfo.packets, packet_records: parseInfo.packets, malformed_packets: 0,
+      issues: streamed.issue === undefined ? [] : [{ code: streamed.issue }] };
+    const after = await stat(absolute);
+    if (after.size !== info.size || after.mtimeMs !== info.mtimeMs) throw new Error('抓包文件在流式读取期间发生变化，请重新运行分析。');
+  } else {
+    let bytes;
+    try {
+      bytes = await readFile(absolute, { signal });
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      throw new Error(`无法读取文件 ${display}。`);
+    }
+    if (bytes.length > MAX_FILE_SIZE) throw new Error(`${display} 在读取期间增大并超过 64 MiB 内存读取上限。`);
+    throwIfAborted(signal);
+    if (bytes.length < 4) throw new Error('不支持的抓包格式：只支持经典 PCAP 和 PCAPNG。');
+    captureLayout = inspectCaptureLayout(bytes, { offset: 0, limit: 0 });
+    const magic = bytes.readUInt32BE(0);
+    if (magic === SECTION_HEADER) parseInfo = parsePcapng(bytes, collector);
+    else parseInfo = parseClassicPcap(bytes, collector);
+    sha256 = createHash('sha256').update(bytes).digest('hex');
+  }
   throwIfAborted(signal);
 
-  const { flows, skipped, tcpPackets, udpPackets, dns, truncatedFlows, ipFragments } = collector.finalize();
+  const { flows, skipped, tcpPackets, udpPackets, dns, truncatedFlows, filteredPackets, ipFragments } = collector.finalize();
   const notes = [
     '重组 IPv4/TCP 载荷，并统计 IPv4/UDP 和端口 53 的 DNS 报文。DNS 样本包含查询名、应答 TXT 和可用的捕获时间。',
     `方向流按四元组首次出现顺序保留前 ${maxFlows} 条，单方向最多重组 ${maxBytes} 字节载荷。`,
   ];
+  if (filter !== undefined) notes.push('已在 TCP 重组之前按指定 IPv4、协议、端口和 UTC 时间筛选可解析包。');
   if (truncatedFlows > 0) notes.push(`另有 ${truncatedFlows} 条方向流因 max_flows 上限未保留。`);
   if (flows.some(flow => flow.payload_truncated)) {
     notes.push('部分方向流载荷超过 max_bytes_per_flow，已标记 payload_truncated。');
@@ -859,7 +1106,7 @@ export async function pcapStream(input, options = {}) {
     notes.push('部分方向流有序列缺口或等待队列溢出。HTTP 字段仅依据已连续重组的片段。');
   }
   if (Object.values(skipped).some(count => count > 0)) {
-    notes.push(`跳过非 IPv4 ${skipped.non_ipv4} 个、其他 IPv4 协议 ${skipped.non_tcp} 个、IP 分片 ${skipped.fragmented} 个、截断捕获 ${skipped.truncated_capture} 个、无效 UDP ${skipped.invalid_udp} 个。`);
+    notes.push(`跳过非 IPv4 ${skipped.non_ipv4} 个、其他 IPv4 协议 ${skipped.non_tcp} 个、IP 分片 ${skipped.fragmented} 个、截断捕获 ${skipped.truncated_capture} 个、无效 UDP ${skipped.invalid_udp} 个、无效包 ${skipped.invalid_packet} 个、不支持的链路 ${skipped.unsupported_link} 个。`);
   }
   if (captureLayout?.issues?.length) {
     notes.push(`捕获文件有 ${captureLayout.issues.length} 条结构告警：${captureLayout.issues.map(issue => issue.code).join('、')}。`);
@@ -873,19 +1120,20 @@ export async function pcapStream(input, options = {}) {
     }
   }
   if (tcpPackets === 0) notes.push('未发现可重组的 IPv4 TCP 包。');
-  const warnings = notes.slice(2);
+  const warnings = notes.slice(2 + (filter === undefined ? 0 : 1));
 
   const report = {
     file: display,
-    size: bytes.length,
-    sha256: createHash('sha256').update(bytes).digest('hex'),
+    size: info.size,
+    sha256,
     format: parseInfo.format,
-    capture_scope: { kind: 'whole_file', packet_records: parseInfo.packets, filtered: false },
+    capture_scope: { kind: 'whole_file', packet_records: parseInfo.packets, filtered: filter !== undefined,
+      filtered_ipv4_packets: filteredPackets, ...(filter === undefined ? {} : { filter }) },
     status: captureLayout?.status ?? 'ok',
     complete: captureLayout?.complete ?? true,
     packet_count: captureLayout?.packet_count ?? parseInfo.packets,
     packet_records: captureLayout?.packet_records ?? parseInfo.packets,
-    malformed_packets: captureLayout?.malformed_packets ?? 0,
+    malformed_packets: captureLayout?.malformed_packets ?? skipped.invalid_packet,
     issues: captureLayout?.issues ?? [],
     analysis_status: warnings.length ? 'partial' : 'complete',
     warnings,

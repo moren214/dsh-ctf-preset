@@ -1,5 +1,9 @@
-import { crc32, inflateRawSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { crc32, createInflateRaw, inflateRawSync } from 'node:zlib';
 import { checkRange, label, MAX_ARCHIVE_MEMBER_BYTES, MAX_ATTACHMENT_BYTES, MAX_MEMBER_NAME, page } from './attachment-layout.js';
+import { windowLength } from './byte-window.js';
 
 const ZIP_LOCAL = 0x04034b50;
 const ZIP_END = 0x06054b50;
@@ -21,6 +25,8 @@ const MAX_TRAILING_BYTES = 1024 * 1024;
 const ZIP_TAIL_BYTES = ZIP_END_BYTES + U16_MAX + ZIP64_LOCATOR_BYTES + MAX_TRAILING_BYTES;
 const ZIP_END_SIGNATURE = Buffer.from([0x50, 0x4b, 0x05, 0x06]);
 const MAX_FOOTER_CANDIDATES = 64;
+const MAX_PAGED_MEMBER_BYTES = 32 * 1024 * 1024;
+const ZIP_DATA_CHUNK_BYTES = 64 * 1024;
 
 export function isZip(bytes) {
   return bytes.length >= 4 && [ZIP_LOCAL, ZIP_END, ZIP_SPANNED, ZIP64_END].includes(bytes.readUInt32LE(0));
@@ -147,13 +153,15 @@ function indexDirectory(bytes, directory) {
   let { zip64 } = directory;
   const offsets = new Uint32Array(directory.total + 1);
   let firstLocalOffset;
+  let firstLocalEntry;
   let cursor = 0;
   for (let index = 0; index < directory.total; index++) {
     offsets[index] = cursor;
     const member = readMember(bytes, cursor);
     if (member.disk !== 0) return null;
-    if (typeof member.localOffset === 'number') {
-      firstLocalOffset = Math.min(firstLocalOffset ?? member.localOffset, member.localOffset);
+    if (typeof member.localOffset === 'number' && (firstLocalOffset === undefined || member.localOffset < firstLocalOffset)) {
+      firstLocalOffset = member.localOffset;
+      firstLocalEntry = cursor;
     }
     zip64 ||= member.zip64;
     cursor = member.next;
@@ -165,7 +173,7 @@ function indexDirectory(bytes, directory) {
       throw new Error('附件结构无效：ZIP 中央目录大小与条目不一致。');
     }
   }
-  return { ...directory, zip64, offsets, firstLocalOffset };
+  return { ...directory, zip64, offsets, firstLocalOffset, firstLocalEntry };
 }
 
 function memberPage(index, { offset, limit }) {
@@ -333,7 +341,55 @@ export async function inspectZipRanges(reader, paging, cachedIndex, probeEmbedde
   return { report: zipReport(window, index, paging, count), zipIndex: index };
 }
 
-async function loadZipData(read, limit, member, flags, method, nameBytes, checksum) {
+export async function inspectZipFooter({ size, read }, footerOffset, paging) {
+  if (!Number.isSafeInteger(footerOffset) || footerOffset < 0 || footerOffset > size - ZIP_END_BYTES) {
+    return { status: 'rejected', reason: '结束记录不足 22 字节。' };
+  }
+  const lead = Math.min(footerOffset, ZIP64_LOCATOR_BYTES);
+  const start = footerOffset - lead;
+  const head = await read(start, lead + ZIP_END_BYTES);
+  if (head.readUInt32LE(lead) !== ZIP_END) return { status: 'rejected', reason: '原件在该位置没有 ZIP 结束签名。' };
+  const end = lead + ZIP_END_BYTES + head.readUInt16LE(lead + 20);
+  if (end > size - start) return { status: 'rejected', reason: '结束记录里的注释超出了原件。' };
+  if (lead === ZIP64_LOCATOR_BYTES && head.readUInt32LE(0) === ZIP64_LOCATOR) {
+    return { status: 'insufficient', reason: '这是 ZIP64 结束记录，请给出 ZIP 原件区间继续核对。' };
+  }
+  if (head.readUInt16LE(lead + 10) === 0) {
+    return { status: 'insufficient', reason: '该结束记录没有成员条目可交叉核对。' };
+  }
+
+  try {
+    const directory = locateDirectory(head, start, { end: lead, archiveEnd: end }, true);
+    if (directory === null) return { status: 'insufficient', reason: '该候选声明跨卷目录。' };
+    directory.trailingSize = 0;
+    if (directory.size > MAX_ATTACHMENT_BYTES) {
+      return { status: 'insufficient', reason: '候选中央目录超过 32 MiB。' };
+    }
+    const entries = await read(directory.start, directory.size);
+    const index = indexDirectory(entries, directory);
+    if (!index) return { status: 'insufficient', reason: '候选目录包含其他卷的成员。' };
+    const first = index.firstLocalOffset + index.adjustment;
+    if (!Number.isSafeInteger(first)) throw new Error('附件结构无效：ZIP 成员偏移超出安全整数范围。');
+    const row = index.firstLocalEntry;
+    const firstMember = readMember(entries, row);
+    if (!Number.isSafeInteger(firstMember.packed)) return { status: 'insufficient', reason: '首个成员大小超过可复核范围。' };
+    firstMember.localOffset = first;
+    await validateLocalZipHeader(read, index.start, firstMember, entries.readUInt16LE(row + 8),
+      entries.readUInt16LE(row + 10), entries.subarray(firstMember.nameStart, firstMember.nameEnd), entries.readUInt32LE(row + 16));
+    const { start: pageStart, end: pageEnd, count } = memberPage(index, paging);
+    return {
+      ...zipReport(entries.subarray(pageStart, pageEnd), index, paging, count),
+      status: 'confirmed',
+      archive_range: { byte_offset: index.adjustment, byte_length: start + end - index.adjustment },
+      first_member_offset: first,
+    };
+  } catch (error) {
+    if (!structuralError(error)) throw error;
+    return { status: 'rejected', reason: error.message };
+  }
+}
+
+async function validateLocalZipHeader(read, limit, member, flags, method, nameBytes, checksum) {
   const { localOffset, original, packed } = member;
   checkRange(limit, localOffset, LOCAL_HEADER_BYTES, 'ZIP 本地成员头');
   const header = await read(localOffset, LOCAL_HEADER_BYTES);
@@ -356,21 +412,67 @@ async function loadZipData(read, limit, member, flags, method, nameBytes, checks
       throw new Error('附件结构无效：ZIP 本地成员大小或 CRC 与中央目录不一致。');
     }
   }
+  return { dataOffset, encryptionFlag: Boolean((flags | localFlags) & 1) };
+}
+
+async function loadZipData(read, dataOffset, member, method) {
+  const { original, packed } = member;
   const compressed = await read(dataOffset, packed);
   if (method === 0) {
     if (packed !== original) throw new Error('附件结构无效：ZIP Store 成员大小不一致。');
-    return { bytes: compressed, encryptionFlag: Boolean((flags | localFlags) & 1) };
+    return compressed;
   }
   try {
     const { buffer, engine } = inflateRawSync(compressed, { maxOutputLength: Math.max(1, original), info: true });
-    if (engine.bytesWritten === packed) return { bytes: buffer, encryptionFlag: Boolean((flags | localFlags) & 1) };
+    if (engine.bytesWritten === packed) return buffer;
   } catch {
     // The advertised uncompressed size is also a hard decompression limit.
   }
   throw new Error('附件结构无效：ZIP Deflate 成员无法按声明的长度解压。');
 }
 
-export async function readZipMember(reader, memberIndex, cachedIndex, probeEmbedded = false) {
+async function loadZipPage(read, dataOffset, { original, packed }, method, checksum, offset, length, signal) {
+  const chunk = Buffer.alloc(length);
+  const hash = createHash('sha256');
+  let size = 0;
+  let crc = 0;
+
+  async function* packedChunks() {
+    for (let start = 0; start < packed; start += ZIP_DATA_CHUNK_BYTES) {
+      signal?.throwIfAborted();
+      yield await read(dataOffset + start, Math.min(ZIP_DATA_CHUNK_BYTES, packed - start));
+    }
+  }
+
+  async function verifyChunks(source) {
+    for await (const bytes of source) {
+      signal?.throwIfAborted();
+      const end = size + bytes.length;
+      if (end > original) throw new Error('附件结构无效：ZIP 成员解压长度超出声明大小。');
+      const from = Math.max(size, offset);
+      const to = Math.min(end, offset + length);
+      if (from < to) bytes.copy(chunk, from - offset, from - size, to - size);
+      hash.update(bytes);
+      crc = crc32(bytes, crc);
+      size = end;
+    }
+  }
+
+  if (method === 0) {
+    if (packed !== original) throw new Error('附件结构无效：ZIP Store 成员大小不一致。');
+    await verifyChunks(packedChunks());
+  } else {
+    const inflate = createInflateRaw({ chunkSize: ZIP_DATA_CHUNK_BYTES });
+    await pipeline(Readable.from(packedChunks(), { objectMode: false }), inflate, verifyChunks, { signal });
+    if (inflate.bytesWritten !== packed) throw new Error('附件结构无效：ZIP Deflate 未消耗声明的压缩数据。');
+  }
+  if (size !== original || crc !== checksum) {
+    throw new Error('附件结构无效：ZIP 成员解压长度或 CRC-32 校验值不匹配。');
+  }
+  return { chunk, size, sha256: hash.digest('hex'), pageOnly: true };
+}
+
+export async function readZipMember(reader, memberIndex, cachedIndex, probeEmbedded = false, { window, signal } = {}) {
   const loaded = await loadZipIndex(reader, cachedIndex, probeEmbedded);
   if (loaded === undefined) return undefined;
   if (loaded === null) throw new Error('当前支持单卷 ZIP 和 ZIP64 成员。');
@@ -393,23 +495,33 @@ export async function readZipMember(reader, memberIndex, cachedIndex, probeEmbed
   if (!Number.isSafeInteger(member.localOffset)) throw new Error('ZIP 成员头偏移超出可读取范围。');
   member.localOffset += index.adjustment;
   if (!Number.isSafeInteger(member.localOffset)) throw new Error('ZIP 成员头偏移超出可读取范围。');
-  if (typeof member.original !== 'number' || member.original > MAX_ARCHIVE_MEMBER_BYTES) {
-    throw new Error('归档成员解压后须在 1 MiB 内。');
+  const memberLimit = window === undefined ? MAX_ARCHIVE_MEMBER_BYTES : MAX_PAGED_MEMBER_BYTES;
+  if (!Number.isSafeInteger(member.original) || member.original > memberLimit) {
+    throw new Error(`ZIP 成员解压后须在 ${memberLimit / (1024 * 1024)} MiB 内。`);
   }
+  const pageOnly = member.original > MAX_ARCHIVE_MEMBER_BYTES;
+  const length = pageOnly ? windowLength(member.original, window) : undefined;
   if (typeof member.packed !== 'number' || member.packed > MAX_ATTACHMENT_BYTES) throw new Error('ZIP 成员压缩数据超过 32 MiB。');
   const checksum = row.readUInt32LE(16);
   let data;
   try {
-    data = await loadZipData(reader.read, index.start, member, flags, method, nameBytes, checksum);
-    if (data.bytes.length !== member.original || crc32(data.bytes) !== checksum) {
-      throw new Error('附件结构无效：ZIP 成员解压长度或 CRC-32 校验值不匹配。');
+    const { dataOffset, encryptionFlag } = await validateLocalZipHeader(reader.read, index.start, member, flags, method, nameBytes, checksum);
+    if (pageOnly) {
+      data = await loadZipPage(reader.read, dataOffset, member, method, checksum, window.offset, length, signal);
+    } else {
+      const bytes = await loadZipData(reader.read, dataOffset, member, method);
+      if (bytes.length !== member.original || crc32(bytes) !== checksum) {
+        throw new Error('附件结构无效：ZIP 成员解压长度或 CRC-32 校验值不匹配。');
+      }
+      data = { bytes };
     }
+    if (encryptionFlag) data.encryption_flag_only = true;
   } catch (error) {
+    signal?.throwIfAborted();
     if (error?.name === 'AbortError') throw error;
     if (flags & 1) throw new Error('ZIP 成员带加密标记且无法按未加密数据通过校验，请提供已知口令。');
     throw error;
   }
-  const { bytes, encryptionFlag } = data;
-  return { bytes, ...memberName(nameBytes, flags, row.subarray(member.nameEnd, member.extraEnd)),
-    ...(encryptionFlag ? { encryption_flag_only: true } : {}), format: 'ZIP', variant: index.zip64 ? 'ZIP64' : 'ZIP', zipIndex: index };
+  return { ...data, ...memberName(nameBytes, flags, row.subarray(member.nameEnd, member.extraEnd)),
+    format: 'ZIP', variant: index.zip64 ? 'ZIP64' : 'ZIP', zipIndex: index };
 }

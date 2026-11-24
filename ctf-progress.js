@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto';
 import { decodeEvidenceText, lineBounds, parseEvidenceJson } from './evidence.js';
+import { EXPERIMENT_TOOLS, experimentRequestHash } from './experiment-input.js';
 import {
   cachedResultValue, isResultPointer, isResultScalar, MAX_VALUE_LENGTH, RESULT_HASH, resultReferences, resultValue,
 } from './ctf-result-values.js';
 
 const MAX_ENTRIES = 24;
+const MAX_EXPERIMENTS = 12;
 const MAX_RESULT_SOURCES = 16;
 const MAX_TEXT = 1024;
 const MAX_SOURCES = 5;
@@ -18,22 +20,22 @@ const STATE_RECOVERY = '.ctf/state.saved.json';
 const STATE_HEADER = /^<!-- machine: ([^ ]+) sha256:([a-f0-9]{64}) -->\n/u;
 
 const REFERENCE_PROPERTIES = {
-  file_path: { type: 'string', description: '相对于题目目录的原件路径。' },
+  file_path: { type: 'string', description: '相对原件路径。' },
   line: { type: 'integer', minimum: 1 },
   byte_offset: { type: 'integer', minimum: 0 },
-  byte_length: { type: 'integer', minimum: 1, description: '可选的引用字节数。使用时同时给出 byte_offset。' },
-  json_pointer: { type: 'string', maxLength: 256, description: '原件中的 JSON 标量字段路径，与行号和字节偏移择一。' },
-  sha256: { type: 'string', description: '可选的已核对原件 SHA-256。' },
+  byte_length: { type: 'integer', minimum: 1 },
+  json_pointer: { type: 'string', maxLength: 256 },
+  sha256: { type: 'string' },
 };
 const TEXT = { type: 'string', minLength: 1, maxLength: MAX_TEXT };
 const TEXT_LIST = { type: 'array', maxItems: MAX_ENTRIES, items: TEXT };
 const SOURCE_SCHEMA = { type: 'object', properties: REFERENCE_PROPERTIES, additionalProperties: false, required: ['file_path'] };
 const VALUE_FIELDS = {
   label: TEXT,
-  result_id: { type: 'string', description: '该工具返回的完整 result_id。' },
-  pointer: { type: 'string', maxLength: 256, description: '要核对的字段路径，例如 /image/width 或 /steps/0/result。数组从 0 开始。' },
+  result_id: { type: 'string' },
+  pointer: { type: 'string', maxLength: 256, description: '字段路径，如 /steps/0/result。' },
   value: { anyOf: [{ type: 'string', maxLength: MAX_VALUE_LENGTH }, { type: 'number' }, { type: 'boolean' }, { type: 'null' }] },
-  tool: { type: 'string', description: '保留 load 返回的工具名时使用。' },
+  tool: { type: 'string' },
   sources: { type: 'array', maxItems: MAX_RESULT_SOURCES, items: SOURCE_SCHEMA },
 };
 const VALUE_LIST = {
@@ -42,39 +44,38 @@ const VALUE_LIST = {
 };
 const INSIGHT_FIELDS = {
   text: TEXT,
-  source: {
-    type: 'string', enum: ['self', 'human', 'external'],
-    description: '关键判断的来源：self 为自行推导，human 为队长或队友给出的提示，external 为参考了外部题解或 WP。',
-  },
-  note: { ...TEXT, description: '可选的说明，例如提示的大意或参考出处；不要抄录他人 WP 原文。' },
+  source: { type: 'string', enum: ['self', 'human', 'external'] },
+  note: TEXT,
 };
 const INSIGHT_LIST = {
   type: 'array', maxItems: 16,
   items: { type: 'object', properties: INSIGHT_FIELDS, additionalProperties: false, required: ['text', 'source'] },
 };
 const HINT_FIELDS = {
-  hint: { ...TEXT, description: '收到的方向性提示原文或大意，保留关键措辞。' },
-  source: {
-    type: 'string', enum: ['self', 'human', 'external'],
-    description: '提示来源：self 为自己回看题面得出，human 为队长或队友提示，external 为外部题解或 WP。',
-  },
-  hypothesis: { ...TEXT, description: '把提示复述成的可证伪假设，说明预期能观察到什么。' },
-  test: { ...TEXT, description: '为验证该假设设计的最小验证步骤或命令。' },
-  verified: { type: 'boolean', description: '验证是否通过；未验证的假设留在 hints，不要写进 confirmed。' },
+  hint: TEXT,
+  source: { type: 'string', enum: ['self', 'human', 'external'] },
+  hypothesis: TEXT,
+  test: TEXT,
+  verified: { type: 'boolean' },
 };
 const HINT_LIST = {
   type: 'array', maxItems: 16,
   items: { type: 'object', properties: HINT_FIELDS, additionalProperties: false, required: ['hint', 'source', 'hypothesis'] },
 };
+const EXPERIMENT_FIELDS = {
+  label: TEXT,
+  hypothesis: TEXT,
+  pointer: VALUE_FIELDS.pointer,
+  expected: VALUE_FIELDS.value,
+  result_id: VALUE_FIELDS.result_id,
+  actual: VALUE_FIELDS.value,
+  tool: { type: 'string', enum: EXPERIMENT_TOOLS },
+  request_sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+  sources: VALUE_FIELDS.sources,
+};
 const PROGRESS_FIELDS = {
-  insights: {
-    ...INSIGHT_LIST,
-    description: '关键判断是谁先提出的。每写出一条关键判断就记录来源；被提示或参考外部 WP 时照实记录。',
-  },
-  hints: {
-    ...HINT_LIST,
-    description: '提示吸收记录：把收到的方向性提示复述成可证伪假设，写清最小验证与验证结果。未验证的假设不要写入 confirmed。',
-  },
+  insights: { ...INSIGHT_LIST, description: '关键判断及来源（self/human/external）。' },
+  hints: { ...HINT_LIST, description: '提示假设与验证记录。' },
   confirmed: {
     type: 'array', maxItems: MAX_ENTRIES,
     items: {
@@ -90,10 +91,7 @@ const PROGRESS_FIELDS = {
   },
   ruled_out: TEXT_LIST,
   pending: TEXT_LIST,
-  attachments: {
-    type: 'array', maxItems: MAX_ATTACHMENTS, items: { type: 'string' },
-    description: '题面已知附件的相对路径。接替简报同时会包含已引用的原件。',
-  },
+  attachments: { type: 'array', maxItems: MAX_ATTACHMENTS, items: { type: 'string' } },
   commands: {
     type: 'array', maxItems: 16,
     items: {
@@ -102,27 +100,32 @@ const PROGRESS_FIELDS = {
         command: TEXT,
         exit_code: { type: 'integer' },
         output: TEXT,
-        cwd: { ...TEXT, description: '命令实际工作目录。ops_bash 不继承 working_directory 的切换，请在命令里显式传 workdir，并按实际 pwd 记录。' },
+        cwd: TEXT,
       },
     },
   },
   values: VALUE_LIST,
+  experiments: {
+    type: 'array', maxItems: MAX_EXPERIMENTS,
+    items: { type: 'object', additionalProperties: false, properties: EXPERIMENT_FIELDS,
+      required: ['label', 'hypothesis', 'pointer', 'expected'] },
+  },
 };
 
 export const PROGRESS_PROPERTIES = {
-  action: { type: 'string', enum: ['load', 'check', 'save', 'writeup', 'handoff', 'results', 'repair'],
-    description: '按动作只传对应字段：check 传 claims；save 传 revision、progress 和可选 instance；writeup 可传 revision；repair 传 revision。' },
-  revision: { type: 'string', description: 'save、repair 必填，writeup 可选。使用 load 返回的 notes.md 版本。' },
-  claims: { ...VALUE_LIST, description: 'check 使用。无原件引用的当前工具值返回 tool_match。仅找到 notes 保存值时返回 recorded（待复核）。' },
+  action: { type: 'string', enum: ['load', 'check', 'save', 'writeup', 'handoff', 'results', 'experiments', 'repair'],
+    description: '按动作传对应字段：check 传 claims；save 传 revision+progress；repair 传 revision。' },
+  revision: { type: 'string', description: 'load 返回的 notes.md 版本（save/repair 必填）。' },
+  claims: { ...VALUE_LIST, description: 'check 待核对的工具值列表。' },
+  experiment_query: {
+    type: 'object', additionalProperties: false, required: ['tool', 'args'],
+    properties: { tool: { type: 'string', enum: EXPERIMENT_TOOLS }, args: { type: 'object' } },
+  },
   progress: {
     type: 'object', properties: PROGRESS_FIELDS, additionalProperties: false,
     required: ['confirmed', 'ruled_out', 'pending'],
-    description: 'save 使用。values 保存工具值，commands 保存命令、退出码、输出和目录。',
   },
-  instance: {
-    type: 'string', maxLength: 200,
-    description: 'save 可选：当前使用的实例名或 ID。多个会话共用一个工作区时用来区分实例。',
-  },
+  instance: { type: 'string', maxLength: 200, description: 'save 可选实例标识。' },
 };
 
 export const PROGRESS_ACTION_KEYS = Object.freeze({
@@ -132,6 +135,7 @@ export const PROGRESS_ACTION_KEYS = Object.freeze({
   writeup: ['action', 'revision'],
   handoff: ['action'],
   results: ['action'],
+  experiments: ['action', 'experiment_query'],
   repair: ['action', 'revision'],
 });
 
@@ -208,6 +212,26 @@ function normalizeValues(values, normalizePath) {
   });
 }
 
+function normalizeExperiments(entries, normalizePath) {
+  if (!Array.isArray(entries) || entries.length > MAX_EXPERIMENTS) throw new Error('单题验证最多记录 12 项。');
+  const labels = new Set();
+  return entries.map(entry => {
+    if (!keysMatch(entry, Object.keys(EXPERIMENT_FIELDS)) || !isText(entry.label) || labels.has(entry.label)
+      || !isText(entry.hypothesis) || !isResultPointer(entry.pointer) || !isResultScalar(entry.expected)
+      || (entry.result_id !== undefined && (typeof entry.result_id !== 'string' || !RESULT_HASH.test(entry.result_id)))
+      || (entry.actual !== undefined && !isResultScalar(entry.actual))
+      || (entry.tool !== undefined && !EXPERIMENT_TOOLS.includes(entry.tool))
+      || (entry.request_sha256 !== undefined && (typeof entry.request_sha256 !== 'string' || !RESULT_HASH.test(entry.request_sha256)))
+      || (entry.sources !== undefined && (!Array.isArray(entry.sources) || entry.sources.length > MAX_RESULT_SOURCES))) {
+      throw new Error('验证记录需要唯一标签、假设、结果字段路径和预期标量值。');
+    }
+    labels.add(entry.label);
+    return { ...entry, ...(entry.sources === undefined ? {} : {
+      sources: entry.sources.map(source => normalizeSource(source, normalizePath)),
+    }) };
+  });
+}
+
 function normalizeCommands(commands) {
   if (!Array.isArray(commands) || commands.length > 16) {
     throw new Error('最多可记录 16 条命令。');
@@ -281,6 +305,7 @@ function normalizeProgress(progress, normalizePath) {
     ...(attachments === undefined ? {} : { attachments: [...new Set(attachments.map(path => normalizePath(path)))] }),
     ...(progress.commands === undefined ? {} : { commands: normalizeCommands(progress.commands) }),
     ...(progress.values === undefined ? {} : { values: normalizeValues(progress.values, normalizePath) }),
+    ...(progress.experiments === undefined ? {} : { experiments: normalizeExperiments(progress.experiments, normalizePath) }),
   };
 }
 
@@ -510,6 +535,13 @@ function renderProgress(progress, heading, valueStates, includeResultIds = true)
       return '- ' + '`' + readable(entry.command) + '`' + (meta ? '（' + meta + '）' : '') + output;
     }).join('\n')]
     : [];
+  const experiments = progress.experiments?.length
+    ? ['### 单题验证记录', progress.experiments.map(entry => {
+      const observed = entry.actual === undefined ? '待取得观测' : '已记录观测 ' + readable(JSON.stringify(entry.actual));
+      return '- ' + readable(entry.label) + ' · ' + readable(entry.hypothesis)
+        + '\n  - 预期 ' + readable(JSON.stringify(entry.expected)) + '，' + observed;
+    }).join('\n')]
+    : [];
   return [
     heading, '### 已记录结论', observations.join('\n') || '- 暂无记录。',
     ...(values?.length ? [...valuesHeading, values.join('\n')] : []),
@@ -519,6 +551,7 @@ function renderProgress(progress, heading, valueStates, includeResultIds = true)
     '### 待补证据与待办', bullets(progress.pending),
     ...insights,
     ...hints,
+    ...experiments,
   ].join('\n\n');
 }
 
@@ -679,6 +712,49 @@ function checkValues(claims, files, saved = []) {
   return { status, checks };
 }
 
+function recordExperiment(draft, files, previous) {
+  const { label, hypothesis, pointer, expected, result_id } = draft;
+  const prediction = { label, hypothesis, pointer, expected, ...(result_id === undefined ? {} : { result_id }) };
+  if (result_id === undefined) return prediction;
+  const result = files.readResult(result_id);
+  if (!result || !EXPERIMENT_TOOLS.includes(result.tool)) {
+    const recorded = previous?.find(entry => entry.result_id === result_id && entry.pointer === pointer);
+    return recorded === undefined ? prediction : { ...recorded, ...prediction };
+  }
+  // A displayed page is not the full text even when the final page fits in a scalar.
+  if (result.tool === 'calculate_offline' && /^\/steps\/\d+\/result$/u.test(pointer)
+    && typeof cachedResultValue(result, pointer.replace(/\/result$/u, '/result_sha256')) === 'string') {
+    return prediction;
+  }
+  const actual = cachedResultValue(result, pointer);
+  const requestHash = cachedResultValue(result, '/request_sha256');
+  if (actual === undefined) return prediction;
+  const sources = resultReferences(result, pointer);
+  return {
+    ...prediction, actual, tool: result.tool,
+    ...(typeof requestHash === 'string' && RESULT_HASH.test(requestHash) ? { request_sha256: requestHash } : {}),
+    sources: hasOriginals(sources) ? sources.map(source => normalizeSource(source, files.normalizePath)) : [],
+  };
+}
+
+async function checkExperiments(entries, files) {
+  if (!entries?.length) return [];
+  const { confirmed } = await verifySources({
+    confirmed: entries.map(entry => ({ ...entry, sources: entry.sources ?? [] })),
+  }, files.readEvidence, false);
+  return confirmed.map(entry => {
+    const sufficient = entry.actual !== undefined && hasOriginals(entry.sources) && !needsReview(entry);
+    const observation = entry.result_id === undefined ? undefined : files.readResult(entry.result_id);
+    return {
+      ...entry, status: sufficient ? entry.actual === entry.expected ? 'supported' : 'refuted' : 'insufficient',
+      ...(entry.actual === undefined ? {} : {
+        observation_status: observation && !observation.persisted ? 'current_session' : 'recorded',
+      }),
+      ...(!sufficient ? { reason: needsReview(entry) ? '引用的原件已变化或不可复核。' : '缺少可复核的实际观测。' } : {}),
+    };
+  });
+}
+
 export async function manageProgress(args, files) {
   const { action, revision } = args;
   if (!PROGRESS_PROPERTIES.action.enum.includes(action)) throw new Error('请选择读取、核对、保存、生成题解、接替、查看结果或修复。');
@@ -687,6 +763,24 @@ export async function manageProgress(args, files) {
       throw new Error('results 只需 action。');
     }
     return { status: 'results', file: 'notes.md', results: files.listResults?.() ?? [] };
+  }
+  if (action === 'experiments') {
+    if (!keysMatch(args, PROGRESS_ACTION_KEYS.experiments)) throw new Error('experiments 只接受 action 和 experiment_query。');
+    const { experiment_query: query } = args;
+    let requestHash;
+    if (query !== undefined) {
+      if (!keysMatch(query, ['tool', 'args'])) throw new Error('找验证记录需要工具名和原调用参数。');
+      const input = typeof query.args?.file_path === 'string'
+        ? { ...query.args, file_path: files.normalizePath(query.args.file_path) } : query.args;
+      requestHash = experimentRequestHash(query.tool, input);
+      if (requestHash === undefined) throw new Error('无法为这组工具参数计算验证编号。');
+    }
+    const notes = await files.readDocument('notes.md');
+    const state = await files.readDocument(STATE_FILE);
+    const record = await readStored(files, notes, state);
+    const saved = record?.progress.experiments ?? [];
+    const entries = requestHash === undefined ? saved : saved.filter(entry => entry.request_sha256 === requestHash);
+    return { status: 'experiments', experiments: await checkExperiments(entries, files) };
   }
   if (action === 'check') {
     if (revision !== undefined || args.progress !== undefined) throw new Error('check 只需 action 和 claims。');
@@ -728,6 +822,11 @@ export async function manageProgress(args, files) {
   const storedMeta = record?.meta ?? {};
   if (action === 'save') {
     if (draft.attachments === undefined && stored?.attachments !== undefined) draft.attachments = stored.attachments;
+    if (draft.experiments !== undefined) {
+      draft.experiments = draft.experiments.map(entry => recordExperiment(entry, files, stored?.experiments));
+    } else if (stored?.experiments !== undefined) {
+      draft.experiments = stored.experiments;
+    }
     const values = draft.values ?? stored?.values;
     const valueStates = new Map();
     if (values !== undefined) {
@@ -745,6 +844,7 @@ export async function manageProgress(args, files) {
       });
     }
     const checkpoint = await verifySources(draft, files.readEvidence, true);
+    const experimentStatus = checkpoint.experiments === undefined ? undefined : await checkExperiments(checkpoint.experiments, files);
     const instance = args.instance ?? storedMeta.instance;
     const meta = {
       ...(files.sessionId === undefined ? {} : { session: files.sessionId }),
@@ -768,6 +868,7 @@ export async function manageProgress(args, files) {
       warning = [warning, '最新恢复副本写入失败。'].filter(Boolean).join(' ');
     }
     return { status: 'saved', file: 'notes.md', state_file: STATE_FILE, state_sha256: digest(body),
+      ...(experimentStatus === undefined ? {} : { experiment_status: experimentStatus }),
       revision: progressRevision(nextNotes, { version: 'saved', text: body }), ...(warning ? { warning } : {}) };
   }
 
@@ -797,6 +898,7 @@ export async function manageProgress(args, files) {
     return { status: 'loaded', file: 'notes.md', revision: current, progress: stored,
       ...(storedMeta.instance === undefined ? {} : { instance: storedMeta.instance }),
       evidence_status: Object.fromEntries(evidenceStatus), value_status: valueChecks,
+      ...(stored.experiments === undefined ? {} : { experiment_status: await checkExperiments(stored.experiments, files) }),
       ...(warnings.length ? { warning: warnings.join(' ') } : {}) };
   }
 

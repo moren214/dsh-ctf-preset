@@ -30,18 +30,20 @@ export async function stageAttachment(source, destination, { signal, limit = MAX
   return { size, sha256: hash.digest('hex'), head: head.subarray(0, Math.min(size, head.length)) };
 }
 
-function requestAttachment(url, address, signal) {
+function requestAttachment(url, address, signal, extraHeaders = {}) {
   const transport = url.protocol === 'https:' ? https : http;
   return new Promise((resolve, reject) => {
     const request = transport.get(url, {
       agent: false, signal, lookup: pinnedLookup(address),
-      headers: { 'User-Agent': 'dsh-ctf-preset', Accept: '*/*', 'Accept-Encoding': 'identity' },
+      headers: { 'User-Agent': 'dsh-ctf-preset', Accept: '*/*', 'Accept-Encoding': 'identity', ...extraHeaders },
     }, resolve);
     request.once('error', reject);
   });
 }
 
-export async function downloadAttachment(target, destination, { signal, resolveAddress, request = requestAttachment, limit = MAX_TRANSFER_BYTES } = {}) {
+export async function downloadAttachment(target, destination, {
+  signal, resolveAddress, authorizeHop, headersFor, request = requestAttachment, limit = MAX_TRANSFER_BYTES,
+} = {}) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_TRANSFER_BYTES) throw new Error('附件下载上限无效。');
   const timeout = AbortSignal.timeout(60000);
   const deadline = signal ? AbortSignal.any([signal, timeout]) : timeout;
@@ -51,8 +53,11 @@ export async function downloadAttachment(target, destination, { signal, resolveA
     deadline.throwIfAborted();
     if (seen.has(url.href)) throw new Error('下载重定向循环。');
     seen.add(url.href);
-    const address = await pinAddress(url.hostname, { publicOnly: true, signal: deadline, resolve: resolveAddress });
-    const response = await request(url, address, deadline);
+    const address = authorizeHop
+      ? await authorizeHop(url, deadline)
+      : await pinAddress(url.hostname, { publicOnly: true, signal: deadline, resolve: resolveAddress });
+    const extraHeaders = headersFor ? (headersFor(url) ?? {}) : {};
+    const response = await request(url, address, deadline, extraHeaders);
     const status = response.statusCode ?? 0;
     if (REDIRECTS.has(status)) {
       response.destroy();

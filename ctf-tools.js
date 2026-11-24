@@ -1,30 +1,34 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { constants, createReadStream } from 'node:fs';
-import { copyFile, lstat, mkdir, realpath, unlink } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readFile, realpath, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative } from 'node:path';
 import { downloadAttachment, MAX_TRANSFER_BYTES, provenanceUrl, stageAttachment } from './attachment-transfer.js';
 import { createNetworkBoundary, pinAddress, webUrl } from './network-boundary.js';
-import { cleanHttpResponse, platformBase, platformCredential, platformRequest } from './platform-request.js';
+import { platformAuthHeaders, platformBase, platformCredential, platformRequest, redactPlatformToken } from './platform-request.js';
 import { describeToolError, ToolError } from './tool-errors.js';
 import { readZipWithKnownPassword } from './archive-password.js';
-import { MAX_ATTACHMENT_BYTES } from './attachment-layout.js';
+import { checkRange, MAX_ARCHIVE_MEMBER_BYTES, MAX_ATTACHMENT_BYTES } from './attachment-layout.js';
 import { inspectAttachment } from './attachment.js';
-import { readTarOrGzipMember } from './archive.js';
+import { inspectDecompressedStream, readDecompressedStreamMember, readTarOrCompressedMember } from './archive.js';
+import { compressedStreamFormat, decompressCompressedStream } from './compressed-stream.js';
 import {
   checkAttachmentHash, createRangeInspector, inspectEvidenceLines, inspectLogWindow, MAX_LOG_WINDOW_BYTES,
   requireCurrentFile, WorkspaceFileError,
 } from './attachment-ranges.js';
 import { BYTE_WINDOW_PROPERTIES, describeByteWindow, MAX_WINDOW_BYTES, parseByteWindow, printableStrings, windowLength } from './byte-window.js';
+import { BINARY_SCAN_PROPERTIES, parseBinaryScan, scanBinary } from './binary-scan.js';
 import { inspectZipRanges, readZipMember } from './zip-directory.js';
+import { inspectZipCandidates } from './zip-candidates.js';
 import { inspectNativeArchive, nativeArchiveFormat, readNativeArchiveMember } from './archive-directory.js';
 import { parsePcapngQuery, PCAPNG_QUERY_SCHEMA } from './pcapng-statistics.js';
 import { inspectMedia, MEDIA_PROPERTIES, parseMediaRequest, parsePngRequest, PNG_PIXEL_PROPERTIES } from './media-reader.js';
 import { inspectElf, verifyElf } from './elf.js';
 import { PWN_PATTERN_PROPERTIES, cyclicPattern } from './pwn-pattern.js';
+import { PWN_PAYLOAD_PROPERTIES, buildPwnPayload } from './pwn-payload.js';
 import { NET_SESSION_PROPERTIES, createNetSessionManager } from './net-session.js';
 import { REV_QUERY_PROPERTIES, runRevQuery } from './rev-query.js';
-import { HTTP_REQUEST_PROPERTIES, httpRequest } from './http-client.js';
+import { createCookieJarStore, HTTP_REQUEST_PROPERTIES, httpRequest } from './http-client.js';
 import { PCAP_STREAM_PROPERTIES, pcapStream } from './pcap-stream.js';
 import { MAX_EVIDENCE_SOURCES, MAX_EVIDENCE_TEXT, verifyEvidence } from './evidence.js';
 import { HTTP_EVIDENCE_PROPERTIES, MAX_HTTP_BYTES, verifyHttpEvidence } from './http-evidence.js';
@@ -36,16 +40,20 @@ import { REV_ADDRESS_PROPERTIES, mapRevAddress } from './rev-address.js';
 import { REV_MACHINE_PROPERTIES, verifyRevMachine } from './rev-machine.js';
 import { REV_TRACE_PROPERTIES, compareRevTrace } from './rev-trace.js';
 import { BATCH_TEXT_PROPERTIES, MAX_BATCH_FILE_BYTES, readCtfFiles } from './batch-text.js';
-import { CALCULATION_PROPERTIES } from './offline-calculation.js';
+import { CALCULATION_PROPERTIES, hasAttachmentInputs, validateSteps } from './offline-calculation.js';
 import { createCalculationRunner } from './offline-calculation-runner.js';
 import { Base100Workbench, WORKBENCH_BASE100_PROPERTIES } from './workbench-base100.js';
-import { CONFIG_LIST_FIELDS, CONFIG_PATH_FIELDS, CONFIG_TEXT_FIELDS, createWorkbenchEnvironment, WorkbenchDependencyError } from './workbench-config.js';
+import { CONFIG_BOOLEAN_FIELDS, CONFIG_LIST_FIELDS, CONFIG_PATH_FIELDS, CONFIG_TEXT_FIELDS, createWorkbenchEnvironment, dshHome, WorkbenchDependencyError } from './workbench-config.js';
 import { PROGRESS_ACTION_KEYS, PROGRESS_PARAMETERS, PROGRESS_PROPERTIES, manageProgress } from './ctf-progress.js';
-import { appendStatus, readStatusHistory } from './ctf-status.js';
-import { createToolResults, OFFLINE_RESULT_SCOPE, RESULT_HASH } from './ctf-result-values.js';
+import { appendStatus, readStatusHistory, summarizeStatus } from './ctf-status.js';
+import { cachedResultValue, createToolResults, OFFLINE_RESULT_SCOPE, RESULT_HASH } from './ctf-result-values.js';
+import { experimentRequestHash } from './experiment-input.js';
 import { detectBrowser, detectGdb, findOnPathAsync, registerExtraTools } from './extra-tools.js';
 import { handleSubmission } from './submission.js';
 import { appendEvidenceIndex, decodeEvidenceIndex, encodeEvidenceEntry } from './evidence-index.js';
+import { detectSandbox, runSandbox, SANDBOX_PROPERTIES } from './sandbox-runner.js';
+import { GRAPH_DIR, GRAPH_FILE, GRAPH_PROPERTIES, manageGraph } from './ctf-graph.js';
+import { ARENA_PROPERTIES, runArena } from './ctf-arena.js';
 
 export const name = 'ctf-attachment-tools';
 export const inject = ['tools', 'fs', 'workingDirectory', 'sandboxPolicy'];
@@ -72,8 +80,10 @@ export const Config = {
           return { issues: [{ message: field + ' 须是字符串数组。', path: [field] }] };
         }
       }
-      if (value.compact !== undefined && typeof value.compact !== 'boolean') {
-        return { issues: [{ message: 'compact 须是布尔值。', path: ['compact'] }] };
+      for (const field of CONFIG_BOOLEAN_FIELDS) {
+        if (value[field] !== undefined && typeof value[field] !== 'boolean') {
+          return { issues: [{ message: `${field} 须是布尔值。`, path: [field] }] };
+        }
       }
       return { value };
     },
@@ -89,74 +99,80 @@ const INSTANCE_STATE_FILE = '.ctf-instances.json';
 const instanceTransitions = new Set();
 const SUBMISSION_LOG = '.ctf-submissions.jsonl';
 const STATUS_PROPERTIES = {
-  action: { type: 'string', enum: ['set', 'show', 'board'], description: 'set 追加一条时间盒心跳；show 查看最近状态并返回含 code、severity、action 的结构化 warnings；board 拉取平台榜单并写入一条状态记录。' },
-  phase: { type: 'string', maxLength: 200, description: '当前阶段，例如 题面理解、入口定位、利用构造、复核。' },
-  stuck: { type: 'string', maxLength: 400, description: '当前卡点，一句话说清卡在哪一步。' },
-  ruled_out: { type: 'array', maxItems: 8, items: { type: 'string', maxLength: 200 }, description: '已排除的假设或路径。' },
-  next_step: { type: 'string', maxLength: 400, description: '下一步计划，写可执行的一步。' },
-  need: { type: 'string', maxLength: 200, description: '需要谁或什么帮助；没有就省略。' },
+  action: { type: 'string', enum: ['set', 'show', 'board'], description: 'set 追加时间盒心跳；show 查状态与 warnings；board 拉取榜单。' },
+  phase: { type: 'string', maxLength: 200, description: '当前阶段。' },
+  stuck: { type: 'string', maxLength: 400, description: '当前卡点。' },
+  ruled_out: { type: 'array', maxItems: 8, items: { type: 'string', maxLength: 200 }, description: '已排除路径。' },
+  next_step: { type: 'string', maxLength: 400, description: '可执行下一步。' },
+  need: { type: 'string', maxLength: 200, description: '所需帮助。' },
 };
 const SUBMIT_PROPERTIES = {
-  flag: { type: 'string', maxLength: 512, description: '待提交的 flag 原文，不要带多余空格。' },
-  pattern: { type: 'string', maxLength: 200, description: '可选的 flag 格式正则，例如 ^FLAG\\{[0-9a-f]{32}\\}$。' },
-  source: { type: 'string', maxLength: 400, description: 'flag 来源：结果编号、命令或提示，写可核对的位置。' },
-  dynamic: { type: 'boolean', description: '动态 flag 设为 true 时，会要求实例名和刷新时间。' },
-  instance: { type: 'string', maxLength: 200, description: '动态 flag 所属实例或题目名。' },
-  refreshed_at: { type: 'string', maxLength: 40, description: '实例刷新时间（ISO 8601），动态 flag 必填。' },
-  record: { type: 'boolean', description: 'check_flag / submit_check 传 true 才写本地预检回执。正式提交始终记录回执。' },
+  flag: { type: 'string', maxLength: 512, description: '待提交 flag 原文。' },
+  pattern: { type: 'string', maxLength: 200, description: '可选 flag 格式正则。' },
+  source: { type: 'string', maxLength: 400, description: 'flag 来源位置。' },
+  dynamic: { type: 'boolean', description: '动态 flag 为 true 时需 instance 与 refreshed_at。' },
+  instance: { type: 'string', maxLength: 200, description: '实例名。' },
+  refreshed_at: { type: 'string', maxLength: 40, description: '实例刷新 ISO 时间。' },
+  record: { type: 'boolean', description: 'check_flag 传 true 才写预检回执。' },
 };
 const SUBMIT_FLAG_PROPERTIES = {
   ...SUBMIT_PROPERTIES,
-  challenge: { type: 'string', maxLength: 200, description: '题目标识，平台需要时填写。' },
+  challenge: { type: 'string', maxLength: 200, description: '题目标识。' },
 };
 const INSTANCE_PROPERTIES = {
-  action: { type: 'string', enum: ['status', 'list', 'create', 'rotate', 'delete'], description: 'status 查看配置；list 列出实例；create 新建；rotate 确认新实例已创建后删除传入 id；delete 删除传入 id。' },
-  id: { type: 'string', maxLength: 200, description: '实例标识，rotate 与 delete 必填。' },
-  body: { type: 'object', description: 'create 或 rotate 的请求体，按 JSON 原样提交。', additionalProperties: true },
+  action: { type: 'string', enum: ['status', 'list', 'create', 'rotate', 'delete'], description: '实例操作。' },
+  id: { type: 'string', maxLength: 200, description: '实例 ID（rotate/delete 必填）。' },
+  body: { type: 'object', description: 'create/rotate JSON 请求体。', additionalProperties: true },
 };
 const FETCH_PROPERTIES = {
-  url: { type: 'string', maxLength: 2048, description: '赛题附件的 http(s) 下载地址，只用于比赛实例。' },
-  name: { type: 'string', maxLength: 200, description: '保存文件名；省略时取 URL 最后一段。' },
-  sha256: { type: 'string', description: '可选，下载内容的 64 位十六进制 SHA-256；不符会报 conflict。' },
-  max_bytes: { type: 'integer', minimum: 1, maximum: MAX_TRANSFER_BYTES, default: MAX_ATTACHMENT_BYTES,
-    description: '下载大小上限。默认 32 MiB，可为明确要分段处理的大文件指定更高上限。' },
+  url: { type: 'string', maxLength: 2048, description: '赛题附件 http(s) 地址。' },
+  name: { type: 'string', maxLength: 200, description: '保存文件名。' },
+  sha256: { type: 'string', description: '可选 64 位 SHA-256 校验。' },
+  max_bytes: { type: 'integer', minimum: 1, maximum: MAX_TRANSFER_BYTES, default: MAX_ATTACHMENT_BYTES, description: '下载上限（默认 32 MiB）。' },
 };
-const PATH_SCHEMA = {
-  type: 'string',
-  description: '题目附件相对于会话工作目录的路径。已在配置中授权的外部附件可在允许写入的会话里复制到 .ctf-attachments/ 并登记 SHA-256。',
+const PATH_SCHEMA = { type: 'string', description: '相对工作区附件路径（已授权外部路径可自动导入）。' };
+const RESULT_SOURCE_PROPERTIES = {
+  source_result_id: { type: 'string', pattern: '^[a-f0-9]{64}$', description: '引用前序派生字节结果编号。' },
+  source_result_ids: { type: 'array', minItems: 1, maxItems: 64, uniqueItems: true,
+    items: { type: 'string', pattern: '^[a-f0-9]{64}$' }, description: '按顺序拼接连续 PNG bitstream 结果编号。' },
 };
-const ZIP_FORMAT_HINT = { type: 'string', enum: ['zip'], description: '设为 zip 时检查文件内部嵌入的 ZIP。' };
-const SHA256_SCHEMA = { type: 'string', description: '待核对的 64 位十六进制 SHA-256。翻页时可使用前一页返回的值。' };
+const ARCHIVE_FORMAT_HINT = { type: 'string', enum: ['zip', 'zlib', 'deflate_raw'], description: '内嵌 zip/zlib/deflate_raw 提示。' };
+const SHA256_SCHEMA = { type: 'string', description: '待核对的 64 位 SHA-256。' };
+const ZIP_RANGE_PROPERTIES = {
+  archive_offset: { type: 'integer', minimum: 0 },
+  archive_length: { type: 'integer', minimum: 1 },
+};
 const ATTACHMENT_PROPERTIES = {
   file_path: PATH_SCHEMA,
-  format_hint: ZIP_FORMAT_HINT,
-  offset: { type: 'integer', minimum: 0, maximum: MAX_ATTACHMENT_BYTES, description: '从 0 开始的结构记录索引。后续页使用 next_offset。' },
-  limit: { type: 'integer', minimum: 1, maximum: 16, description: '每页记录数，默认 10。' },
+  ...RESULT_SOURCE_PROPERTIES,
+  format_hint: ARCHIVE_FORMAT_HINT,
+  ...ZIP_RANGE_PROPERTIES,
+  scan_result_id: { type: 'string', pattern: '^[a-f0-9]{64}$', description: 'scan_binary 结果编号（核对 ZIP 候选）。' },
+  offset: { type: 'integer', minimum: 0, maximum: MAX_ATTACHMENT_BYTES },
+  limit: { type: 'integer', minimum: 1, maximum: 16 },
   expected_sha256: SHA256_SCHEMA,
   pcapng: PCAPNG_QUERY_SCHEMA,
 };
 const LOG_RANGE_PROPERTIES = {
   file_path: PATH_SCHEMA,
-  byte_offset: { type: 'integer', minimum: 0, description: '从 0 开始的原件字节偏移。后续片段使用 next_byte_offset。默认 0。' },
-  byte_length: { type: 'integer', minimum: 1, maximum: MAX_LOG_WINDOW_BYTES, description: '所需字节数，默认 2048。结果向外对齐至完整 UTF-8 字符。' },
+  byte_offset: { type: 'integer', minimum: 0 },
+  byte_length: { type: 'integer', minimum: 1, maximum: MAX_LOG_WINDOW_BYTES },
   expected_sha256: SHA256_SCHEMA,
 };
 const BINARY_RANGE_PROPERTIES = {
   file_path: PATH_SCHEMA,
   ...BYTE_WINDOW_PROPERTIES,
-  strings: { type: 'boolean', description: '附带该片段内可打印 ASCII 字符串及原件偏移。默认 false。' },
-  min_string_length: { type: 'integer', minimum: 1, maximum: 256, description: '字符串最短字节数，默认 4，仅在 strings 为 true 时使用。' },
-  hash_scope: {
-    type: 'string', enum: ['auto', 'file', 'range'],
-    description: '默认 auto。超过 128 MiB 时默认只计算片段 SHA-256。file 计算原件和片段，range 只读和散列这段。',
-  },
+  strings: { type: 'boolean', description: '附带可打印 ASCII 字符串。' },
+  min_string_length: { type: 'integer', minimum: 1, maximum: 256 },
+  hash_scope: { type: 'string', enum: ['auto', 'file', 'range'] },
   expected_sha256: SHA256_SCHEMA,
 };
 const ARCHIVE_MEMBER_PROPERTIES = {
   file_path: PATH_SCHEMA,
-  format_hint: ZIP_FORMAT_HINT,
-  password: { type: 'string', maxLength: 512, description: '可选。用于读取单个 ZIP 成员的已知口令。' },
-  member_index: { type: 'integer', minimum: 0, description: 'inspect_attachment 目录里的 member_index，零起始。单文件 gzip 使用 0。' },
+  format_hint: ARCHIVE_FORMAT_HINT,
+  ...ZIP_RANGE_PROPERTIES,
+  password: { type: 'string', maxLength: 512, description: '可选已知 ZIP 口令。' },
+  member_index: { type: 'integer', minimum: 0, description: '归档成员索引（从 0 起）。' },
   ...BYTE_WINDOW_PROPERTIES,
   expected_sha256: SHA256_SCHEMA,
 };
@@ -244,6 +260,10 @@ async function openWorkspaceFile(ctx, parts, { cwd, root, signal }) {
   return { target, targetKey: target.targetKey, size: before.size, version: before.version };
 }
 
+function attachmentSnapshot(file) {
+  return createHash('sha256').update(JSON.stringify([file.size, file.version])).digest('hex');
+}
+
 async function readOpenedFile(ctx, file, signal, limit = MAX_ATTACHMENT_BYTES) {
   if (file.size > limit) {
     throw new WorkspaceFileError(`请选择不超过 ${limit / (1024 * 1024)} MiB 的普通附件文件。`);
@@ -274,7 +294,7 @@ function importFileName(path) {
 
 function writablePolicy(ctx, execution) {
   const policy = ctx.sandboxPolicy.resolve({ session: execution.agent?.session });
-  if (!policy || policy.mode === 'read-only') throw new Error('当前会话为只读权限，无法修改文件或比赛状态。');
+  if (!policy || policy.mode === 'read-only') throw new ToolError('permission', '当前会话为只读权限，无法修改文件或比赛状态。');
   return policy;
 }
 
@@ -422,14 +442,132 @@ async function readAttachment(ctx, path, location) {
   return (await readWorkspaceFile(ctx, pathParts(path), location)).bytes;
 }
 
-async function readMediaAttachment(ctx, args, request, location, workbench) {
-  const expectedHash = parseExpectedHash(args.expected_sha256);
-  const file = await readWorkspaceFile(ctx, pathParts(args.file_path), location);
-  const sha256 = createHash('sha256').update(file.bytes).digest('hex');
-  checkAttachmentHash(expectedHash, sha256);
-  const report = await inspectMedia(file.bytes, request, location.signal, workbench);
-  await requireCurrentFile(ctx.fs, file, location.signal);
-  return { ...report, size: file.size, sha256 };
+function resultField(result, pointer) {
+  if (result.summary !== undefined) return cachedResultValue(result, pointer);
+  return cachedResultValue(result, pointer);
+}
+
+async function resolveResultRecord(ctx, id, execution, location, results) {
+  let result = results.get(execution.agent?.session, location.directoryKey, id);
+  if (result === undefined) result = (await recordedResults(ctx, location)).get(id);
+  if (result === undefined) throw new ToolError('conflict', '结果编号不存在或已过期，请重新读取来源。');
+  return result;
+}
+
+async function resolveResultBytes(ctx, id, execution, location, results, inspectRanges, workbench) {
+  const result = await resolveResultRecord(ctx, id, execution, location, results);
+  const artifact = results.getArtifact(execution.agent?.session, id);
+  if (artifact !== undefined) {
+    const digest = createHash('sha256').update(artifact.bytes).digest('hex');
+    const expected = resultField(result, '/artifact_sha256') ?? resultField(result, '/packed_sha256');
+    if (typeof expected === 'string' && digest !== expected) throw new ToolError('conflict', '缓存派生字节与结果编号中的 SHA-256 不同。');
+    const report = result.summary === undefined ? result.report : undefined;
+    const source = artifact.evidence[0] ?? result.sources?.[0];
+    return { bytes: artifact.bytes, result, source, data_sha256: digest,
+      source_evidence: report?.source_evidence ?? (source === undefined ? undefined
+        : { ...source, source_result_id: id, source_tool: result.tool, derived_sha256: digest }) };
+  }
+  if (['read_binary_range', 'read_archive_member'].includes(result.tool)) {
+    const recovered = await recoverCalculationInput(ctx, result, location, inspectRanges, workbench);
+    return { ...recovered, result, source: recovered.source,
+      source_evidence: { ...recovered.source, source_result_id: id,
+        ...(recovered.member_index === undefined ? {} : { member_index: recovered.member_index, member_sha256: recovered.member_sha256 }),
+        ...(recovered.member_page === undefined ? {} : { member_page: recovered.member_page }),
+        ...(recovered.archive_range === undefined ? {} : { archive_range: recovered.archive_range }),
+        ...(recovered.byte_offset === undefined ? {} : { byte_offset: recovered.byte_offset, byte_length: recovered.byte_length }),
+        derived_sha256: recovered.data_sha256 } };
+  }
+  throw new ToolError('conflict', '该结果没有可复读的二进制内容。请在当前会话重新生成它，再传入 source_result_id。');
+}
+
+async function resolveMediaInput(ctx, args, execution, location, workbench, results, inspectRanges) {
+  const id = args.source_result_id;
+  const ids = args.source_result_ids;
+  if ((typeof args.file_path === 'string') === (id !== undefined || ids !== undefined)
+    || (id !== undefined && ids !== undefined)) {
+    throw new ToolError('unsupported', 'file_path、source_result_id 和 source_result_ids 只能选一种输入。');
+  }
+  if (args.file_path !== undefined) {
+    const file = await readWorkspaceFile(ctx, pathParts(args.file_path), location);
+    const sha256 = createHash('sha256').update(file.bytes).digest('hex');
+    checkAttachmentHash(parseExpectedHash(args.expected_sha256), sha256);
+    return { bytes: file.bytes, file: args.file_path, sha256, data_sha256: sha256, size: file.size,
+      source_evidence: { file_path: pathParts(args.file_path).join('/'), sha256 } , fileSnapshot: file };
+  }
+  const sourceIds = ids ?? [id];
+  if (!Array.isArray(sourceIds) || sourceIds.length < 1 || sourceIds.length > 64) {
+    throw new ToolError('unsupported', '请提供一个来源结果编号，或 1 至 64 个连续位流结果编号。');
+  }
+  const parts = [];
+  const reports = [];
+  let source;
+  let sourceEvidence;
+  let previous;
+  let bitstreamSignature;
+  let total = 0;
+  for (const sourceId of sourceIds) {
+    if (typeof sourceId !== 'string' || !RESULT_HASH.test(sourceId)) throw new ToolError('unsupported', '来源编号须为 64 位十六进制 SHA-256。');
+    const item = await resolveResultBytes(ctx, sourceId, execution, location, results, inspectRanges, workbench);
+    total += item.bytes.length;
+    if (total > 16 * 1024 * 1024) throw new ToolError('size', '连续派生字节最多拼接 16 MiB。');
+    const report = item.result.summary === undefined ? item.result.report : undefined;
+    if (sourceIds.length > 1) {
+      const operation = resultField(item.result, '/operation');
+      const offset = resultField(item.result, '/bit_offset');
+      const count = resultField(item.result, '/bit_count');
+      const next = resultField(item.result, '/next_bit_offset');
+      const fileHash = resultField(item.result, '/sha256');
+      const frame = resultField(item.result, '/frame_index');
+      const signature = report === undefined ? undefined : JSON.stringify([fileHash, frame, report.region, report.channels,
+        report.bit_index, report.bit_order, report.total_bit_count]);
+      if (item.result.tool !== 'read_png_pixels' || operation !== 'bitstream'
+        || !Number.isSafeInteger(offset) || !Number.isSafeInteger(count)
+        || signature === undefined || (bitstreamSignature !== undefined && signature !== bitstreamSignature)
+        || (previous !== undefined && (previous.next !== offset || previous.fileHash !== fileHash || previous.frame !== frame))) {
+        throw new ToolError('unsupported', '多结果拼接只接受同一 PNG、同一帧且 bit_offset 连续的 bitstream 分页。');
+      }
+      bitstreamSignature = signature;
+      previous = { next, fileHash, frame };
+      const packedHash = resultField(item.result, '/packed_sha256');
+      if (typeof packedHash !== 'string' || createHash('sha256').update(item.bytes).digest('hex') !== packedHash) {
+        throw new ToolError('conflict', '位流分页数据与记录的 SHA-256 不同。');
+      }
+    }
+    parts.push(item.bytes);
+    reports.push(item);
+    source ??= item.source;
+    sourceEvidence ??= item.source_evidence ?? (item.source === undefined ? undefined : { ...item.source, source_result_id: sourceId, derived_sha256: item.data_sha256 });
+  }
+  const bytes = parts.length === 1 ? parts[0] : Buffer.concat(parts, total);
+  const dataSha = createHash('sha256').update(bytes).digest('hex');
+  checkAttachmentHash(parseExpectedHash(args.expected_sha256), dataSha);
+  const file = source?.file_path;
+  const sha256 = source?.sha256;
+  return { bytes, file, sha256, data_sha256: dataSha, size: bytes.length,
+    source_evidence: sourceEvidence ?? source, source_result_ids: sourceIds };
+}
+
+async function readMediaAttachment(ctx, args, request, location, workbench, execution, results, inspectRanges) {
+  const input = await resolveMediaInput(ctx, args, execution, location, workbench, results, inspectRanges);
+  if (input.bytes.length > MAX_ATTACHMENT_BYTES) throw new ToolError('size', '派生媒体输入最多 32 MiB。');
+  const report = await inspectMedia(input.bytes, request, location.signal, workbench);
+  if (input.fileSnapshot !== undefined) await requireCurrentFile(ctx.fs, input.fileSnapshot, location.signal);
+  let artifact = report.__artifact_bytes;
+  if (request.kind === 'png' && ['bitstream', 'lsb'].includes(request.operation) && typeof report.hex === 'string') {
+    artifact = Buffer.from(report.hex, 'hex');
+  }
+  if (request.kind === 'qr' && Array.isArray(report.codes)) {
+    const code = report.codes.find(value => value.byte_exact && typeof value.hex === 'string' && !value.hex_truncated);
+    if (code) artifact = Buffer.from(code.hex, 'hex');
+  }
+  const { __artifact_bytes: _privateArtifact, ...visible } = report;
+  if (artifact !== undefined && visible.artifact_sha256 === undefined) {
+    visible.artifact_sha256 = createHash('sha256').update(artifact).digest('hex');
+  }
+  return { ...visible, file: input.file, size: input.size, sha256: input.sha256,
+    data_sha256: input.data_sha256, source_evidence: input.source_evidence,
+    ...(input.source_result_ids === undefined ? {} : { source_result_ids: input.source_result_ids }),
+    ...(artifact === undefined ? {} : { __artifact_bytes: artifact }) };
 }
 
 async function snapshotEvidence(ctx, file, location, limit = MAX_ATTACHMENT_BYTES, readLarge) {
@@ -554,6 +692,68 @@ function statusLine(value, field, maxLength = 400) {
   return value.trim();
 }
 
+function graphFiles(ctx, location, execution) {
+  const policy = ctx.sandboxPolicy.resolve({ session: execution.agent?.session });
+  return {
+    canWrite: Boolean(policy && policy.mode !== 'read-only'),
+    read: name => progressDocument(ctx, name, location),
+    async write(document, body) {
+      const activePolicy = writablePolicy(ctx, execution);
+      if (document.version === undefined && typeof document.name === 'string' && document.name.includes('/')) {
+        await checkedOutput(ctx, location, GRAPH_DIR, true);
+      }
+      const intent = document.version === undefined
+        ? { kind: 'createIfAbsent' }
+        : { kind: 'replaceIfVersion', version: document.version };
+      await ctx.fs.writeText(document.target, body, intent, location.signal, activePolicy);
+    },
+  };
+}
+
+async function runGraphTool(ctx, args, execution) {
+  const location = await workspaceLocation(ctx, execution);
+  return manageGraph(args, graphFiles(ctx, location, execution), {
+    defaultOwner: typeof execution.agent?.session?.id === 'string' && execution.agent.session.id !== ''
+      ? execution.agent.session.id : 'agent',
+  });
+}
+
+async function runSandboxTool(ctx, args, execution, config) {
+  const location = await workspaceLocation(ctx, execution);
+  const policy = ctx.sandboxPolicy.resolve({ session: execution.agent?.session });
+  const writable = Boolean(policy && policy.mode !== 'read-only');
+  return runSandbox(args, {
+    cwd: location.cwd,
+    config,
+    signal: execution.signal,
+    writable,
+    async checkWorkspaceFile(rel) {
+      const parts = pathParts(rel);
+      await openWorkspaceFile(ctx, parts, location);
+      return parts.join('/');
+    },
+  });
+}
+
+async function runArenaTool(ctx, args, execution, config, network) {
+  const location = await workspaceLocation(ctx, execution);
+  const policy = ctx.sandboxPolicy.resolve({ session: execution.agent?.session });
+  const writable = Boolean(policy && policy.mode !== 'read-only');
+  const gFiles = graphFiles(ctx, location, execution);
+  const owner = typeof execution.agent?.session?.id === 'string' && execution.agent.session.id !== ''
+    ? execution.agent.session.id : 'commander';
+  return runArena(args, {
+    config,
+    signal: execution.signal,
+    writable,
+    network,
+    authorizeResponse: res => authorizeInstanceTargets(res, network),
+    syncGraphFact: factArgs => manageGraph(factArgs, gFiles, { defaultOwner: owner }),
+    fetchFile: url => runFetchAttachment(ctx, { url }, execution, config, network),
+    submissionFiles: submissionFiles(ctx, location, execution),
+  });
+}
+
 function statusFiles(ctx, location, execution, config) {
   return {
     read: name => progressDocument(ctx, name, location),
@@ -592,22 +792,6 @@ function boardSummary(body, teamId) {
   return boardScalars(root?.me ?? root?.self ?? root?.team ?? root);
 }
 
-function statusWarnings(entries) {
-  const warnings = [];
-  const add = (code, severity, message, action, thresholdMinutes) =>
-    warnings.push({ code, severity, message, action, ...(thresholdMinutes === undefined ? {} : { threshold_minutes: thresholdMinutes }) });
-  const last = entries[entries.length - 1];
-  if (last) {
-    const minutes = Math.max(0, Math.round((Date.now() - Date.parse(last.at)) / 60000));
-    if (minutes >= 60) add('timebox_60', 'urgent', '距上一条状态已 ' + minutes + ' 分钟：整理卡点并升级求助，给出三条候选路径和排除证据。', '升级求助并比较三条路径。', 60);
-    else if (minutes >= 30) add('timebox_30', 'warning', '距上一条状态已 ' + minutes + ' 分钟：列出三条候选路径，写清各自的验证代价。', '列出三条候选路径并选择验证成本最低的一条。', 30);
-    else if (minutes >= 15) add('timebox_15', 'info', '距上一条状态已 ' + minutes + ' 分钟：没有新假设就换方向，先排除一条已走路径。', '核对新假设或排除一条已走路径。', 15);
-  }
-  if (last && !last.next_step) add('next_step_missing', 'warning', '本条状态没有写 next_step：补一条具体可执行的下一步。', '保存一个可执行的下一步。');
-  if (entries.length < 2) add('status_records_low', 'info', '本题状态记录不足 2 条，收尾前至少再记录一次。', '收尾前补一条状态记录。');
-  return warnings;
-}
-
 function warningMessages(warnings) {
   return warnings.map(warning => warning.message);
 }
@@ -617,12 +801,11 @@ async function runStatus(ctx, args, execution, config) {
   const files = statusFiles(ctx, location, execution, config);
   const history = await readStatusHistory(files);
   const { entries, recovered } = history;
-  const last = entries[entries.length - 1];
-  const elapsed = entries.length ? Math.max(0, Math.round((Date.now() - Date.parse(entries[0].at)) / 60000)) : 0;
   if (args.action === 'show') {
-    const warnings = statusWarnings(entries);
+    const summary = summarizeStatus(entries);
+    const warnings = [...summary.warnings];
     if (recovered) warnings.push({ code: 'status_recovered', severity: 'warning', message: '主状态文件不可读，当前结果从恢复副本载入。' });
-    return { status: 'status', file: STATUS_FILE, records: entries.length, elapsed_minutes: elapsed, last,
+    return { status: 'status', file: STATUS_FILE, records: summary.records, elapsed_minutes: summary.elapsed_minutes, last: summary.last,
       warnings, warning_messages: warningMessages(warnings) };
   }
   if (args.action === 'board') {
@@ -649,9 +832,10 @@ async function runStatus(ctx, args, execution, config) {
   const ruledOut = args.ruled_out === undefined ? [] : args.ruled_out.map(item => statusLine(item, 'ruled_out', 200)).filter(Boolean);
   await checkedOutput(ctx, location, '.ctf', true);
   const saved = await appendStatus(files, { phase, stuck, ruled_out: ruledOut, next_step: nextStep, need });
-  const warnings = statusWarnings(saved.entries);
+  const summary = summarizeStatus(saved.entries);
+  const warnings = [...summary.warnings];
   if (saved.recovered) warnings.push({ code: 'status_recovered', severity: 'warning', message: '主状态文件不可读，已在恢复副本基础上追加记录。' });
-  return { status: 'recorded', file: STATUS_FILE, records: saved.entries.length, elapsed_minutes: elapsed,
+  return { status: 'recorded', file: STATUS_FILE, records: summary.records, elapsed_minutes: summary.elapsed_minutes,
     entry: saved.entry, warnings, warning_messages: warningMessages(warnings), ...(saved.warning ? { warning: saved.warning } : {}) };
 }
 
@@ -682,7 +866,7 @@ function submissionFiles(ctx, location, execution) {
     },
     async write(document, receipts) {
       const policy = ctx.sandboxPolicy.resolve({ session: execution.agent?.session });
-      if (policy?.mode === 'read-only') throw new Error('当前会话为只读权限，无法记录正式提交。');
+      if (policy?.mode === 'read-only') throw new ToolError('permission', '当前会话为只读权限，无法记录正式提交。');
       const body = receipts.map(entry => JSON.stringify(receiptForStorage(entry))).join('\n') + '\n';
       if (Buffer.byteLength(body) > MAX_ATTACHMENT_BYTES) throw new Error('提交回执超过文件大小上限。');
       const intent = document.version === undefined ? { kind: 'createIfAbsent' }
@@ -703,7 +887,6 @@ const PYTHON_MODULES = {
   fpylll: 'pip install fpylll',
   Crypto: 'pip install pycryptodome',
   sympy: 'pip install sympy',
-  libarchive: 'pip install libarchive-c',
   capstone: 'pip install capstone',
   fitz: 'pip install pymupdf',
   PIL: 'pip install pillow',
@@ -711,12 +894,29 @@ const PYTHON_MODULES = {
   numpy: 'pip install numpy',
 };
 
-function pythonModuleState(pythonPath, signal) {
+function pythonModuleState(pythonPath, libarchivePath, signal) {
   const names = JSON.stringify(Object.keys(PYTHON_MODULES));
-  const script = 'import importlib.util, json, sys\n'
+  const libPath = JSON.stringify(libarchivePath ?? '');
+  const script = 'import ctypes as c, importlib.util, json, sys\n'
     + `names = ${names}\n`
-    + 'print(json.dumps({"version": "%d.%d" % sys.version_info[:2], "modules": {name: importlib.util.find_spec(name) is not None for name in names}}))\n';
-  return new Promise(resolve => execFile(pythonPath, ['-I', '-B', '-c', script], {
+    + `lib_path = ${libPath}\n`
+    + 'def has_libarchive(path):\n'
+    + '  try:\n'
+    + '    if sys.platform == "win32":\n'
+    + '      c.CDLL(path, winmode=0x1100) if path else c.CDLL("archiveint.dll", winmode=0x800)\n'
+    + '      return True\n'
+    + '    candidates = [path] if path else (["/usr/lib/libarchive.2.dylib", "/usr/lib/libarchive.dylib"] if sys.platform == "darwin" else ["libarchive.so.13", "libarchive.so"])\n'
+    + '    for candidate in candidates:\n'
+    + '      try:\n'
+    + '        c.CDLL(candidate)\n'
+    + '        return True\n'
+    + '      except OSError:\n'
+    + '        continue\n'
+    + '    return False\n'
+    + '  except (OSError, TypeError):\n'
+    + '    return False\n'
+    + 'print(json.dumps({"version": "%d.%d" % sys.version_info[:2], "modules": {name: importlib.util.find_spec(name) is not None for name in names}, "libarchive": has_libarchive(lib_path)}))\n';
+  return new Promise(resolve => execFile(pythonPath, ['-E', '-P', '-B', '-c', script], {
     encoding: 'utf8', cwd: dirname(pythonPath), timeout: 3500, maxBuffer: 8192, windowsHide: true, signal,
   }, (error, stdout) => {
     if (!error) {
@@ -726,7 +926,43 @@ function pythonModuleState(pythonPath, signal) {
   }));
 }
 
-async function runDoctor(ctx, execution, config, workbench) {
+const BUNDLED_SKILL_URL = new URL('./SKILL.md', import.meta.url);
+
+function normalizedTextHash(text) {
+  return createHash('sha256').update(String(text).replace(/\r\n/gu, '\n'), 'utf8').digest('hex');
+}
+
+async function checkSkillSync(cwd) {
+  let bundledHash;
+  try {
+    bundledHash = normalizedTextHash(await readFile(BUNDLED_SKILL_URL, 'utf8'));
+  } catch {
+    return { ok: false, detail: '无法读取包内 SKILL.md。' };
+  }
+  const workspaceSkill = join(cwd, '.dsh', 'skills', 'ctf', 'SKILL.md');
+  const globalSkill = join(dshHome(), 'skills', 'ctf', 'SKILL.md');
+  for (const [scope, candidate] of [['工作区', workspaceSkill], ['全局', globalSkill]]) {
+    let text;
+    try {
+      text = await readFile(candidate, 'utf8');
+    } catch {
+      continue;
+    }
+    if (normalizedTextHash(text) === bundledHash) {
+      return { ok: true, detail: `已同步（${scope}：${candidate}）` };
+    }
+    return {
+      ok: false,
+      detail: `${scope} SKILL.md 与包内版本不一致（${candidate}）；请重新复制包内 SKILL.md 覆盖。`,
+    };
+  }
+  return {
+    ok: false,
+    detail: `未检测到已安装的 CTF 技能文件（${globalSkill} 或工作区 .dsh/skills/ctf/SKILL.md）；请复制包内 SKILL.md。`,
+  };
+}
+
+async function runDoctor(ctx, execution, config, workbench, registeredToolTier) {
   const location = await workspaceLocation(ctx, execution);
   const checks = [];
   const add = (check, ok, detail, required = true) => checks.push({ name: check, ok, detail, required });
@@ -745,6 +981,14 @@ async function runDoctor(ctx, execution, config, workbench) {
     hostCapabilities.system_prompt_context ? '已注入续接提示。' : '不可用；改由包内 SKILL.md 提供相同规则。', false);
   const issue = workbench.configurationIssue();
   add('workbench_config', issue === undefined, issue ?? '已载入适用的 CTF 配置。', false);
+  const configuredToolTier = config?.enableExtendedAudit === true ? 'full' : 'core';
+  const activeToolTier = registeredToolTier ?? configuredToolTier;
+  const tierSynced = activeToolTier === configuredToolTier;
+  add('tool_tier_sync', tierSynced, tierSynced
+    ? `已同步（${activeToolTier}，${activeToolTier === 'full' ? 45 : 27} 个工具）`
+    : `配置 enableExtendedAudit 为 ${configuredToolTier}，但当前进程已注册为 ${activeToolTier}；重启或重载 DSH 后生效。`, false);
+  const skillState = await checkSkillSync(location.cwd);
+  add('skill_sync', skillState.ok, skillState.detail, false);
   const deadline = AbortSignal.timeout(8500);
   const probeSignal = location.signal ? AbortSignal.any([deadline, location.signal]) : deadline;
   let python;
@@ -753,7 +997,11 @@ async function runDoctor(ctx, execution, config, workbench) {
   catch (error) { pythonIssue = deadline.aborted ? 'Python 探测超时。' : error.message; }
   location.signal?.throwIfAborted();
   add('python', python !== undefined, python ?? pythonIssue, false);
-  const state = python ? await pythonModuleState(python, probeSignal) : undefined;
+  let libarchivePath = '';
+  let libarchiveIssue;
+  try { libarchivePath = workbench.library(); }
+  catch (error) { libarchiveIssue = error.message; }
+  const state = python ? await pythonModuleState(python, libarchiveIssue ? '' : libarchivePath, probeSignal) : undefined;
   location.signal?.throwIfAborted();
   if (state) {
     const [major, minor] = String(state.version ?? '0.0').split('.').map(Number);
@@ -764,20 +1012,65 @@ async function runDoctor(ctx, execution, config, workbench) {
       add('python:' + name, present,
         present ? '已安装' : '未安装：' + PYTHON_MODULES[name] + ' 后可启用对应功能。', false);
     }
+    if (libarchiveIssue) {
+      add('libarchive', false, libarchiveIssue, false);
+    } else {
+      const hasLibarchive = state.libarchive === true;
+      add('libarchive', hasLibarchive,
+        hasLibarchive ? (libarchivePath || '系统原生归档库可用') : '未找到本机 libarchive 动态库：安装系统 libarchive 或在 ctf-workbench.json 配置 libarchivePath。', false);
+    }
   } else if (python) {
     add('python:modules', false, 'Python 模块探测失败：检查 Python 是否可执行。', false);
+    if (libarchiveIssue) add('libarchive', false, libarchiveIssue, false);
+  } else if (libarchiveIssue) {
+    add('libarchive', false, libarchiveIssue, false);
   }
   const toolNames = ['jadx', 'apktool', 'apksigner', 'john', 'hashcat'];
-  const [gdb, browser, ...paths] = await Promise.all([
-    detectGdb(config), detectBrowser(config), ...toolNames.map(findOnPathAsync),
+  const [gdb, browser, sandbox, ...paths] = await Promise.all([
+    detectGdb(config), detectBrowser(config), detectSandbox(config, probeSignal), ...toolNames.map(findOnPathAsync),
   ]);
+  const baseProfile = sandbox.profiles?.base;
+  const heavyProfile = sandbox.profiles?.heavy;
+  const dockerDaemonDown = !sandbox.docker?.available && !sandbox.docker?.daemon_version;
+  add('sandbox', sandbox.available,
+    sandbox.available ? `${sandbox.backend}:${sandbox.image ?? sandbox.distro}`
+      : `不可用（Docker: ${sandbox.docker.reason}；WSL2: ${sandbox.wsl.reason}）`, false);
+  if (baseProfile?.image) {
+    add('sandbox:docker_base', Boolean(baseProfile.available),
+      baseProfile.available
+        ? `已就绪（${baseProfile.image}）`
+        : dockerDaemonDown
+          ? `未就绪（${sandbox.docker.reason}）`
+          : `未构建（${baseProfile.image}）：可执行 docker build -t ${baseProfile.image} docker/`, false);
+  }
+  if (heavyProfile?.image && heavyProfile.image !== baseProfile?.image) {
+    add('sandbox:docker_heavy', Boolean(heavyProfile.available),
+      heavyProfile.available
+        ? `已就绪（${heavyProfile.image}，自动按需升级）`
+        : dockerDaemonDown
+          ? `未就绪（${sandbox.docker.reason}）`
+          : `未构建（${heavyProfile.image}，可选重器档位）：可执行 docker build -f docker/Dockerfile.heavy -t ${heavyProfile.image} docker/`, false);
+  }
+  const sandboxSummary = {
+    available: sandbox.available,
+    active_backend: sandbox.backend,
+    active_target: sandbox.image ?? sandbox.distro ?? null,
+    docker_base: { image: baseProfile?.image ?? null, available: Boolean(baseProfile?.available) },
+    docker_heavy: { image: heavyProfile?.image ?? null, available: Boolean(heavyProfile?.available) },
+    wsl: { distro: sandbox.wsl?.distro ?? null, available: Boolean(sandbox.wsl?.available) },
+    next_steps: [
+      ...(!baseProfile?.available && baseProfile?.image ? [`docker build -t ${baseProfile.image} docker/`] : []),
+      ...(!heavyProfile?.available && heavyProfile?.image && heavyProfile.image !== baseProfile?.image
+        ? [`docker build -f docker/Dockerfile.heavy -t ${heavyProfile.image} docker/`] : []),
+    ],
+  };
   add('gdb', typeof gdb === 'string' && gdb !== '', gdb ?? '未找到 gdb：只影响本机对应能力。', false);
   add('browser', typeof browser === 'string' && browser !== '', browser ?? '未找到 Chrome/Edge：browser_session 不可用。', false);
   for (const [index, tool] of toolNames.entries()) {
     const found = paths[index];
     add(tool, Boolean(found), found ?? '未安装：对应功能会返回 dependency 提示。', false);
   }
-  for (const [file, label] of [['notes.md', '续接记录'], ['handoff.md', '接替简报'], [STATUS_FILE, '时间盒心跳'], [SUBMISSION_LOG, '提交回执']]) {
+  for (const [file, label] of [['notes.md', '续接记录'], ['handoff.md', '接替简报'], [GRAPH_FILE, '事实意图图谱'], [STATUS_FILE, '时间盒心跳'], [SUBMISSION_LOG, '提交回执']]) {
     let present = false;
     try {
       present = (await ctx.fs.lstat(file, { cwd: location.cwd }, location.signal)) !== undefined;
@@ -789,12 +1082,12 @@ async function runDoctor(ctx, execution, config, workbench) {
   const missing = checks.filter(item => item.required && !item.ok).map(item => item.name);
   const optionalMissing = checks.filter(item => !item.required && !item.ok).map(item => item.name);
   return { status: missing.length ? 'missing' : optionalMissing.length ? 'partial' : 'ok', cwd: location.cwd,
-    host_capabilities: hostCapabilities, checks, missing, optional_missing: optionalMissing };
+    tool_tier: activeToolTier, configured_tool_tier: configuredToolTier, sandbox, sandbox_summary: sandboxSummary, host_capabilities: hostCapabilities, checks, missing, optional_missing: optionalMissing };
 }
 
-async function runCompetitionApi(ctx, args, execution, config) {
+async function runCompetitionApi(ctx, args, execution, config, network) {
   if (args.action === 'submit') return runSubmitFlag(ctx, args, execution, config);
-  return runInstance(ctx, { ...args, action: args.action === 'instances' ? 'list' : args.action }, execution, config);
+  return runInstance(ctx, { ...args, action: args.action === 'instances' ? 'list' : args.action }, execution, config, network);
 }
 
 function platformOperationSucceeded(response) {
@@ -860,7 +1153,95 @@ async function recordInstance(ctx, location, execution, platform, id, state) {
   return false;
 }
 
-async function runInstance(ctx, args, execution, config) {
+const INSTANCE_TCP_KEYS = new Set(['addr', 'address', 'connect', 'nc', 'tcp', 'endpoint', 'target', 'entry', 'access', 'connection', 'host_port']);
+
+function validPortNumber(value) {
+  const port = typeof value === 'string' && /^\d{1,5}$/u.test(value.trim()) ? Number(value.trim()) : value;
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : undefined;
+}
+
+export function extractInstanceTargets(response) {
+  const httpTargets = [];
+  const tcpTargets = [];
+  if (typeof response?.body !== 'string' || response.body.trim() === '') return { http: httpTargets, tcp: tcpTargets };
+  let parsed;
+  try { parsed = JSON.parse(response.body); }
+  catch { return { http: httpTargets, tcp: tcpTargets }; }
+  let visited = 0;
+  function inspectString(value, key) {
+    const text = value.trim();
+    if (!text || text.length > 512) return;
+    if (/^https?:\/\//iu.test(text)) {
+      httpTargets.push(text);
+      return;
+    }
+    if (!INSTANCE_TCP_KEYS.has(key)) return;
+    const nc = /^(?:nc|ncat|netcat)\s+(?:-[A-Za-z0-9]+\s+)*(\[[^\]]+\]|[^\s:]+)\s+(\d{1,5})(?:\s|$)/iu.exec(text);
+    if (nc) {
+      const port = validPortNumber(nc[2]);
+      if (port !== undefined) tcpTargets.push({ host: nc[1], port });
+      return;
+    }
+    const hostPort = /^(\[[^\]]+\]|[A-Za-z0-9.-]+):(\d{1,5})$/u.exec(text);
+    if (hostPort) {
+      const port = validPortNumber(hostPort[2]);
+      if (port !== undefined) tcpTargets.push({ host: hostPort[1], port });
+    }
+  }
+  function walk(node, depth, key = '') {
+    if (depth > 5 || visited >= 128 || node === null || node === undefined) return;
+    visited += 1;
+    if (typeof node === 'string') {
+      inspectString(node, key);
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node.slice(0, 32)) walk(item, depth + 1, key);
+      return;
+    }
+    if (typeof node !== 'object') return;
+    const rawHost = node.host ?? node.ip ?? node.hostname;
+    if (typeof rawHost === 'string' && rawHost.trim() && !/[\s/\\:?#]/u.test(rawHost.trim())) {
+      const host = rawHost.trim();
+      const proto = typeof (node.protocol ?? node.scheme) === 'string' ? String(node.protocol ?? node.scheme).trim().toLowerCase() : '';
+      const singlePort = validPortNumber(node.port);
+      const portEntries = [];
+      if (singlePort !== undefined) portEntries.push({ port: singlePort, proto });
+      if (Array.isArray(node.ports)) {
+        for (const item of node.ports.slice(0, 16)) {
+          const numeric = validPortNumber(item);
+          if (numeric !== undefined) portEntries.push({ port: numeric, proto });
+          else if (item && typeof item === 'object') {
+            const p = validPortNumber(item.port ?? item.external ?? item.host_port ?? item.public_port);
+            const itemProto = typeof (item.protocol ?? item.scheme) === 'string' ? String(item.protocol ?? item.scheme).trim().toLowerCase() : proto;
+            if (p !== undefined) portEntries.push({ port: p, proto: itemProto });
+          }
+        }
+      }
+      for (const entry of portEntries) {
+        tcpTargets.push({ host, port: entry.port });
+        if (entry.proto === 'http' || entry.proto === 'https') {
+          httpTargets.push(`${entry.proto}://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${entry.port}`);
+        }
+      }
+    }
+    for (const [childKey, childValue] of Object.entries(node)) {
+      walk(childValue, depth + 1, childKey.toLowerCase());
+    }
+  }
+  walk(parsed, 0);
+  return { http: httpTargets, tcp: tcpTargets };
+}
+
+function authorizeInstanceTargets(response, network) {
+  if (!network) return undefined;
+  const extracted = extractInstanceTargets(response);
+  const http = [...new Set(extracted.http.map(url => network.grantHttp(url)).filter(Boolean))];
+  const tcp = [...new Set(extracted.tcp.map(({ host, port }) => network.grantTcp(host, port)).filter(Boolean))];
+  return http.length || tcp.length ? { http, tcp } : undefined;
+}
+
+async function runInstance(ctx, args, execution, config, network) {
   const location = await workspaceLocation(ctx, execution);
   const base = platformBase(config);
   const { tokenEnv, token } = platformCredential(config);
@@ -872,14 +1253,18 @@ async function runInstance(ctx, args, execution, config) {
   const call = (method, route, body) => platformRequest(config, execution.signal, method, route, body);
   if (args.action === 'list') {
     const request = await call('GET', path);
-    return { status: platformOperationSucceeded(request) ? 'instances' : 'failed', request };
+    const ok = platformOperationSucceeded(request);
+    const authorized = ok ? authorizeInstanceTargets(request, network) : undefined;
+    return { status: ok ? 'instances' : 'failed', request, ...(authorized ? { authorized_targets: authorized } : {}) };
   }
   writablePolicy(ctx, execution);
   if (args.action === 'create') {
     const request = await call('POST', path, args.body ?? {});
     if (!platformOperationSucceeded(request)) return { status: 'failed', request };
     const id = createdInstance(request);
-    return { status: 'created', request, id, instance_recorded: await recordInstance(ctx, location, execution, base, id, 'created') };
+    const authorized = authorizeInstanceTargets(request, network);
+    return { status: 'created', request, id, instance_recorded: await recordInstance(ctx, location, execution, base, id, 'created'),
+      ...(authorized ? { authorized_targets: authorized } : {}) };
   }
   if (!['rotate', 'delete'].includes(args.action)) throw new Error('未知的实例操作。');
   const id = typeof args.id === 'string' ? args.id.trim() : '';
@@ -905,8 +1290,9 @@ async function runInstance(ctx, args, execution, config) {
       if (!newId || newId === id) {
         return { status: 'unconfirmed', step: 'create', id, old_preserved: true, created, reason: '平台未返回一个可确认的新实例标识。' };
       }
+      const authorized = authorizeInstanceTargets(created, network);
       const recorded = await recordInstance(ctx, location, execution, base, newId, 'created');
-      replacement = { new_id: newId, created, instance_recorded: recorded };
+      replacement = { new_id: newId, created, instance_recorded: recorded, ...(authorized ? { authorized_targets: authorized } : {}) };
       if (!recorded) return { status: 'partial', step: 'record', id, old_preserved: true, ...replacement };
     }
     let deleted;
@@ -947,7 +1333,7 @@ function detectAttachmentType(name, bytes) {
   return 'unknown';
 }
 
-async function runFetchAttachment(ctx, args, execution) {
+async function runFetchAttachment(ctx, args, execution, config, network) {
   const url = webUrl(args.url);
   const location = await workspaceLocation(ctx, execution);
   let fallback = url.pathname.split('/').filter(Boolean).at(-1) ?? 'attachment';
@@ -956,8 +1342,23 @@ async function runFetchAttachment(ctx, args, execution) {
   const expected = parseExpectedHash(args.sha256);
   const limit = args.max_bytes ?? MAX_ATTACHMENT_BYTES;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_TRANSFER_BYTES) throw new Error('max_bytes 须在 1 字节至 256 MiB 内。');
+  let platformOrigin;
+  const base = platformBase(config);
+  if (base) {
+    try { platformOrigin = webUrl(base).origin; } catch { /* invalid platformUrl grants nothing */ }
+  }
+  const authorizeHop = (hopUrl, signal) => {
+    const trusted = (platformOrigin !== undefined && hopUrl.origin === platformOrigin)
+      || Boolean(network?.isHttpAuthorized(hopUrl));
+    return pinAddress(hopUrl.hostname, { publicOnly: !trusted, signal });
+  };
+  const headersFor = hopUrl => {
+    if (platformOrigin === undefined || hopUrl.origin !== platformOrigin) return {};
+    if (hopUrl.protocol !== 'https:' && config?.allowInsecurePlatformHttp !== true) return {};
+    return platformAuthHeaders(config);
+  };
   const result = await storeAttachment(ctx, location, execution, wanted, { source_url: provenanceUrl(url) }, async temp => {
-    const received = await downloadAttachment(url, temp, { signal: location.signal, limit });
+    const received = await downloadAttachment(url, temp, { signal: location.signal, limit, authorizeHop, headersFor });
     checkAttachmentHash(expected, received.sha256);
     return received;
   });
@@ -1082,6 +1483,9 @@ function parseEvidenceSources(args, resolveResult) {
 
 function resultSources(tool, output, workspace) {
   if (!workspace) return [];
+  if (tool === 'calculate_offline') {
+    return [...new Map(output.input_evidence.map(item => [JSON.stringify(item.source), item.source])).values()];
+  }
   if (tool === 'read_ctf_files') return output.sources.length ? output.sources : undefined;
   if (['trace_flask_route', 'verify_flask_response', 'query_rev_export', 'map_rev_address',
     'verify_rev_machine', 'compare_rev_trace'].includes(tool)) return output.sources;
@@ -1093,12 +1497,48 @@ function resultSources(tool, output, workspace) {
       ...(source.status === 'observed' ? { line: source.line, byte_offset: source.byte_offset, byte_length: source.byte_length || undefined } : {}),
     }));
   }
-  if (typeof output.sha256 !== 'string' || !RESULT_HASH.test(output.sha256)) return undefined;
+  if (typeof output.sha256 !== 'string' || !RESULT_HASH.test(output.sha256)) {
+    return tool === 'scan_binary' ? [] : undefined;
+  }
   return [{
     file_path: pathParts(output.file).join('/'), sha256: output.sha256,
     ...(['read_log_range', 'read_binary_range'].includes(tool)
       ? { byte_offset: output.byte_offset, byte_length: output.byte_length || undefined } : {}),
   }];
+}
+
+function parseZipRange(args, size) {
+  const { archive_offset: offset, archive_length: length } = args;
+  if (offset === undefined && length === undefined) return undefined;
+  if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 1) {
+    throw new ToolError('unsupported', 'ZIP 区间须同时提供非负安全整数 archive_offset 和正安全整数 archive_length。');
+  }
+  if (length > size - offset) throw new ToolError('size', '指定的 ZIP 区间超出了原件大小。');
+  return { byte_offset: offset, byte_length: length };
+}
+
+async function inspectSelectedZip(ctx, inspectRanges, file, { signal, expectedHash, range }, inspect) {
+  if (typeof ctx.fs.readByteRange !== 'function') throw new ToolError('dependency', '当前 DSH 文件服务不支持 ZIP 区间读取。');
+  const { byte_offset: start, byte_length: size } = range;
+  return inspectRanges(file, signal, expectedHash, async reader => {
+    const report = await inspect({
+      size,
+      read(offset, length) {
+        checkRange(size, offset, length, 'ZIP 区间读取');
+        return reader.read(start + offset, length);
+      },
+    });
+    if (report === undefined) {
+      throw new ToolError('unsupported', '所选区间内没有可验证的 ZIP。请核对起点和长度。');
+    }
+    // Directory indexes use offsets in their own view. Only cache the whole-file index.
+    return { report: {
+      ...report,
+      archive_range: range,
+      ...(report.archive_offset === undefined ? {} : { archive_offset: start + report.archive_offset }),
+      ...(report.trailing_offset === undefined ? {} : { trailing_offset: start + report.trailing_offset }),
+    } };
+  });
 }
 
 function describeArchiveMember(member, memberIndex, window) {
@@ -1107,6 +1547,7 @@ function describeArchiveMember(member, memberIndex, window) {
   const chunk = member.chunk ?? bytes.subarray(window.offset, window.offset + length);
   return {
     format, variant, member_index: memberIndex, member_name: name, member_size: size,
+    ...(member.pageOnly ? { result_scope: 'page' } : {}),
     ...(member.name_encoding === undefined ? {} : { name_encoding: member.name_encoding }),
     ...(member.name_truncated ? { name_truncated: true } : {}),
     ...(member.encryption_flag_only ? { encryption_flag_only: true } : {}),
@@ -1115,14 +1556,48 @@ function describeArchiveMember(member, memberIndex, window) {
   };
 }
 
-async function readArchiveMember(ctx, args, location, inspectRanges, workbench) {
+function archiveFormatHint(format) {
+  if (format === 'ZIP') return 'zip';
+  if (format === 'zlib' || format === 'TAR.ZLIB') return 'zlib';
+  if (format === 'deflate_raw' || format === 'TAR.DEFLATE') return 'deflate_raw';
+  return undefined;
+}
+
+async function inspectAttachmentWithCompression(bytes, paging, pcapngQuery, formatHint, signal, workbench) {
+  const format = pcapngQuery === undefined && formatHint === undefined ? compressedStreamFormat(bytes) : undefined;
+  if (format === undefined) return inspectAttachment(bytes, paging, pcapngQuery, formatHint);
+  const decompressed = await decompressCompressedStream(bytes, format, signal, workbench);
+  if (decompressed.status !== 'ok') return { format, ...decompressed };
+  return inspectDecompressedStream(decompressed.bytes, paging, format);
+}
+
+async function readArchiveMember(ctx, args, location, inspectRanges, workbench, full = false) {
   const memberIndex = args.member_index;
   if (!Number.isSafeInteger(memberIndex) || memberIndex < 0) throw new Error('member_index 须是非负整数。');
-  const window = parseByteWindow(args, 'auto', 1024);
+  const window = full ? { offset: 0, length: MAX_ARCHIVE_MEMBER_BYTES, encoding: 'base64' } : parseByteWindow(args, 'auto', 1024);
   const expectedHash = parseExpectedHash(args.expected_sha256);
   const zipHint = args.format_hint === 'zip';
-  if (args.format_hint !== undefined && !zipHint) throw new Error('format_hint 目前支持 zip。');
+  const compressionHint = ['zlib', 'deflate_raw'].includes(args.format_hint) ? args.format_hint : undefined;
+  if (compressionHint !== undefined && (args.archive_offset !== undefined || args.archive_length !== undefined
+    || args.password !== undefined)) {
+    throw new ToolError('unsupported', '压缩流格式提示不能与 ZIP 区间或 ZIP 口令合用。');
+  }
   const file = await openWorkspaceFile(ctx, pathParts(args.file_path), location);
+  const range = parseZipRange(args, file.size);
+  const zipOptions = { window: full ? undefined : window, signal: location.signal };
+  if (range !== undefined) {
+    const { signal } = location;
+    return inspectSelectedZip(ctx, inspectRanges, file, { signal, expectedHash, range }, async reader => {
+      if (args.password !== undefined && reader.size > MAX_ATTACHMENT_BYTES) {
+        throw new ToolError('size', '使用已知口令时，所选 ZIP 区间最多 32 MiB。');
+      }
+      const member = args.password === undefined
+        ? await readZipMember(reader, memberIndex, undefined, true, zipOptions)
+        : await readZipWithKnownPassword(await reader.read(0, reader.size), memberIndex, args.password, workbench, signal);
+      if (member === undefined || member.status === 'dependency_missing') return member;
+      return describeArchiveMember(member, memberIndex, window);
+    });
+  }
   if (args.password !== undefined) {
     const bytes = await readOpenedFile(ctx, file, location.signal);
     const sha256 = createHash('sha256').update(bytes).digest('hex');
@@ -1132,9 +1607,9 @@ async function readArchiveMember(ctx, args, location, inspectRanges, workbench) 
     if (member.status === 'dependency_missing') return { ...member, size: file.size, sha256 };
     return { ...describeArchiveMember(member, memberIndex, window), size: file.size, sha256 };
   }
-  if (typeof ctx.fs.readByteRange === 'function') {
+  if (compressionHint === undefined && typeof ctx.fs.readByteRange === 'function') {
     const zip = await inspectRanges(file, location.signal, expectedHash, async (reader, index) => {
-      const member = await readZipMember(reader, memberIndex, index, zipHint);
+      const member = await readZipMember(reader, memberIndex, index, zipHint, zipOptions);
       return member && { report: describeArchiveMember(member, memberIndex, window), zipIndex: member.zipIndex };
     });
     if (zip !== undefined) return zip;
@@ -1143,19 +1618,144 @@ async function readArchiveMember(ctx, args, location, inspectRanges, workbench) 
   const bytes = await readOpenedFile(ctx, file, location.signal);
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   checkAttachmentHash(expectedHash, sha256);
-  const native = zipHint ? undefined : nativeArchiveFormat(bytes);
+  const compressedFormat = compressionHint === undefined && !zipHint ? compressedStreamFormat(bytes) : undefined;
+  if (compressedFormat !== undefined) {
+    const decompressed = await decompressCompressedStream(bytes, compressedFormat, location.signal, workbench);
+    if (decompressed.status !== 'ok') {
+      await requireCurrentFile(ctx.fs, file, location.signal);
+      return { format: compressedFormat, ...decompressed, member_index: memberIndex, size: bytes.length, sha256 };
+    }
+    const member = await readDecompressedStreamMember(decompressed.bytes, memberIndex, location.signal, compressedFormat);
+    if (member === undefined) throw new Error('压缩流内容不是可读取的 TAR 或单文件成员。');
+    await requireCurrentFile(ctx.fs, file, location.signal);
+    return { ...describeArchiveMember(member, memberIndex, window), size: bytes.length, sha256 };
+  }
+  const native = zipHint || compressionHint !== undefined ? undefined : nativeArchiveFormat(bytes);
   const member = native
     ? await readNativeArchiveMember(bytes, native, memberIndex, window, location.signal, workbench)
-    : (zipHint ? undefined : await readTarOrGzipMember(bytes, memberIndex, location.signal))
+    : (zipHint ? undefined : await readTarOrCompressedMember(bytes, memberIndex, location.signal, compressionHint))
       ?? await readZipMember({ size: bytes.length, read: (offset, length) => bytes.subarray(offset, offset + length) },
-        memberIndex, undefined, zipHint);
-  if (member === undefined) throw new Error('可读取 ZIP/ZIP64、TAR、TAR.GZ、gzip、7z 和 RAR 的普通文件成员。');
+        memberIndex, undefined, zipHint, zipOptions);
+  if (member === undefined) throw new Error('可读取 ZIP/ZIP64、TAR、TAR.GZ、gzip、zlib、bzip2、xz、指定格式的 raw Deflate、7z 和 RAR 的普通文件成员。');
   await requireCurrentFile(ctx.fs, file, location.signal);
   if (member.status === 'dependency_missing') return { ...member, member_index: memberIndex, size: bytes.length, sha256 };
   return { ...describeArchiveMember(member, memberIndex, window), size: bytes.length, sha256 };
 }
 
-function compactJson(value, config) {
+async function recoverCalculationInput(ctx, result, location, inspectRanges, workbench) {
+  const get = field => cachedResultValue(result, field);
+  const fileName = get('/file');
+  const fileHash = get('/sha256');
+  if (typeof fileName !== 'string' || typeof fileHash !== 'string' || !RESULT_HASH.test(fileHash)) {
+    throw new ToolError('conflict', '该结果缺少可复核的原件引用。请带原件 SHA-256 重新读取。');
+  }
+  const source = { file_path: pathParts(fileName).join('/'), sha256: fileHash };
+  if (!result.sources.some(reference => reference.file_path === source.file_path && reference.sha256 === fileHash)) {
+    throw new ToolError('conflict', '结果的原件路径或 SHA-256 与记录不一致。');
+  }
+  if (result.tool === 'read_binary_range') {
+    const offset = get('/byte_offset');
+    const length = get('/byte_length');
+    const rangeHash = get('/range_sha256');
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0 || length > MAX_WINDOW_BYTES
+      || typeof rangeHash !== 'string' || !RESULT_HASH.test(rangeHash)) {
+      throw new ToolError('unsupported', '该结果没有完整的原件字节范围。');
+    }
+    if (typeof ctx.fs.readByteRange !== 'function') throw new ToolError('dependency', '当前文件服务不支持分段复读。');
+    const file = await openWorkspaceFile(ctx, pathParts(fileName), location);
+    const { bytes } = await inspectRanges(file, location.signal, fileHash, async reader => {
+      checkRange(reader.size, offset, length, '计算输入');
+      const bytes = await reader.read(offset, length);
+      if (createHash('sha256').update(bytes).digest('hex') !== rangeHash) {
+        throw new ToolError('conflict', '片段字节与记录的 SHA-256 不同。');
+      }
+      return { report: { bytes } };
+    });
+    return { bytes, source: { ...source, byte_offset: offset, ...(length === 0 ? {} : { byte_length: length }) }, data_sha256: rangeHash };
+  }
+
+  const memberIndex = get('/member_index');
+  const memberHash = get('/member_sha256');
+  const memberSize = get('/member_size');
+  const pageOnly = get('/result_scope') === 'page';
+  if (!Number.isSafeInteger(memberIndex) || memberIndex < 0 || !Number.isSafeInteger(memberSize)
+    || memberSize < 0 || typeof memberHash !== 'string' || !RESULT_HASH.test(memberHash)) {
+    throw new ToolError('unsupported', '该结果缺少成员编号、完整大小或成员哈希。');
+  }
+  if (!pageOnly && memberSize > MAX_ARCHIVE_MEMBER_BYTES) {
+    throw new ToolError('size', '请重新读取该大成员的所需页，再引用对应的结果编号。');
+  }
+  const offset = pageOnly ? get('/byte_offset') : 0;
+  const length = pageOnly ? get('/byte_length') : memberSize;
+  const dataHash = pageOnly ? get('/range_sha256') : memberHash;
+  if (pageOnly && (!Number.isSafeInteger(offset) || offset < 0 || offset > memberSize
+    || !Number.isSafeInteger(length) || length < 0 || length > Math.min(MAX_WINDOW_BYTES, memberSize - offset)
+    || !RESULT_HASH.test(dataHash ?? ''))) {
+    throw new ToolError('unsupported', '该结果缺少可复核的成员页坐标或 SHA-256。');
+  }
+  const archiveOffset = get('/archive_range/byte_offset');
+  const archiveLength = get('/archive_range/byte_length');
+  const member = await readArchiveMember(ctx, {
+    file_path: fileName, expected_sha256: fileHash, member_index: memberIndex,
+    ...(pageOnly ? { byte_offset: offset, byte_length: Math.max(1, length), encoding: 'base64' } : {}),
+    ...(archiveFormatHint(get('/format')) === undefined ? {} : { format_hint: archiveFormatHint(get('/format')) }),
+    ...(archiveOffset === undefined && archiveLength === undefined ? {} : { archive_offset: archiveOffset, archive_length: archiveLength }),
+  }, location, inspectRanges, workbench, !pageOnly);
+  if (member.status === 'dependency_missing') throw new ToolError('dependency', member.reason);
+  const bytes = Buffer.from(member.data, 'base64');
+  if (member.member_size !== memberSize || member.member_sha256 !== memberHash || bytes.length !== length
+    || createHash('sha256').update(bytes).digest('hex') !== dataHash) {
+    throw new ToolError('conflict', '当前解压得到的成员或页与记录不一致。');
+  }
+  return { bytes, source, data_sha256: dataHash, member_index: memberIndex, member_sha256: memberHash,
+    ...(pageOnly ? { member_page: { byte_offset: offset, byte_length: length } } : {}),
+    ...(member.archive_range === undefined ? {} : { archive_range: member.archive_range }) };
+}
+
+async function runReferencedCalculation(ctx, args, execution, location, results, inspectRanges, workbench, calculation) {
+  const references = validateSteps(args.steps);
+  const origin = new Map();
+  const resolved = [];
+  const inputEvidence = [];
+  let saved;
+  let inputBytes = 0;
+  for (const reference of references) {
+    const { result_id: id, encoding = 'utf8', step, input } = reference;
+    let data = origin.get(id);
+    if (data === undefined) {
+      let result = results.get(execution.agent?.session, location.directoryKey, id);
+      if (result === undefined) {
+        saved ??= await recordedResults(ctx, location);
+        result = saved.get(id);
+      }
+      if (result === undefined || !['read_binary_range', 'read_archive_member'].includes(result.tool)) {
+        throw new ToolError('unsupported', '引用须来自本题目录的分段读取或归档成员结果。');
+      }
+      data = await recoverCalculationInput(ctx, result, location, inspectRanges, workbench);
+      origin.set(id, data);
+    }
+    const { bytes, ...proof } = data;
+    inputBytes += bytes.length;
+    if (inputBytes > 2 * MAX_ARCHIVE_MEMBER_BYTES) throw new ToolError('size', '每批引用的原始数据合计最多 2 MiB。');
+    const value = bytes.toString(encoding);
+    if (encoding === 'utf8' && !Buffer.from(value, 'utf8').equals(bytes)) {
+      throw new ToolError('encoding', '引用的字节不是完整 UTF-8，请选择 hex 或 base64。');
+    }
+    resolved.push(value);
+    inputEvidence.push({ step, input_index: input, result_id: id, encoding, data_bytes: bytes.length, ...proof });
+  }
+  const report = await calculation.run(args.steps, location.signal, resolved, {
+    candidates: args.candidates, resumeId: args.resume_id, session: execution.agent?.session, directoryKey: location.directoryKey,
+  });
+  return { ...report, input_evidence: inputEvidence };
+}
+
+function resolveConfig(configSource) {
+  return typeof configSource === 'function' ? configSource() : configSource;
+}
+
+function compactJson(value, configSource) {
+  const config = resolveConfig(configSource);
   return JSON.stringify(value, null, config?.compact === false ? 2 : 0);
 }
 
@@ -1172,20 +1772,28 @@ function registerTool(ctx, toolName, description, properties, run, required = ['
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
     async execute(args, execution) {
       const askedFile = typeof args?.file_path === 'string' ? args.file_path : undefined;
+      const binding = typeof capture === 'function' ? capture(args) : capture;
       try {
         if (!objectWithKeys(args, Object.keys(properties))) throw new ToolError('unsupported', '提供了此工具不支持的参数。');
-        const location = capture?.workspace ? await workspaceLocation(ctx, execution) : undefined;
+        const location = binding?.workspace ? await workspaceLocation(ctx, execution) : undefined;
         let prepared = args;
         let imported;
-        if (location !== undefined) ({ args: prepared, imported } = await rewriteInputPaths(ctx, args, location, execution, capture.config));
+        if (location !== undefined) ({ args: prepared, imported } = await rewriteInputPaths(ctx, args, location, execution, resolveConfig(binding.config)));
         const report = await run(prepared, execution, location);
-        const output = { file: prepared.file_path, ...(imported?.length ? { imported } : {}), ...report };
-        const scope = capture?.workspace ? location.directoryKey : (capture?.scope ?? null);
-        const resultId = capture && scope !== undefined ? capture.results.remember(execution.agent?.session, scope, toolName,
-          output, resultSources(toolName, output, capture.workspace)) : undefined;
-        const outputConfig = capture?.config ?? OUTPUT_CONFIGS.get(ctx);
+        const artifactBytes = Buffer.isBuffer(report?.__artifact_bytes) ? report.__artifact_bytes : undefined;
+        if (artifactBytes !== undefined) delete report.__artifact_bytes;
+        const requestHash = binding?.workspace ? experimentRequestHash(toolName, typeof prepared.file_path === 'string'
+          ? { ...prepared, file_path: pathParts(prepared.file_path).join('/') } : prepared) : undefined;
+        const output = { file: prepared.file_path, ...(imported?.length ? { imported } : {}), ...report,
+          ...(requestHash === undefined ? {} : { request_sha256: requestHash }) };
+        const scope = binding?.workspace ? location.directoryKey : (binding?.scope ?? null);
+        const resultId = binding && scope !== undefined ? binding.results.remember(execution.agent?.session, scope, toolName,
+          output, resultSources(toolName, output, binding.workspace)) : undefined;
+        const outputConfig = binding?.config ?? OUTPUT_CONFIGS.get(ctx);
         if (resultId === undefined) return compactJson(output, outputConfig);
-        const result = capture.workspace ? capture.results.get(execution.agent?.session, scope, resultId) : undefined;
+        if (artifactBytes !== undefined) binding.results.rememberArtifact(execution.agent?.session, resultId, artifactBytes,
+          resultSources(toolName, output, binding.workspace));
+        const result = binding.workspace ? binding.results.get(execution.agent?.session, scope, resultId) : undefined;
         const summary = result?.summary;
         const evidencePersistence = result === undefined ? undefined : await persistResult(ctx, location, execution, resultId, result);
         return compactJson({
@@ -1196,7 +1804,7 @@ function registerTool(ctx, toolName, description, properties, run, required = ['
           }),
         }, outputConfig);
       } catch (error) {
-        return compactJson({ ok: false, file: askedFile, error: describeToolError(error) }, capture?.config ?? OUTPUT_CONFIGS.get(ctx));
+        return compactJson({ ok: false, file: askedFile, error: describeToolError(error) }, binding?.config ?? OUTPUT_CONFIGS.get(ctx));
       }
     },
   });
@@ -1204,16 +1812,32 @@ function registerTool(ctx, toolName, description, properties, run, required = ['
 
 export function apply(ctx, config) {
   const workbench = createWorkbenchEnvironment(config);
-  config = workbench.presetConfig();
-  OUTPUT_CONFIGS.set(ctx, config);
+  const currentConfig = () => workbench.presetConfig();
+  OUTPUT_CONFIGS.set(ctx, currentConfig);
   const inspectRanges = createRangeInspector(ctx.fs);
   const results = createToolResults();
   const calculation = createCalculationRunner();
   ctx.effect(() => () => calculation.dispose(), 'CTF offline calculation workers');
-  const fileResults = { results, workspace: true, config };
+  const fileResults = { results, workspace: true, config: currentConfig };
   const offlineResults = { results, workspace: false, scope: OFFLINE_RESULT_SCOPE };
   const sessionResults = { results, workspace: false };
-  const network = createNetworkBoundary(config);
+  const network = createNetworkBoundary(currentConfig);
+  const cookieJars = new WeakMap();
+  function cookieJarFor(execution, directoryKey, name) {
+    if (name === undefined) return undefined;
+    const session = execution.agent.session;
+    let byWorkspace = cookieJars.get(session);
+    if (byWorkspace === undefined) {
+      byWorkspace = new Map();
+      cookieJars.set(session, byWorkspace);
+    }
+    let store = byWorkspace.get(directoryKey);
+    if (store === undefined) {
+      store = createCookieJarStore();
+      byWorkspace.set(directoryKey, store);
+    }
+    return store.forJar(name);
+  }
   const tcpSessions = new WeakMap();
   const managers = new Set();
   ctx.effect(() => () => {
@@ -1241,17 +1865,20 @@ export function apply(ctx, config) {
     }
     return manager;
   }
-  registerTool(ctx, 'read_ctf_files',
-    '边界：需要一次读取多个已知文本路径或行段时用本工具；单个文件用 read。批量读取题面已经列明的本地文本路径与行段，返回每个片段的文本、原件行号、字节偏移和 SHA-256。',
-    BATCH_TEXT_PROPERTIES,
-    (args, _execution, location) => readCtfFiles(args, {
-      normalizePath: path => pathParts(path).join('/'),
-      read: path => snapshotEvidence(ctx, path, location, MAX_BATCH_FILE_BYTES),
-    }), ['files'], fileResults);
+  const extendedAudit = currentConfig().enableExtendedAudit === true;
+  if (extendedAudit) {
+    registerTool(ctx, 'read_ctf_files',
+      '批量读取多个已知本地文本路径与行段，返回行号、字节偏移与 SHA-256。',
+      BATCH_TEXT_PROPERTIES,
+      (args, _execution, location) => readCtfFiles(args, {
+        normalizePath: path => pathParts(path).join('/'),
+        read: path => snapshotEvidence(ctx, path, location, MAX_BATCH_FILE_BYTES),
+      }), ['files'], fileResults);
+  }
   registerTool(ctx, 'inspect_attachment',
-    '只读检查本地 PNG、JPEG、ZIP/ZIP64、7z、RAR、TAR/TAR.GZ、gzip、PCAP/PCAPNG、ELF、PE 和 WebAssembly。返回原件 SHA-256 和分页结构。归档目录返回成员序号及大小。传 pcapng 查询接口和 UTC 窗口。',
+    '只读检查附件格式、归档目录或抓包结构；支持 format_hint、scan_result_id 与 pcapng 统计。',
     ATTACHMENT_PROPERTIES,
-    async (args, _execution, location) => {
+    async (args, execution, location) => {
       const { offset = 0, limit = 10 } = args;
       if (!Number.isInteger(offset) || offset < 0 || offset > MAX_ATTACHMENT_BYTES
         || !Number.isInteger(limit) || limit < 1 || limit > 16) {
@@ -1261,16 +1888,59 @@ export function apply(ctx, config) {
       const expectedHash = parseExpectedHash(args.expected_sha256);
       const pcapngQuery = parsePcapngQuery(args.pcapng);
       const zipHint = args.format_hint === 'zip';
-      if (args.format_hint !== undefined && !zipHint) throw new Error('format_hint 目前支持 zip。');
-      if (zipHint && pcapngQuery !== undefined) throw new Error('一次只能查询 ZIP 或 PCAPNG。');
+      const compressionHint = ['zlib', 'deflate_raw'].includes(args.format_hint) ? args.format_hint : undefined;
+      if (args.source_result_id !== undefined || args.source_result_ids !== undefined) {
+        if (args.scan_result_id !== undefined || args.archive_offset !== undefined || args.archive_length !== undefined || args.pcapng !== undefined) {
+          throw new ToolError('unsupported', '派生字节输入不能同时使用扫描编号、ZIP 区间或 PCAPNG 查询范围。');
+        }
+        const input = await resolveMediaInput(ctx, args, execution, location, workbench, results, inspectRanges);
+        if (input.bytes.length > MAX_ATTACHMENT_BYTES) throw new ToolError('size', '派生附件最多 32 MiB。');
+        const report = await inspectAttachmentWithCompression(input.bytes, paging, undefined, compressionHint, location.signal, workbench);
+        checkAttachmentHash(expectedHash, input.data_sha256);
+        return { ...report, file: input.file, sha256: input.sha256, data_sha256: input.data_sha256,
+          source_evidence: input.source_evidence,
+          ...(input.source_result_ids === undefined ? {} : { source_result_ids: input.source_result_ids }) };
+      }
+      if (typeof args.file_path !== 'string') throw new ToolError('path', '请提供 file_path 或 source_result_id。');
       const file = await openWorkspaceFile(ctx, pathParts(args.file_path), location);
-      if (pcapngQuery === undefined && typeof ctx.fs.readByteRange === 'function') {
+      const range = parseZipRange(args, file.size);
+      if (args.scan_result_id !== undefined) {
+        if (typeof args.scan_result_id !== 'string' || !RESULT_HASH.test(args.scan_result_id) || range || pcapngQuery !== undefined
+          || compressionHint !== undefined) {
+          throw new ToolError('unsupported', 'scan_result_id 只用于 ZIP 候选核对，不能与指定区间或 PCAPNG 查询合用。');
+        }
+        const markerResult = results.get(execution.agent?.session, location.directoryKey, args.scan_result_id);
+        const scan = markerResult?.report;
+        if (markerResult?.tool !== 'scan_binary' || scan?.mode !== 'signatures' || typeof scan.file !== 'string'
+          || pathParts(scan.file).join('/') !== pathParts(args.file_path).join('/') || !Array.isArray(scan.matches)) {
+          throw new ToolError('unsupported', '请引用本题同一原件的签名扫描结果。');
+        }
+        if (typeof ctx.fs.readByteRange !== 'function') throw new ToolError('dependency', '当前文件服务不支持 ZIP 候选核对。');
+        if (file.size !== scan.size || scan.snapshot_id !== attachmentSnapshot(file)) {
+          throw new ToolError('conflict', '扫描之后附件发生变化，请重新扫描。');
+        }
+        return inspectRanges(file, location.signal, expectedHash ?? scan.sha256, async reader => ({
+          report: { ...await inspectZipCandidates(reader, scan, paging), scan_result_id: args.scan_result_id },
+        }));
+      }
+      if ((zipHint || compressionHint !== undefined || range !== undefined) && pcapngQuery !== undefined) {
+        throw new ToolError('unsupported', '一次只能查询压缩/ZIP 附件或 PCAPNG。');
+      }
+      if (compressionHint !== undefined && range !== undefined) {
+        throw new ToolError('unsupported', 'zlib 和 raw Deflate 格式提示不能与 ZIP 区间合用。');
+      }
+      if (range !== undefined) {
+        return inspectSelectedZip(ctx, inspectRanges, file, { signal: location.signal, expectedHash, range },
+          async reader => (await inspectZipRanges(reader, paging, undefined, true))?.report);
+      }
+      if (pcapngQuery === undefined && compressionHint === undefined && typeof ctx.fs.readByteRange === 'function') {
         const zip = await inspectRanges(file, location.signal, expectedHash,
           (reader, index) => inspectZipRanges(reader, paging, index, zipHint));
         if (zip !== undefined) return zip;
         if (zipHint) throw new Error('未在文件中找到可验证的 ZIP 目录。');
       }
       const bytes = await readOpenedFile(ctx, file, location.signal);
+      const sha256 = createHash('sha256').update(bytes).digest('hex');
       if (zipHint) {
         const zip = await inspectZipRanges({ size: bytes.length, read: (offset, length) => bytes.subarray(offset, offset + length) },
           paging, undefined, true);
@@ -1279,33 +1949,50 @@ export function apply(ctx, config) {
         checkAttachmentHash(expectedHash, sha256);
         return { ...zip.report, size: bytes.length, sha256 };
       }
-      const archiveFormat = pcapngQuery === undefined ? nativeArchiveFormat(bytes) : undefined;
+      const archiveFormat = pcapngQuery === undefined && compressionHint === undefined ? nativeArchiveFormat(bytes) : undefined;
       if (archiveFormat !== undefined) {
         const sha256 = createHash('sha256').update(bytes).digest('hex');
         checkAttachmentHash(expectedHash, sha256);
         const archive = await inspectNativeArchive(bytes, archiveFormat, paging, location.signal, workbench);
         return { ...archive, size: bytes.length, sha256 };
       }
-      const report = inspectAttachment(bytes, paging, pcapngQuery);
-      checkAttachmentHash(expectedHash, report.sha256);
-      return report;
-    }, undefined, fileResults);
+      const report = await inspectAttachmentWithCompression(bytes, paging, pcapngQuery, compressionHint, location.signal, workbench);
+      checkAttachmentHash(expectedHash, report.sha256 ?? sha256);
+      return { ...report, size: bytes.length, sha256: report.sha256 ?? sha256 };
+    }, [], fileResults);
   registerTool(ctx, 'read_png_pixels',
-    '读取 PNG 原始像素或 LSB 位平面，支持区域、分页、通道及 APNG 帧。返回样本位深和帧语义。',
-    { file_path: PATH_SCHEMA, ...PNG_PIXEL_PROPERTIES, expected_sha256: SHA256_SCHEMA },
-    (args, _execution, location) => readMediaAttachment(ctx, args, parsePngRequest(args), location, workbench),
-    ['file_path'], fileResults);
+    '读取 PNG 像素、单页 LSB 或连续位流（支持区域、通道、APNG 帧及 source_result_id）。',
+    { file_path: PATH_SCHEMA, ...RESULT_SOURCE_PROPERTIES, ...PNG_PIXEL_PROPERTIES, expected_sha256: SHA256_SCHEMA },
+    (args, execution, location) => readMediaAttachment(ctx, args, parsePngRequest(args), location, workbench, execution, results, inspectRanges),
+    [], fileResults);
   registerTool(ctx, 'inspect_media',
-    '检查 PDF、常见图像及帧元数据、PNG/JPEG 二维码、WAV/FLAC/ID3 音频元数据。返回原件 SHA-256。',
-    { file_path: PATH_SCHEMA, ...MEDIA_PROPERTIES, expected_sha256: SHA256_SCHEMA },
-    (args, _execution, location) => readMediaAttachment(ctx, args, parseMediaRequest(args), location, workbench),
-    ['file_path', 'kind'], fileResults);
+    '检查 PDF（含渲染与嵌入附件）、图像、二维码、音频、只读 SQLite 和 Office 文档。',
+    { file_path: PATH_SCHEMA, ...RESULT_SOURCE_PROPERTIES, ...MEDIA_PROPERTIES, expected_sha256: SHA256_SCHEMA },
+    (args, execution, location) => readMediaAttachment(ctx, args, parseMediaRequest(args), location, workbench, execution, results, inspectRanges),
+    ['kind'], fileResults);
   registerTool(ctx, 'read_archive_member',
-    '按目录的 member_index 在内存中读取单个普通归档成员，成员解压后限 1 MiB。返回分页内容和原件、成员 SHA-256。支持未加密 ZIP/ZIP64、TAR/TAR.GZ、gzip、7z/RAR。',
+    '按 member_index 分页读取归档/压缩流成员并返回原件、成员与页的 SHA-256。',
     ARCHIVE_MEMBER_PROPERTIES,
     (args, _execution, location) => readArchiveMember(ctx, args, location, inspectRanges, workbench), ['file_path', 'member_index'], fileResults);
+  registerTool(ctx, 'scan_binary',
+    '分块扫描附件中的格式签名、十六进制或 UTF-8 字节并返回偏移与片段 SHA-256。',
+    { file_path: PATH_SCHEMA, ...BINARY_SCAN_PROPERTIES, expected_sha256: SHA256_SCHEMA },
+    async (args, _execution, location) => {
+      const request = parseBinaryScan(args);
+      const expectedHash = parseExpectedHash(args.expected_sha256);
+      if (request.hashScope === 'range' && expectedHash !== undefined) {
+        throw new ToolError('unsupported', '核对原件 SHA-256 时请省略 hash_scope 或选择 file。');
+      }
+      if (typeof ctx.fs.readByteRange !== 'function') throw new ToolError('dependency', '当前 DSH 文件服务不支持分段扫描。');
+      const file = await openWorkspaceFile(ctx, pathParts(args.file_path), location);
+      const hashFile = expectedHash !== undefined || request.hashScope === 'file';
+      return inspectRanges(file, location.signal, expectedHash, async reader => ({
+        report: { ...await scanBinary(reader, request, location.signal), hash_scope: hashFile ? 'file' : 'range',
+          snapshot_id: attachmentSnapshot(file) },
+      }), { hashFile });
+    }, undefined, fileResults);
   registerTool(ctx, 'read_binary_range',
-    '按精确偏移读取本地附件的一段字节，每次最多 4 KiB。默认输出十六进制、ASCII 和片段 SHA-256。strings 为 true 时附可打印字符串及绝对偏移。',
+    '按精确偏移读取附件片段（每次最多 4 KiB），返回 hexdump/ASCII/可选字符串与 SHA-256。',
     BINARY_RANGE_PROPERTIES,
     async (args, _execution, location) => {
       const window = parseByteWindow(args, 'hexdump', 256);
@@ -1330,29 +2017,37 @@ export function apply(ctx, config) {
         } };
       }, { hashFile });
     }, undefined, fileResults);
-  registerTool(ctx, 'read_log_range',
-    '按字节偏移只读题目目录里的 UTF-8 日志或文本片段。返回实际偏移、下一段偏移和原件 SHA-256。继续读取时可核对上一段的 SHA-256。',
-    LOG_RANGE_PROPERTIES,
-    async (args, _execution, location) => {
-      const { byte_offset: offset = 0, byte_length: length = 2048 } = args;
-      if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(length) || length < 1 || length > MAX_LOG_WINDOW_BYTES) {
-        throw new Error('byte_offset 须是非负安全整数，byte_length 须在 1 至 4096 之间。');
-      }
-      if (typeof ctx.fs.readByteRange !== 'function') throw new Error('当前 DSH 文件服务不支持分段读取。');
-      const expectedHash = parseExpectedHash(args.expected_sha256);
-      const file = await openWorkspaceFile(ctx, pathParts(args.file_path), location);
-      return inspectRanges(file, location.signal, expectedHash, reader => inspectLogWindow(reader, offset, length));
-    }, undefined, fileResults);
+  if (extendedAudit) {
+    registerTool(ctx, 'read_log_range',
+      '按字节偏移只读 UTF-8 日志片段，返回对齐偏移与原件 SHA-256。',
+      LOG_RANGE_PROPERTIES,
+      async (args, _execution, location) => {
+        const { byte_offset: offset = 0, byte_length: length = 2048 } = args;
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(length) || length < 1 || length > MAX_LOG_WINDOW_BYTES) {
+          throw new Error('byte_offset 须是非负安全整数，byte_length 须在 1 至 4096 之间。');
+        }
+        if (typeof ctx.fs.readByteRange !== 'function') throw new Error('当前 DSH 文件服务不支持分段读取。');
+        const expectedHash = parseExpectedHash(args.expected_sha256);
+        const file = await openWorkspaceFile(ctx, pathParts(args.file_path), location);
+        return inspectRanges(file, location.signal, expectedHash, reader => inspectLogWindow(reader, offset, length));
+      }, undefined, fileResults);
+  }
   registerTool(ctx, 'inspect_elf',
-    '检查本地 ELF 的文件头、静态与动态符号表状态、入口和 SHA-256。按 checksec 口径给出 NX、PIE、RELRO、canary、FORTIFY、动态导入、DT_NEEDED 和 x86-64 常见 gadget 字节扫描；x86-64 还返回 PLT/GOT 重定位、system 等 libc 导出偏移和 /bin/sh 位置。依赖节头，节头缺失时部分字段不可用。对匹配的 x86-64 glibc 启动形式给出可核验的 main 证据。',
+    '静态检查本地 ELF：头信息、checksec（NX/PIE/RELRO/canary/FORTIFY）、导入、PLT/GOT、gadget 与 libc 导出。',
     { file_path: PATH_SCHEMA },
     async (args, _execution, location) => inspectElf(await readAttachment(ctx, args.file_path, location)), undefined, fileResults);
-  registerTool(ctx, 'pwn_cyclic',
-    '生成或查找 pwntools 兼容的 De Bruijn 循环模式（阶 4、字母表 a–z）。create 返回指定长度前缀；find 按十六进制字节串或 0x 整数（默认小端）返回 0 起始偏移；用于栈溢出 offset 和泄露值定位。',
-    PWN_PATTERN_PROPERTIES,
-    async args => cyclicPattern(args), ['operation']);
+  if (extendedAudit) {
+    registerTool(ctx, 'pwn_cyclic',
+      '生成或查找 pwntools 兼容 De Bruijn 循环模式（阶 4）。',
+      PWN_PATTERN_PROPERTIES,
+      async args => cyclicPattern(args), ['operation']);
+    registerTool(ctx, 'pwn_payload',
+      '复核 Pwn 基址并组装有界 x86-64 小端 ROP 数据。',
+      PWN_PAYLOAD_PROPERTIES,
+      async args => buildPwnPayload(args), ['operation']);
+  }
   registerTool(ctx, 'net_session',
-    '边界：需要保持连接多次收发、按分隔符读取或自定义 TCP 协议时用本工具；一次性管道用 shell。建立 TCP 会话并收发字节，支持 connect、send、recv、read_until、close 和 list。recv 在文本安全时返回 UTF-8，二进制返回十六进制和 hexdump；read_until 读到分隔符或 64 KiB 上限；单次发送限 1 MiB，最多同时保留 8 个会话。用于 pwn 远程交互和自定义 TCP 协议。',
+    '管理长连接 TCP 会话（connect/send/recv/read_until/close/list），用于 Pwn 交互与自定义协议。',
     NET_SESSION_PROPERTIES,
     async (args, execution) => {
       if (args.operation === 'send') writablePolicy(ctx, execution);
@@ -1361,138 +2056,173 @@ export function apply(ctx, config) {
       return Array.isArray(report) ? { sessions: report } : report;
     }, ['operation'], sessionResults);
   registerTool(ctx, 'http_request',
-    '边界：需要指定方法、请求头、重定向策略或结构化观测时用本工具；单次简单 curl 用 shell。发起 HTTP/HTTPS 请求并返回状态、响应头和有限正文。自动重定向仅限同源且无请求体的 GET/HEAD，其他跳转保留 3xx 响应。正文支持 gzip/deflate/br，最多 1 MiB。',
+    '发起 HTTP(S) 请求，支持自定义 Host、cookie_jar、multipart 上传与重定向控制，保留赛题响应头（仅脱敏平台令牌）。',
     HTTP_REQUEST_PROPERTIES,
     async (args, execution) => {
-      await workspaceLocation(ctx, execution);
-      if (!['GET', 'HEAD', 'OPTIONS'].includes(String(args.method ?? 'GET').toUpperCase()) || args.body !== undefined) {
+      const location = await workspaceLocation(ctx, execution);
+      if (!['GET', 'HEAD', 'OPTIONS'].includes(String(args.method ?? 'GET').toUpperCase())
+        || args.body !== undefined || args.multipart !== undefined) {
         writablePolicy(ctx, execution);
       }
-      if (Object.keys(args.headers ?? {}).some(name => name.toLowerCase() === 'host')) {
-        throw new Error('HTTP Host 随授权 URL 生成。');
-      }
-      return cleanHttpResponse(await httpRequest(args, { signal: execution.signal, authorize: network.http }));
+      const jar = cookieJarFor(execution, location.directoryKey, args.cookie_jar);
+      const response = await httpRequest(args, {
+        signal: execution.signal,
+        authorize: network.http,
+        ...(jar ? { cookieJar: jar } : {}),
+        readFile: async (filePath, limit) => (await readWorkspaceFile(ctx, pathParts(filePath), location, limit)).bytes,
+      });
+      return redactPlatformToken(response, platformCredential(currentConfig()).token);
     }, ['url'], sessionResults);
   registerTool(ctx, 'pcap_stream',
-    '只读分析 PCAP/PCAPNG，支持 BSD 回环和 Linux cooked。重组 IPv4 分片及 TCP 流，列出捕获时间及 UDP DNS 的查询名、TXT 样本。未完成分片和截断包单列统计。',
+    '只读分析 PCAP/PCAPNG：重组 IPv4 分片与 TCP 流，提取 DNS 查询与 TXT 样本。',
     PCAP_STREAM_PROPERTIES,
     async (args, execution, location) => {
       await openWorkspaceFile(ctx, pathParts(args.file_path), location);
       return pcapStream(args, { cwd: location.cwd, signal: execution.signal });
     }, ['file_path'], fileResults);
-  registerTool(ctx, 'verify_elf',
-    '从原文件重新核验 ELF 入口、main、动态符号偏移标注或 SHA-256。逐项返回匹配状态与理由。',
-    VERIFY_PROPERTIES,
-    async (args, _execution, location) => {
-      const claims = parseClaims(args);
-      return verifyElf(await readAttachment(ctx, args.file_path, location), claims);
-    }, undefined, fileResults);
-  registerTool(ctx, 'verify_evidence',
-    '对照 2 至 8 个本地证据位置。可提供文本前缀、文件字节范围及 SHA-256，或结果编号。编号过期时可按完整的原件范围复算。',
-    EVIDENCE_PROPERTIES,
-    async (args, execution, location) => {
-      const recorded = await recordedResults(ctx, location);
-      const sources = parseEvidenceSources(args, id => results.get(execution.agent?.session, location.directoryKey, id) ?? recorded.get(id));
-      return verifyEvidence(sources, args.expected_value, file => snapshotEvidence(ctx, file, location));
-    }, ['sources'], fileResults);
-  registerTool(ctx, 'verify_http_evidence',
-    '用已知方法、路径及可选的请求 ID，对照题目内的 HAR、JSONL 或 Common/Combined 日志及预期状态表。返回状态码、匹配情况、少量响应头元数据及原件位置。',
-    HTTP_EVIDENCE_PROPERTIES,
-    (args, _execution, location) => verifyHttpEvidence(args, {
-      normalizePath: path => pathParts(path).join('/'),
-      read: path => readWorkspaceFile(ctx, path.split('/'), location, MAX_HTTP_BYTES),
-    }), ['request', 'sources'], fileResults);
-  registerTool(ctx, 'trace_flask_route',
-    '从本地 Python 源码定位 Flask 方法、路径、蓝图挂载、请求前钩子、响应钩子和处理函数。汇总可静态识别的状态码及源码行。',
-    FLASK_ROUTE_PROPERTIES,
-    (args, _execution, location) => traceFlaskRoute(args, {
-      normalizePath: path => pathParts(path).join('/'),
-      read: path => readWorkspaceFile(ctx, path.split('/'), location, MAX_FLASK_SOURCE_BYTES),
-    }, location.signal, workbench), ['entry_file', 'request'], fileResults);
-  registerTool(ctx, 'verify_flask_response',
-    '将已有的 JSONL 应用返回事件与本会话的 HTTP 观测和 Flask 源码结果核对。按已知请求 ID、方法、路径、状态码与源码行关联，证据不足时保留候选。',
-    FLASK_RESPONSE_PROPERTIES,
-    (args, execution, location) => verifyFlaskResponse(args, {
-      normalizePath: path => pathParts(path).join('/'),
-      readEvent: path => readWorkspaceFile(ctx, path.split('/'), location, MAX_HTTP_BYTES),
-      readSource: path => snapshotEvidence(ctx, path, location, MAX_HTTP_BYTES),
-      async result(id) {
-        const local = results.get(execution.agent?.session, location.directoryKey, id);
-        if (local?.report !== undefined) return local;
-        const recorded = (await recordedResults(ctx, location)).get(id);
-        return recorded?.full === true ? recorded : undefined;
-      },
-    }), ['http_result_id', 'observation_index', 'trace_result_id', 'file_path'], fileResults);
-  registerTool(ctx, 'query_rev_export',
-    '按已知名称、地址或字符串查询现有的本地 JSONL 或 GNU 式导出。返回导出中记录的函数、直接调用与引用证据。',
-    REV_EXPORT_PROPERTIES,
-    async (args, _execution, location) => {
-      const parts = pathParts(args.file_path);
-      const { bytes } = await readWorkspaceFile(ctx, parts, location, MAX_REV_TEXT_BYTES);
-      return queryRevExport(bytes, parts.join('/'), args.format, args.query);
-    }, ['file_path', 'format', 'query'], fileResults);
-  registerTool(ctx, 'map_rev_address',
-    '在本地 ELF、PE 或 Wasm 原件上核对给定虚拟地址、相对地址、节内偏移或文件偏移。返回映射位置、字节范围与原件引用。',
-    REV_ADDRESS_PROPERTIES,
-    async (args, _execution, location) => {
-      const parts = pathParts(args.file_path);
-      const { bytes } = await readWorkspaceFile(ctx, parts, location);
-      return mapRevAddress(bytes, parts.join('/'), args);
-    }, ['file_path', 'queries'], fileResults);
-  registerTool(ctx, 'verify_rev_machine',
-    '按已给出的本地 JSONL 字节状态机规则处理短 Hex 样例。返回每一步的输入、状态、累加值、输出与规则行。',
-    REV_MACHINE_PROPERTIES,
-    async (args, _execution, location) => {
-      const parts = pathParts(args.file_path);
-      const { bytes } = await readWorkspaceFile(ctx, parts, location, MAX_REV_TEXT_BYTES);
-      return verifyRevMachine(bytes, parts.join('/'), args);
-    }, ['file_path', 'input_hex'], fileResults);
-  registerTool(ctx, 'compare_rev_trace',
-    '对照已有本地 JSONL 运行记录与参考记录或本会话的状态机结果。按 step 和指定字段返回第一个差异及两侧证据。',
-    REV_TRACE_PROPERTIES,
-    (args, execution, location) => compareRevTrace(args, {
-      normalizePath: path => pathParts(path).join('/'),
-      read: path => readWorkspaceFile(ctx, path.split('/'), location, MAX_REV_TEXT_BYTES),
-      snapshot: path => snapshotEvidence(ctx, path, location, MAX_REV_TEXT_BYTES),
-      async result(id) {
-        const local = results.get(execution.agent?.session, location.directoryKey, id);
-        if (local?.report !== undefined) return local;
-        const recorded = (await recordedResults(ctx, location)).get(id);
-        return recorded?.full === true ? recorded : undefined;
-      },
-    }), ['file_path', 'fields'], fileResults);
+  registerTool(ctx, 'ctf_sandbox',
+    'Linux 安全工具沙箱（Docker 优先，自动回退 WSL2）：status 探测兵器库；exec 运行命令/脚本；decompile 列出函数或反编译；pwn_triage 采集 checksec/libc/gadget/seccomp。',
+    SANDBOX_PROPERTIES,
+    (args, execution) => runSandboxTool(ctx, args, execution, currentConfig()),
+    ['action']);
+  if (extendedAudit) {
+    registerTool(ctx, 'verify_elf',
+      '从原文件复核 ELF 入口、main、动态符号偏移标注或 SHA-256。',
+      VERIFY_PROPERTIES,
+      async (args, _execution, location) => {
+        const claims = parseClaims(args);
+        return verifyElf(await readAttachment(ctx, args.file_path, location), claims);
+      }, undefined, fileResults);
+    registerTool(ctx, 'verify_evidence',
+      '对照 2 至 8 个本地证据位置并核验一致性。',
+      EVIDENCE_PROPERTIES,
+      async (args, execution, location) => {
+        const recorded = await recordedResults(ctx, location);
+        const sources = parseEvidenceSources(args, id => results.get(execution.agent?.session, location.directoryKey, id) ?? recorded.get(id));
+        return verifyEvidence(sources, args.expected_value, file => snapshotEvidence(ctx, file, location));
+      }, ['sources'], fileResults);
+    registerTool(ctx, 'verify_http_evidence',
+      '对照题目 HAR/JSONL/访问日志中的 HTTP 请求观测。',
+      HTTP_EVIDENCE_PROPERTIES,
+      (args, _execution, location) => verifyHttpEvidence(args, {
+        normalizePath: path => pathParts(path).join('/'),
+        read: path => readWorkspaceFile(ctx, path.split('/'), location, MAX_HTTP_BYTES),
+      }), ['request', 'sources'], fileResults);
+    registerTool(ctx, 'trace_flask_route',
+      '静态定位 Flask 路由、蓝图、钩子与处理函数状态码。',
+      FLASK_ROUTE_PROPERTIES,
+      (args, _execution, location) => traceFlaskRoute(args, {
+        normalizePath: path => pathParts(path).join('/'),
+        read: path => readWorkspaceFile(ctx, path.split('/'), location, MAX_FLASK_SOURCE_BYTES),
+      }, location.signal, workbench), ['entry_file', 'request'], fileResults);
+    registerTool(ctx, 'verify_flask_response',
+      '核对 JSONL 应用返回事件、HTTP 观测与 Flask 路由追踪结果。',
+      FLASK_RESPONSE_PROPERTIES,
+      (args, execution, location) => verifyFlaskResponse(args, {
+        normalizePath: path => pathParts(path).join('/'),
+        readEvent: path => readWorkspaceFile(ctx, path.split('/'), location, MAX_HTTP_BYTES),
+        readSource: path => snapshotEvidence(ctx, path, location, MAX_HTTP_BYTES),
+        async result(id) {
+          const local = results.get(execution.agent?.session, location.directoryKey, id);
+          if (local?.report !== undefined) return local;
+          const recorded = (await recordedResults(ctx, location)).get(id);
+          return recorded?.full === true ? recorded : undefined;
+        },
+      }), ['http_result_id', 'observation_index', 'trace_result_id', 'file_path'], fileResults);
+    registerTool(ctx, 'query_rev_export',
+      '查询本地 JSONL 或 GNU 式逆向导出中的函数与引用。',
+      REV_EXPORT_PROPERTIES,
+      async (args, _execution, location) => {
+        const parts = pathParts(args.file_path);
+        const { bytes } = await readWorkspaceFile(ctx, parts, location, MAX_REV_TEXT_BYTES);
+        return queryRevExport(bytes, parts.join('/'), args.format, args.query);
+      }, ['file_path', 'format', 'query'], fileResults);
+    registerTool(ctx, 'map_rev_address',
+      '在本地 ELF、PE 或 Wasm 原件上核对虚拟地址、RVA 与文件偏移映射。',
+      REV_ADDRESS_PROPERTIES,
+      async (args, _execution, location) => {
+        const parts = pathParts(args.file_path);
+        const { bytes } = await readWorkspaceFile(ctx, parts, location);
+        return mapRevAddress(bytes, parts.join('/'), args);
+      }, ['file_path', 'queries'], fileResults);
+    registerTool(ctx, 'verify_rev_machine',
+      '按本地 JSONL 字节状态机规则复算短 Hex 样例。',
+      REV_MACHINE_PROPERTIES,
+      async (args, _execution, location) => {
+        const parts = pathParts(args.file_path);
+        const { bytes } = await readWorkspaceFile(ctx, parts, location, MAX_REV_TEXT_BYTES);
+        return verifyRevMachine(bytes, parts.join('/'), args);
+      }, ['file_path', 'input_hex'], fileResults);
+    registerTool(ctx, 'compare_rev_trace',
+      '对照本地 JSONL 运行轨迹与参考记录或状态机结果。',
+      REV_TRACE_PROPERTIES,
+      (args, execution, location) => compareRevTrace(args, {
+        normalizePath: path => pathParts(path).join('/'),
+        read: path => readWorkspaceFile(ctx, path.split('/'), location, MAX_REV_TEXT_BYTES),
+        snapshot: path => snapshotEvidence(ctx, path, location, MAX_REV_TEXT_BYTES),
+        async result(id) {
+          const local = results.get(execution.agent?.session, location.directoryKey, id);
+          if (local?.report !== undefined) return local;
+          const recorded = (await recordedResults(ctx, location)).get(id);
+          return recorded?.full === true ? recorded : undefined;
+        },
+      }), ['file_path', 'fields'], fileResults);
+  }
   registerTool(ctx, 'rev_query',
-    '用本机 Python 与 capstone 对会话工作区内的 ELF 做线性反汇编（按符号、地址或节，20 至 400 条）或字符串扫描（最短 4 至 64 字节，最多 200 条）。返回地址、字节、助记符、操作数和文件偏移；反汇编需要 capstone，strings 只依赖 Python。',
+    '多架构二进制查询（ELF32/64、PE32/32+）：disassemble 反汇编、cfg 控制流、strings 扫串、triage 快检加壳/密码常量（无需 capstone）。',
     Object.fromEntries(Object.entries(REV_QUERY_PROPERTIES).filter(([key]) => key !== 'python_path')),
     async (args, execution, location) => {
       const file = await openWorkspaceFile(ctx, pathParts(args.file_path), location);
-      const report = await runRevQuery(args, {
-        cwd: location.cwd, signal: execution.signal, pythonPath: await workbench.resolvePython(execution.signal),
-      });
+      let report;
+      try {
+        report = await runRevQuery(args, {
+          cwd: location.cwd, signal: execution.signal, pythonPath: await workbench.resolvePython(execution.signal),
+        });
+      } catch (error) {
+        if (typeof error?.message === 'string' && /capstone/iu.test(error.message)) {
+          const sb = await detectSandbox(currentConfig(), execution.signal);
+          const hint = sb.available
+            ? `宿主机缺少 capstone，可改用 rev_query(operation: "triage"/"strings")，或直接切换 ctf_sandbox(action: "decompile" / "exec") 使用 ${sb.backend} 沙箱内的反汇编/反编译工具。`
+            : '宿主机缺少 capstone，可改用 rev_query(operation: "triage"/"strings")，或安装 capstone / 构建 dsh-ctf-sandbox:latest。';
+          throw new ToolError('dependency', error.message, hint);
+        }
+        throw error;
+      }
       await requireCurrentFile(ctx.fs, file, location.signal);
       return report;
     }, ['file_path', 'operation'], fileResults);
   registerTool(ctx, 'calculate_offline',
-    '执行大整数、定宽字、模运算、字节序、进制或编码转换，以及哈希/HMAC、base32/base58/base85/URL/HTML、XOR 与单字节爆破、凯撒/维吉尼亚/仿射/栅栏、AES、RSA 原始运算和 RSA 攻击（rsa_attack：factor/fermat/wiener/common_modulus/broadcast/small_e）。可引用前序结果并核对样例，返回首个不符的步骤。',
+    '离线多步确定性计算：大整数/模运算、编解码、哈希/HMAC、古典密码、XOR、AES、RSA/ECDSA/LCG 复算，支持 result_id 引用与超时续算。',
     CALCULATION_PROPERTIES,
-    (args, execution) => calculation.run(args.steps, execution.signal),
-    ['steps'], offlineResults);
-  const base100 = new Base100Workbench(workbench);
-  ctx.effect(() => () => base100.dispose(), 'CTF Base100 workbench process');
-  registerTool(ctx, 'workbench_base100',
-    '批量使用本机 CTF 工作台进行 Base100 编码和解码。编码输入为 UTF-8 或 Hex。解码返回 Hex 和有效的 UTF-8 文本。',
-    WORKBENCH_BASE100_PROPERTIES,
-    async (args, execution) => {
-      try {
-        return await base100.run(args.items, execution.signal);
-      } catch (error) {
-        if (!(error instanceof WorkbenchDependencyError)) throw error;
-        return { status: 'dependency_missing', reason: error.message };
-      }
-    },
-    ['items'], offlineResults);
+    (args, execution, location) => location === undefined
+      ? calculation.run(args.steps, execution.signal, undefined, {
+        candidates: args.candidates, resumeId: args.resume_id, session: execution.agent?.session,
+      })
+      : runReferencedCalculation(ctx, args, execution, location, results, inspectRanges, workbench, calculation),
+    ['steps'], args => hasAttachmentInputs(args?.steps) ? fileResults : offlineResults);
+  if (extendedAudit) {
+    const base100 = new Base100Workbench(workbench);
+    ctx.effect(() => () => base100.dispose(), 'CTF Base100 workbench process');
+    registerTool(ctx, 'workbench_base100',
+      '批量使用本机 CTF 工作台进行 Base100 编解码。',
+      WORKBENCH_BASE100_PROPERTIES,
+      async (args, execution) => {
+        try {
+          return await base100.run(args.items, execution.signal);
+        } catch (error) {
+          if (!(error instanceof WorkbenchDependencyError)) throw error;
+          return { status: 'dependency_missing', reason: error.message };
+        }
+      },
+      ['items'], offlineResults);
+  }
+  registerTool(ctx, 'ctf_graph',
+    '工作区共享分层 Fact-Intent 图谱（.ctf-graph/）：board 查极简索引、expand 按需展开、add_fact/add_intent 记事实与任务、claim_intent 并发互斥认领、finish_intent 原子结案。',
+    GRAPH_PROPERTIES,
+    (args, execution) => runGraphTool(ctx, args, execution),
+    ['action']);
   registerTool(ctx, 'ctf_progress',
-    'load 恢复题目笔记并复核原件。check 核对 claims，纯工具值一致时返回 tool_match，只有笔记记录时返回 recorded。save 保存结果与附件路径。writeup 生成题解草稿。handoff 整理题目目录、附件和下一步。repair 可备份并修复托管区。',
+    '题目续接笔记（load/check/save/writeup/handoff/results/experiments/repair）。',
     PROGRESS_PROPERTIES,
     (args, execution) => {
       const allowed = PROGRESS_ACTION_KEYS[args.action];
@@ -1502,43 +2232,53 @@ export function apply(ctx, config) {
       return runProgress(ctx, args, execution, results, inspectRanges);
     }, ['action'], undefined, PROGRESS_PARAMETERS);
   registerTool(ctx, 'ctf_status',
-    '记录或查看时间盒心跳：已用时间、卡点、已排除假设、下一步和需要谁。set 追加一条（每题建议至少 2 次），show 返回含 code、severity、action 的 warnings[] 以及兼容文本 warning_messages：15 分钟换方向、30 分钟列三条路径、60 分钟升级求助；board 从平台榜单接口拉取排名/分数/解题数并写一条记录。',
+    '时间盒心跳与榜单（set/show/board），自动产出 15/30/60 分钟预警。',
     STATUS_PROPERTIES,
-    (args, execution) => runStatus(ctx, args, execution, config), ['action']);
+    (args, execution) => runStatus(ctx, args, execution, currentConfig()), ['action']);
   registerTool(ctx, 'check_flag',
-    '提交前在本地校验 flag 的格式、长度、来源、重复记录和实例刷新时间。默认只读，传 record:true 时才写预检回执。',
+    '本地预检 flag 格式、来源、重复与实例刷新时间；传 record:true 写预检回执。',
     SUBMIT_FLAG_PROPERTIES,
-    (args, execution) => runSubmitCheck(ctx, args, execution, config), ['flag']);
+    (args, execution) => runSubmitCheck(ctx, args, execution, currentConfig()), ['flag']);
   registerTool(ctx, 'submit_flag',
-    '本地校验通过后按插件配置的 platformUrl 提交 flag 到比赛平台，解析平台响应并返回 accepted / rejected / duplicate，同时把回执写入 .ctf-submissions.jsonl。未配置平台时返回 dependency；同一 flag 重复提交会先告警。',
+    '本地校验通过后向平台提交 flag 并写入 .ctf-submissions.jsonl 回执。',
     SUBMIT_FLAG_PROPERTIES,
-    (args, execution) => runSubmitFlag(ctx, args, execution, config), ['flag']);
+    (args, execution) => runSubmitFlag(ctx, args, execution, currentConfig()), ['flag']);
   registerTool(ctx, 'ctf_instance',
-    '列出、创建和删除比赛实例。rotate 先确认新实例已创建，再删除传入 id。创建失败时保留旧实例。',
+    '管理赛题实例（status/list/create/rotate/delete），并自动为本会话授权返回的 HTTP/TCP 靶机。',
     INSTANCE_PROPERTIES,
-    (args, execution) => runInstance(ctx, args, execution, config), ['action']);
+    (args, execution) => runInstance(ctx, args, execution, currentConfig(), network), ['action']);
+  registerTool(ctx, 'ctf_arena',
+    'CTFd/GZCTF/通用赛题平台适配器：拉题单、查题情、一键同步到 ctf_graph、下载附件、启删容器与提交 flag。',
+    ARENA_PROPERTIES,
+    (args, execution) => runArenaTool(ctx, args, execution, currentConfig(), network), ['action']);
   registerTool(ctx, 'fetch_attachment',
-    '下载附件到工作区并登记来源和 SHA-256。默认 32 MiB，可显式放宽至 256 MiB。大文件返回分段读取提示。',
+    '下载赛题附件到 .ctf-attachments/ 并校验 SHA-256（已授权与平台同源支持内网/认证头）。',
     FETCH_PROPERTIES,
-    (args, execution) => runFetchAttachment(ctx, args, execution), ['url']);
-  registerTool(ctx, 'submit_check',
-    '已弃用兼容别名：请改用 check_flag。仍执行本地预检，不联网、不代替平台提交。',
-    SUBMIT_FLAG_PROPERTIES,
-    (args, execution) => runSubmitCheck(ctx, args, execution, config), ['flag']);
+    (args, execution) => runFetchAttachment(ctx, args, execution, currentConfig(), network), ['url']);
+  if (extendedAudit) {
+    registerTool(ctx, 'submit_check',
+      '已弃用兼容别名：请改用 check_flag。',
+      SUBMIT_FLAG_PROPERTIES,
+      (args, execution) => runSubmitCheck(ctx, args, execution, currentConfig()), ['flag']);
+  }
+  const registeredToolTier = extendedAudit ? 'full' : 'core';
   registerTool(ctx, 'ctf_doctor',
-    '自检宿主必需接口、本机依赖与续接文件。返回 status（ok/partial/missing）、必需缺项 missing、可选缺项 optional_missing 和宿主能力。尚未创建的题目记录与可选工具不会误报为必需故障；无提示注入接口时依赖包内 SKILL。只读不改文件。',
+    '只读自检宿主能力、工具分层、SKILL 同步、Linux 沙箱、本机依赖与工作区续接文件。',
     { action: { type: 'string', enum: ['check'], description: '默认 check。' } },
-    (_args, execution) => runDoctor(ctx, execution, config, workbench), ['action']);
-  registerTool(ctx, 'competition_api',
-    '按插件配置的 platformUrl 访问比赛平台：status 查看配置与 token 环境变量，instances 列出实例，create 新建实例（body 为请求体），delete 删除实例（需 id），submit 提交 flag 并追加本地回执。未配置平台时说明如何配置；不回显 token。',
-    {
-      action: { type: 'string', enum: ['status', 'instances', 'create', 'delete', 'submit'], description: '要执行的动作。' },
-      ...SUBMIT_FLAG_PROPERTIES,
-      id: { type: 'string', maxLength: 200, description: 'delete 时的实例标识。' },
-      body: { type: 'object', description: 'create 时的请求体，按 JSON 原样提交。', additionalProperties: true },
-    },
-    (args, execution) => runCompetitionApi(ctx, args, execution, config), ['action']);
-  registerExtraTools(ctx, config, {
+    (_args, execution) => runDoctor(ctx, execution, currentConfig(), workbench, registeredToolTier), ['action']);
+  if (extendedAudit) {
+    registerTool(ctx, 'competition_api',
+      '兼容旧入口：访问比赛平台（status/instances/create/delete/submit）。',
+      {
+        action: { type: 'string', enum: ['status', 'instances', 'create', 'delete', 'submit'], description: '要执行的动作。' },
+        ...SUBMIT_FLAG_PROPERTIES,
+        id: { type: 'string', maxLength: 200, description: 'delete 时的实例标识。' },
+        body: { type: 'object', description: 'create 时的请求体，按 JSON 原样提交。', additionalProperties: true },
+      },
+      (args, execution) => runCompetitionApi(ctx, args, execution, currentConfig(), network), ['action']);
+  }
+  registerExtraTools(ctx, currentConfig, {
+    extendedAudit,
     location: execution => workspaceLocation(ctx, execution),
     async input(location, path) {
       const parts = pathParts(path);
@@ -1549,7 +2289,8 @@ export function apply(ctx, config) {
     output: (location, path, directory) => checkedOutput(ctx, location, path, directory),
     python: signal => workbench.resolvePython(signal),
     authorize: network.http,
-    async observe(tool, args, execution, report) {
+    platformToken: () => platformCredential(currentConfig()).token,
+    async observe(tool, args, execution, report, artifactBytes) {
       if (tool === 'cloud_metadata' || (tool === 'archive_crack' && args.action !== 'info')
         || ['failed', 'timeout', 'closed'].includes(report.status)) return undefined;
       const location = await workspaceLocation(ctx, execution);
@@ -1558,6 +2299,7 @@ export function apply(ctx, config) {
         ? [{ file_path: pathParts(args.file_path).join('/'), sha256: report.input_sha256 }] : [];
       const resultId = results.remember(session, location.directoryKey, tool, report, sources);
       if (!resultId) return undefined;
+      if (Buffer.isBuffer(artifactBytes)) results.rememberArtifact(session, resultId, artifactBytes, sources);
       const result = results.get(session, location.directoryKey, resultId);
       const persisted = sources.length && result ? await persistResult(ctx, location, execution, resultId, result) : undefined;
       return { result_id: resultId, ...(persisted === undefined ? {} : { evidence_persistence: persisted }) };
@@ -1569,7 +2311,7 @@ export function apply(ctx, config) {
       prompt.context({
         name: 'ctf-resume-hint',
         order: 900,
-        text: '本题工作区可能有 notes.md（续接记录）、handoff.md（接替简报）、.ctf-status.json（时间盒心跳）和 .ctf-submissions.jsonl（提交回执）：开始或接手时先读它们，再决定下一步。',
+        text: '本题工作区可能有 .ctf-graph/（优先用 ctf_graph board 查共享事实与待办任务）、notes.md（续接记录）、handoff.md（接替简报）、.ctf-status.json（时间盒心跳）和 .ctf-submissions.jsonl（提交回执）：开始或接手时先读它们，再决定下一步。',
       });
     } catch {
       // Older hosts may not expose the system prompt service; SKILL.md carries the same rule.

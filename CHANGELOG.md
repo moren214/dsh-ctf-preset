@@ -1,5 +1,96 @@
 # 变更记录
 
+## 0.49.1
+
+- **`ctf_graph` 结案 Fencing 保护**：`finish_intent` 拒绝重复结案已处终态（`done`/`dead`）的 Intent（返回 `status: "closed"`），并拒绝非当前持有者越权结案已被其他代理认领的 Intent（返回 `status: "conflict"`），防止超时接管后的滞后子代理覆盖新进度。
+- **`ctf_sandbox` 反编译性能与缓存优化**：`decompile` 将 `radare2`/`rizin` 的伪 C（`pdg`/`pdc`）与反汇编/交叉引用（`pdf`/`axt`）合并为单次 `-A` 分析进程；Ghidra Headless 按二进制 SHA-256 持久化缓存已分析项目至 `.ctf-cache/ghidra/`，二次查询走 `-process -noanalysis -readOnly` 复用缓存并标明 `cached_project`。
+- **`ctf_doctor` 热重载口径与技能同步自检**：`ctf_doctor` 区分进程实际注册层级（`tool_tier`）与配置文件层级（`configured_tool_tier`），新增 `tool_tier_sync` 与 `skill_sync`（自动归一化换行对比包内与工作区/全局 `SKILL.md` 的 SHA-256）自检项。
+- **错误分类与文档对齐**：统一核心与扩展工具的只读权限拒绝错误为 `permission`，补充 `EEXIST -> conflict` 映射；在 `README.md` 与 `SKILL.md` 中完整标明扩展审计层工具边界，修复快速开始示例依赖默认关闭工具的问题。
+
+## 0.49.0
+
+- **工具分层与 Schema 精简**：新增 `enableExtendedAudit` 开关（默认 `false`），默认仅注册 27 个高频核心工具，Schema 体积较全量精简 34%+；设为 `true` 时完整恢复全部 45 个工具（100% 向后兼容）。
+- **跨平台 Linux 安全沙箱与双层镜像自动路由（`ctf_sandbox`）**：
+  - 新增 `ctf_sandbox`（`status` / `exec` / `decompile` / `pwn_triage`），自动探测并优先调用 Docker（默认 `--network=none` 离线隔离），Docker 不可用时自动回退至本机 WSL2 发行版（`wsl.exe --cd --exec` 原生支持中文路径与零 shell 展开），内置 30 秒探测缓存；强隔离运行未知程序可显式传 `backend: "docker"` 禁止降级。
+  - 提供双层镜像定义：`docker/Dockerfile`（`dsh-ctf-sandbox:latest`，含 32 位运行库、GEF、`qemu-user`/`gdb-multiarch`、`radare2`+`r2ghidra`、`pwntools`/`z3`/`fpylll`/`ROPgadget`/`ropper`/`seccomp-tools`/`one_gadget`/`volatility3`/`wabt`/`sleuthkit`/`cpio`/`pillow`/`numpy`/`scipy`/`scapy`/`xdis` 等）与 `docker/Dockerfile.heavy`（`dsh-ctf-sandbox:heavy`，增量叠加 Ghidra Headless、`angr`、`jadx`/`apktool` 及可选 `WITH_SAGE=1`）。
+  - 新增 `profile: "auto" | "base" | "heavy"` 自动档位路由（支持 `sandboxHeavyImage` 配置）：默认 `auto` 自动识别命令、`.sage`/`.apk` 任务与 `.py` 脚本导入头部，按需自动切入 `heavy` 镜像并扩容容器内存至 `4g`；`decompile` 传 `profile: "heavy"` 优先调用 Ghidra Headless 并自动放宽超时至 120 秒，亦支持 `r2`/`rizin`/`objdump`/无节 ELF PT_LOAD/`gdb` 逐级兜底。
+- **跨题共享图谱与多代理并行编排（`ctf_graph`）**：
+  - 在 `.ctf-graph/` 维护分层 Fact-Intent DAG（`graph.json` + `graph.saved.json` 恢复副本 + 自动投影 `BOARD.md`），采用 CAS 乐观锁支持并发互斥认领。
+  - 支持 `board`（按题汇总 `challenges`、已排除路线 `ruled_out` 与超时提醒）、`expand`、`add_fact`（`dedupe_key` 幂等去重）、`add_intent`、`claim_intent`（含 `next: true` 与 `steal_overdue: true` 超时接管）、`finish_intent` 以及 `dispatch_plan`（自动避开进行中题目并生成子代理任务提示与超时回收清单）。
+  - `BOARD.md` 自动生成 `## Overview` 按题总览表、事实来源标注与 `Active & Open` / `Completed & Ruled Out` 分区。
+- **赛题平台原生适配器（`ctf_arena`）**：
+  - 原生适配 **CTFd v1**（自动默认 `Token` 认证）、**GZCTF**（`platformGameId`、分组题单、容器启删自动授权、判题归一化）与通用平台（`platformType: "auto" | "ctfd" | "gzctf" | "generic"`）。
+  - 支持 `status` / `games` / `challenges` / `detail` / `sync_graph`（幂等导入 `.ctf-graph/` 按分值排序）/ `fetch_files` / `container` / `submit`。
+- **Pwn / Rev / Crypto / Web 核心实战增强**：
+  - `crypto_solver` 新增零依赖纯 Node.js `action: "solve"`（`jwt_inspect`、`jwt_crack`、`flask_session`、`lcg_recover`、`mt19937_recover`）；4 个 Python 脚手架模板均补全为可直接编译运行代码；`check` 在宿主机缺库时自动附带 `sandbox_fallback` 提示。
+  - `rev_query` 扩展至 **ELF32 / ELF64**（x86、x86-64、ARM、AArch64、RISC-V）与 **PE32 / PE32+**，新增无需 Capstone 的 `operation: "triage"`（识别 UPX/PyInstaller/Go/Rust/.NET/GCC/Clang/MSVC 及常见密码常量）。
+  - `gdb_driver` 放宽安全只读偏移表达式与缩写、支持 `args` 传参，并在 Windows 下检测 Linux ELF 时自动桥接 Docker/WSL2 运行 Linux `gdb`。
+  - `http_request` 保留赛题响应头（仅脱敏平台令牌）、支持自定义 `Host`、`cookie_jar` 与 `multipart` 上传；`network-boundary` 支持通配端口、端口范围、子域通配、CIDR 与 `ctf_instance`/`ctf_arena` 返回靶机的动态授权；`workbench-config` 支持热重载。
+  - `ctf_doctor` 联动展示 `sandbox_summary`、`sandbox:docker_base` / `sandbox:docker_heavy` 就绪状态与镜像构建命令提示，并修正 Windows 原生 `libarchive` 探测及 `compact: false` 生效范围。
+
+## 0.48.0
+
+- `rev_query` 新增函数级 `cfg`：按函数符号或虚拟地址遍历 x86-64 ELF 的可达基本块，输出条件分支、跳转、直接/间接调用及 RIP 相对数据引用。
+- 分析可设基本块与指令上限；间接跳转标为未解析，并说明混淆、跳转表和代码内数据可能导致的静态分析缺口。
+- 同步更新工具参数、README、包内与当前 CTF 技能说明。
+
+## 0.47.0
+
+- Pwn 增加受限的 GDB 批量调试，可设断点、运行/单步、检查寄存器、栈和回溯，并用工作区输入文件复现题目输入。
+- 新增 `pwn_payload`，根据泄漏与符号偏移计算 libc/PIE 基址，并按给定地址组装有界的 x86-64 ret2libc payload。
+- 同步 GDB 可用命令、执行边界和输入限制说明。
+
+## 0.46.0
+
+- Web 浏览器会话增加受限的点击、表单填充、下拉选择、按键发送和动态元素等待，支持处理依赖客户端脚本的题目页面。
+- 可读取当前授权来源的 localStorage/sessionStorage；页面写操作遵循可写会话策略。
+- 同步浏览器工具参数、边界和当前 CTF 技能说明。
+
+## 0.45.0
+
+- Misc 增加重复密钥 XOR 分析、bzip2/XZ 解压，以及 ASCII85/Z85 编解码。
+- Crypto 增加由已知 RSA 私钥指数恢复因数，以及 ECDSA nonce 重用候选恢复与公钥参数核验。
+- 同步压缩附件限制、计算参数和当前 DSH 技能说明。
+
+## 0.44.0
+
+- `calculate_offline` 的 `encode`/`decode` 新增 basE91，支持与现有字节编码及后续计算串联。
+- 补充 Misc 编码用法和当前技能说明。
+
+## 0.43.0
+
+- Misc 新增 zlib 自动识别和 raw Deflate 显式提示；解压成员或 TAR 可继续交给附件工具检查。
+- Crypto 新增 RSA `batch_gcd` 共享因子检查，广播攻击最多接受 8 组模数。
+- 更新当前 CTF 技能用法与兼容矩阵。
+
+## 0.42.0
+
+- `calculate_offline` 新增无符号大整数与字节互转，可指定字节序、Hex/Base64/Base64URL 编码和输出字节长度。
+- 支持引用附件读取结果，在同一批次串联转换、模逆和同余核验；报告原始字节长度、最大公因数或余数，便于复查。
+
+## 0.41.0
+
+- `calculate_offline` 新增已知参数和种子的 LCG 序列复算。
+- 确定性复算可按候选核对中间步骤，报告首个不符或待验证的检查点。
+- 确定性计算超时可保留完成步骤，同一会话可携原参数从未完成步骤续算。
+
+## 0.40.0
+
+- 图像、PDF、二维码、归档成员与音频提取结果可通过 `result_id` 直接传给下一项本地分析；派生字节保留哈希和来源链。
+- PNG 新增按整字节续接的连续 LSB 位流；PDF 支持页面 PNG 渲染和嵌入附件读取；新增 SQLite 只读查询及 DOCX/XLSX/PPTX/ODF 文本读取。
+- `stego_audio` 支持 24 位 PCM、声道与时间段选择；`pcap_stream` 支持 IPv4/协议/端口/UTC 过滤，并将大于 64 MiB 的 PCAP/PCAPNG 分块流式处理至 1 GiB。
+
+## 0.39.0
+
+- `inspect_attachment` 可接 `scan_binary` 的结果编号，确认普通单卷 ZIP 候选的边界、目录和首个成员头。
+- 离线编码、解码、格式转换和哈希可按结果编号复读完整文件片段或归档成员，并报告原件和数据哈希。
+- `ctf_progress` 保存预测与实际观测，可按原工具参数找回验证并复核原件是否变化。
+
+## 0.38.0
+
+- 新增 `scan_binary`，按块定位格式签名和已知字节，返回原件偏移、命中 SHA-256 与续查位置。
+- `inspect_attachment` 和 `read_archive_member` 支持指定内嵌 ZIP 的原件区间。目录查询和成员复核使用同一区间。
+
 ## 0.37.1
 
 - 补充平台请求、二进制分段读取、归档成员读取、循环模式与 ZIP 扩展工具的成功和失败路径测试；兼容性测试覆盖无提示注入接口时由 SKILL 回退。
@@ -76,7 +167,12 @@
 
 | 插件版本 | DSH 版本 | 说明 |
 |---|---|---|
-| 0.37.x | `>=0.2.2-rc.5 <0.3.0` | 当前版本；要求 `ctx.fs` 与 `tools.register`；系统提示接口缺失时回退包内 SKILL |
+| 0.49.x | `>=0.2.2-rc.5 <0.3.0` | 当前版本。默认 Core Tier（27 工具，`enableExtendedAudit: true` 恢复全部 45 工具）；新增 `ctf_sandbox`（双层镜像自动路由/WSL2 兜底）、`ctf_graph`、`ctf_arena` 与 `crypto_solver solve`。 |
+| 0.48.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。函数级 Rev 控制流分析，以及 ZIP 候选检查、文件片段复读和压缩附件链路需要对应工具及宿主能力。 |
+| 0.45.x–0.47.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本；依具体功能需要相应工具及宿主能力。 |
+| 0.44.x–0.39.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本；ZIP 候选检查与文件片段复读需要 `ctx.fs.readByteRange`。 |
+| 0.38.x | `>=0.2.2-rc.5 <0.3.0` | 扫描与 ZIP 区间查询需要 `ctx.fs.readByteRange`。 |
+| 0.37.x | `>=0.2.2-rc.5 <0.3.0` | 要求 `ctx.fs` 与 `tools.register`；系统提示接口缺失时回退包内 SKILL |
 | 0.33–0.36 | `>=0.2.2-rc.5 <0.3.0` | 旧版本；升级后工具输出默认改为紧凑 JSON |
 | 更低 | 未验证 | 低于声明范围不支持；运行时 `ctf_doctor` 可报告宿主能力缺失 |
 

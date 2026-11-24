@@ -31,6 +31,8 @@ async function readArchive(bytes, [variant, offset, limit, memberIndex], signal,
   signal?.throwIfAborted();
   const args = [variant, String(offset), String(limit), library];
   if (memberIndex !== undefined) args.push(String(memberIndex));
+  const responseLimit = memberIndex === undefined ? RESPONSE_LIMIT
+    : Math.max(RESPONSE_LIMIT, 4 * Math.ceil(Math.min(limit, MAX_ARCHIVE_MEMBER_BYTES) / 3) + 8192);
   const python = spawn(interpreter, ['-I', '-S', '-B', '-c', SCRIPT, ...args],
     { cwd: dirname(interpreter), shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
   return new Promise((resolve, reject) => {
@@ -60,7 +62,7 @@ async function readArchive(bytes, [variant, offset, limit, memberIndex], signal,
     python.stdout.on('error', () => finish(new Error('无法读取本机归档目录。')));
     python.stdout.on('data', chunk => {
       length += chunk.length;
-      if (length > RESPONSE_LIMIT) finish(new Error('本机归档读取器的响应过长。'));
+      if (length > responseLimit) finish(new Error('本机归档读取器的响应过长。'));
       else chunks.push(chunk);
     });
     python.once('close', code => {

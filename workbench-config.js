@@ -10,16 +10,24 @@ const AUTO_INSTALL_SETTINGS = new Set(['PYLAUNCHER_ALLOW_INSTALL', 'PYLAUNCHER_A
 export class WorkbenchDependencyError extends Error {}
 
 export const CONFIG_PATH_FIELDS = ['pythonPath', 'gdbPath', 'browserPath', 'base100Source', 'libarchivePath'];
-export const CONFIG_TEXT_FIELDS = ['base100Sha256', 'platformUrl', 'platformTokenEnv', 'platformInstancesPath',
-  'platformSubmitPath', 'platformLeaderboardPath', 'platformTeamId'];
+export const CONFIG_TEXT_FIELDS = ['base100Sha256', 'platformUrl', 'platformType', 'platformGameId',
+  'platformChallengesPath', 'platformTokenEnv', 'platformAuthHeader', 'platformAuthScheme',
+  'platformInstancesPath', 'platformSubmitPath', 'platformLeaderboardPath', 'platformTeamId',
+  'sandboxBackend', 'sandboxImage', 'sandboxHeavyImage', 'sandboxWslDistro'];
 export const CONFIG_LIST_FIELDS = ['networkOrigins', 'tcpTargets', 'attachmentImportRoots'];
-const CONFIG_FIELDS = [...CONFIG_PATH_FIELDS, ...CONFIG_TEXT_FIELDS, ...CONFIG_LIST_FIELDS];
+export const CONFIG_BOOLEAN_FIELDS = ['compact', 'allowInsecurePlatformHttp', 'enableExtendedAudit'];
+const CONFIG_FIELDS = [...CONFIG_PATH_FIELDS, ...CONFIG_TEXT_FIELDS, ...CONFIG_LIST_FIELDS, ...CONFIG_BOOLEAN_FIELDS];
 
 function configuredValues(source) {
-  return Object.fromEntries(CONFIG_FIELDS.filter(key => source[key] !== undefined).map(key => [key, source[key]]));
+  return Object.fromEntries(CONFIG_FIELDS.filter(key => {
+    const value = source[key];
+    if (value === undefined) return false;
+    if (CONFIG_BOOLEAN_FIELDS.includes(key)) return typeof value === 'boolean';
+    return true;
+  }).map(key => [key, source[key]]));
 }
 
-function dshHome() {
+export function dshHome() {
   return isLocalWorkbenchPath(process.env.DSH_HOME) ? process.env.DSH_HOME : join(homedir(), '.dsh');
 }
 
@@ -88,16 +96,36 @@ function probePython(path, prefix, signal) {
   });
 }
 
+function fileStamp(file) {
+  try {
+    const info = statSync(file);
+    return `${info.mtimeMs}:${info.size}:${info.ino}`;
+  } catch (error) {
+    return error.code === 'ENOENT' ? 'ENOENT' : `ERR:${error.code ?? 'unknown'}`;
+  }
+}
+
 export function createWorkbenchEnvironment(overrides = {}, configFile) {
   let config;
+  let stamp;
   let python;
+  let pythonSetting;
   let configIssue;
+  const resolvedFile = () => configFile ?? join(dshHome(), 'ctf-workbench.json');
   const settings = () => {
-    if (config !== undefined) return config;
+    const file = resolvedFile();
+    const currentStamp = fileStamp(file);
+    if (config !== undefined && currentStamp === stamp) return config;
+    stamp = currentStamp;
+    configIssue = undefined;
     let user = {};
-    try { user = configuredValues(readWorkbenchConfig(configFile)); }
+    try { user = configuredValues(readWorkbenchConfig(file)); }
     catch (error) { configIssue = error.message; }
     config = { ...user, ...configuredValues(overrides) };
+    if (config.pythonPath !== pythonSetting) {
+      python = undefined;
+      pythonSetting = config.pythonPath;
+    }
     return config;
   };
   return {

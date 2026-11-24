@@ -208,7 +208,7 @@ def main():
     variant, offset, limit, library_path, *selection = sys.argv[1:]
     offset, limit = int(offset), int(limit)
     member_index = int(selection[0]) if selection else None
-    if member_index is not None and (member_index < 0 or offset < 0 or not 1 <= limit <= 4096):
+    if member_index is not None and (member_index < 0 or offset < 0 or not 1 <= limit <= MAX_MEMBER):
         raise ValueError("Invalid member read parameters")
     data = sys.stdin.buffer.read(MAX_INPUT + 1)
     if len(data) > MAX_INPUT:

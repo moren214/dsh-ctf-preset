@@ -137,21 +137,23 @@ function inspectWasm(bytes, paging) {
   return { format, status: 'ok', version, layout: page('sections', total, rows, paging.offset) };
 }
 
-export function inspectAttachment(bytes, paging, pcapngQuery) {
+export function inspectAttachment(bytes, paging, pcapngQuery, formatHint) {
   const prefix = bytes.subarray(0, 4);
   if (pcapngQuery === undefined && prefix.equals(ELF_MAGIC)) return { status: 'ok', ...inspectElf(bytes, paging) };
   let report;
   if (pcapngQuery !== undefined) {
     report = inspectCapture(bytes, paging, pcapngQuery);
+  } else if (formatHint === 'zlib' || formatHint === 'deflate_raw') {
+    report = inspectArchive(bytes, paging, formatHint);
   } else if (prefix.equals(WASM_MAGIC)) {
     report = inspectWasm(bytes, paging);
   } else {
-    report = inspectImage(bytes, paging) ?? inspectCapture(bytes, paging) ?? inspectArchive(bytes, paging);
+    report = inspectImage(bytes, paging) ?? inspectCapture(bytes, paging) ?? inspectArchive(bytes, paging, formatHint);
     if (report === undefined && bytes[0] === 0x4d && bytes[1] === 0x5a) report = inspectPe(bytes, paging);
   }
   report ??= {
     format: 'unknown', status: 'unsupported',
-    reason: '可检查 PNG、JPEG、ELF、PE、ZIP、ZIP64、7z、RAR、TAR、TAR.GZ、gzip、PCAP、PCAPNG 和 WebAssembly。未知格式可使用 read_binary_range。',
+    reason: '可检查 PNG、JPEG、ELF、PE、ZIP、ZIP64、7z、RAR、TAR、TAR.GZ、gzip、zlib、bzip2、xz 和 raw Deflate（需指定格式），以及 PCAP、PCAPNG 和 WebAssembly。未知格式可使用 read_binary_range。',
   };
   return { ...report, size: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
 }

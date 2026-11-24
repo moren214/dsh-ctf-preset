@@ -6,9 +6,9 @@ const MAX_STRINGS = 32;
 const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 export const BYTE_WINDOW_PROPERTIES = {
-  byte_offset: { type: 'integer', minimum: 0, description: '零起始字节偏移。续读使用 next_byte_offset。' },
-  byte_length: { type: 'integer', minimum: 1, maximum: MAX_WINDOW_BYTES, description: '要读的字节数，每段最多 4096。' },
-  encoding: { type: 'string', enum: ENCODINGS, description: 'auto 在完整 UTF-8 文本和十六进制转储之间选择。' },
+  byte_offset: { type: 'integer', minimum: 0 },
+  byte_length: { type: 'integer', minimum: 1, maximum: MAX_WINDOW_BYTES },
+  encoding: { type: 'string', enum: ENCODINGS },
 };
 
 export function parseByteWindow(args, defaultEncoding, defaultLength) {

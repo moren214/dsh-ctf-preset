@@ -6,15 +6,15 @@ const UTC_TIMESTAMP = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,127}))?Z
 
 export const PCAPNG_QUERY_SCHEMA = {
   type: 'object',
-  description: '可选的 PCAPNG 统计查询。packet_count 和 captured_bytes 对应匹配的记录。excluded_untimed_packets 单列因缺少时间戳而排除的包。',
+  description: 'PCAPNG 统计/筛选查询。',
   additionalProperties: false,
   properties: {
-    view: { type: 'string', enum: ['interfaces', 'packets'], description: 'interfaces 分页列接口统计（默认）。packets 分页列匹配包的时间和文件偏移。' },
-    section_index: { type: 'integer', minimum: 0, description: '可选的节编号，从 0 开始。' },
-    interface_id: { type: 'integer', minimum: 0, description: '可选的接口编号，从 0 开始。不同节中的同号接口分别报告。' },
-    start_utc: { type: 'string', description: '可选的 UTC 起点（含）。使用 YYYY-MM-DDTHH:mm:ss[.小数]Z。' },
-    end_utc: { type: 'string', description: '可选的 UTC 终点（不含）。时间窗口仅统计带时间戳的包。' },
-    end_inclusive: { type: 'boolean', description: '设为 true 时包含 end_utc 恰好对应的包。默认 false。' },
+    view: { type: 'string', enum: ['interfaces', 'packets'] },
+    section_index: { type: 'integer', minimum: 0 },
+    interface_id: { type: 'integer', minimum: 0 },
+    start_utc: { type: 'string' },
+    end_utc: { type: 'string' },
+    end_inclusive: { type: 'boolean' },
   },
 };
 

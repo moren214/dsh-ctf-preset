@@ -6,6 +6,9 @@ const WORKSPACE_LIMIT = 8;
 const MAX_RESULT_BYTES = 64 * 1024;
 const MAX_BUCKET_BYTES = 4 * 1024 * 1024;
 const MAX_SUMMARY_CONTAINERS = 4096;
+const MAX_DERIVED_ARTIFACTS = 32;
+const MAX_DERIVED_ARTIFACT_BYTES = 16 * 1024 * 1024;
+const MAX_DERIVED_ARTIFACT_ITEM_BYTES = 12 * 1024 * 1024;
 const POINTER = /^(?:\/(?:[^~/\r\n\0]|~[01])*)+$/u;
 export const RESULT_HASH = /^[a-f0-9]{64}$/u;
 export const MAX_VALUE_LENGTH = 256;
@@ -153,7 +156,7 @@ export function createToolResults() {
       const id = createHash('sha256').update(tool).update('\0').update(json).digest('hex');
       let results = sessions.get(session);
       if (!results) {
-        results = { workspaces: new Map(), offline: bucket(), session: bucket() };
+        results = { workspaces: new Map(), offline: bucket(), session: bucket(), artifacts: new Map(), artifactBytes: 0 };
         sessions.set(session, results);
       }
       let cache;
@@ -169,6 +172,35 @@ export function createToolResults() {
       }
       storeResult(cache, id, { bytes, result, created_at: Date.now() }, scope === null ? SESSION_RESULT_LIMIT : EVIDENCE_RESULT_LIMIT);
       return id;
+    },
+    rememberArtifact(session, id, bytes, evidence = []) {
+      if (session === null || typeof session !== 'object' || typeof id !== 'string'
+        || !RESULT_HASH.test(id) || !Buffer.isBuffer(bytes) || bytes.length > MAX_DERIVED_ARTIFACT_ITEM_BYTES) return false;
+      let results = sessions.get(session);
+      if (!results) {
+        results = { workspaces: new Map(), offline: bucket(), session: bucket(), artifacts: new Map(), artifactBytes: 0 };
+        sessions.set(session, results);
+      }
+      const previous = results.artifacts.get(id);
+      if (previous) results.artifactBytes -= previous.bytes.length;
+      const artifact = { bytes: Buffer.from(bytes), evidence: Array.isArray(evidence) ? JSON.parse(JSON.stringify(evidence)) : [] };
+      results.artifacts.delete(id);
+      results.artifacts.set(id, artifact);
+      results.artifactBytes += artifact.bytes.length;
+      while (results.artifacts.size > MAX_DERIVED_ARTIFACTS || results.artifactBytes > MAX_DERIVED_ARTIFACT_BYTES) {
+        const oldest = results.artifacts.keys().next().value;
+        results.artifactBytes -= results.artifacts.get(oldest).bytes.length;
+        results.artifacts.delete(oldest);
+      }
+      return results.artifacts.has(id);
+    },
+    getArtifact(session, id) {
+      const results = sessions.get(session);
+      const entry = results?.artifacts.get(id);
+      if (!entry) return undefined;
+      results.artifacts.delete(id);
+      results.artifacts.set(id, entry);
+      return { bytes: Buffer.from(entry.bytes), evidence: JSON.parse(JSON.stringify(entry.evidence)) };
     },
     list(session, scope) {
       const results = sessions.get(session);

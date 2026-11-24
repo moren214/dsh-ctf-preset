@@ -12,6 +12,12 @@ const MAX_FILE_SIZE = 64 * 1024 * 1024;
 const DEFAULT_COUNT = 100;
 const MIN_COUNT = 20;
 const MAX_COUNT = 400;
+const DEFAULT_MAX_BLOCKS = 64;
+const MIN_MAX_BLOCKS = 1;
+const MAX_MAX_BLOCKS = 256;
+const DEFAULT_MAX_INSTRUCTIONS = 512;
+const MIN_MAX_INSTRUCTIONS = 32;
+const MAX_MAX_INSTRUCTIONS = 2048;
 const DEFAULT_MIN_LENGTH = 6;
 const MIN_MIN_LENGTH = 4;
 const MAX_MIN_LENGTH = 64;
@@ -20,43 +26,16 @@ const MAX_MIN_LENGTH = 64;
  * rev_query 的结构化输入。外层 required 与工具注册保持一致，由 registerTool 补充。
  */
 export const REV_QUERY_PROPERTIES = {
-  operation: {
-    type: 'string',
-    enum: ['disassemble', 'strings'],
-    description: '查询类型：disassemble 线性反汇编 x86-64 指令；strings 扫描 ELF 中的可见字符串。',
-  },
-  file_path: {
-    type: 'string',
-    description: '相对会话工作目录的 ELF 文件路径，例如 chall/pie；不能是绝对路径或越出工作目录。',
-  },
-  symbol: {
-    type: 'string',
-    description: 'disassemble 的起始函数符号（如 main、_start），按符号表优先查找 STT_FUNC；未指定 address 时生效。',
-  },
-  address: {
-    type: 'string',
-    description: 'disassemble 的起始虚拟地址，十六进制（如 0x401136）或十进制；指定时优先于 symbol。',
-  },
-  count: {
-    type: 'integer',
-    minimum: MIN_COUNT,
-    maximum: MAX_COUNT,
-    description: 'disassemble 返回的指令条数，默认 100。',
-  },
-  min_length: {
-    type: 'integer',
-    minimum: MIN_MIN_LENGTH,
-    maximum: MAX_MIN_LENGTH,
-    description: 'strings 的最小字符串长度，默认 6。',
-  },
-  section: {
-    type: 'string',
-    description: '限定节名（如 .text、.rodata）：反汇编从该节起始处开始，strings 只扫描该节；不指定时按符号/地址/入口反汇编，strings 扫描全部非可执行可读节。',
-  },
-  python_path: {
-    type: 'string',
-    description: '可选的 Python 解释器绝对路径；不指定时依次尝试 options.pythonPath、py -3、python、python3。',
-  },
+  operation: { type: 'string', enum: ['disassemble', 'cfg', 'strings', 'triage'], description: 'disassemble/cfg/strings/triage（triage 无需 capstone）。' },
+  file_path: { type: 'string', description: '相对 ELF/PE 路径。' },
+  symbol: { type: 'string' },
+  address: { type: 'string' },
+  count: { type: 'integer', minimum: MIN_COUNT, maximum: MAX_COUNT },
+  max_blocks: { type: 'integer', minimum: MIN_MAX_BLOCKS, maximum: MAX_MAX_BLOCKS },
+  max_instructions: { type: 'integer', minimum: MIN_MAX_INSTRUCTIONS, maximum: MAX_MAX_INSTRUCTIONS },
+  min_length: { type: 'integer', minimum: MIN_MIN_LENGTH, maximum: MAX_MIN_LENGTH },
+  section: { type: 'string' },
+  python_path: { type: 'string' },
 };
 
 class WorkerUnavailableError extends Error {
@@ -169,7 +148,8 @@ function spawnWorker(candidate, request, options) {
   return new Promise((resolve, reject) => {
     const args = [
       ...candidate.prefix,
-      '-I',
+      '-E',
+      '-P',
       '-X',
       'utf8',
       '-B',
@@ -325,8 +305,8 @@ export async function runRevQuery(input, options = {}) {
   }
   if (options === null || typeof options !== 'object') options = {};
   const operation = input.operation;
-  if (operation !== 'disassemble' && operation !== 'strings') {
-    throw new Error('operation 必须是 disassemble 或 strings。');
+  if (operation !== 'disassemble' && operation !== 'cfg' && operation !== 'strings' && operation !== 'triage') {
+    throw new Error('operation 必须是 disassemble、cfg、strings 或 triage。');
   }
 
   const file = normalizeFilePath(input.file_path);
@@ -365,7 +345,26 @@ export async function runRevQuery(input, options = {}) {
     request.count = integerInRange(
       input.count, DEFAULT_COUNT, MIN_COUNT, MAX_COUNT, 'count',
     );
-  } else {
+  } else if (operation === 'cfg') {
+    if (address !== undefined && symbol !== undefined) {
+      throw new Error('cfg 的 address 与 symbol 不能同时指定。');
+    }
+    if (address === undefined && symbol === undefined) {
+      throw new Error('cfg 必须指定 symbol 或 address。');
+    }
+    if (section !== undefined) {
+      throw new Error('cfg 不接受 section；请指定函数 symbol 或 address。');
+    }
+    if (symbol !== undefined) request.symbol = symbol;
+    if (address !== undefined) request.address = address;
+    request.max_blocks = integerInRange(
+      input.max_blocks, DEFAULT_MAX_BLOCKS, MIN_MAX_BLOCKS, MAX_MAX_BLOCKS, 'max_blocks',
+    );
+    request.max_instructions = integerInRange(
+      input.max_instructions, DEFAULT_MAX_INSTRUCTIONS,
+      MIN_MAX_INSTRUCTIONS, MAX_MAX_INSTRUCTIONS, 'max_instructions',
+    );
+  } else if (operation === 'strings') {
     if (symbol !== undefined || address !== undefined) {
       throw new Error('strings 查询不接受 symbol 或 address。');
     }
@@ -373,6 +372,10 @@ export async function runRevQuery(input, options = {}) {
     request.min_length = integerInRange(
       input.min_length, DEFAULT_MIN_LENGTH, MIN_MIN_LENGTH, MAX_MIN_LENGTH, 'min_length',
     );
+  } else {
+    if (symbol !== undefined || address !== undefined || section !== undefined) {
+      throw new Error('triage 查询不接受 symbol、address 或 section。');
+    }
   }
 
   const pythonPath = explicitPython(input, options);
