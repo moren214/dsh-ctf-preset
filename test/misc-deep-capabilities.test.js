@@ -8,6 +8,8 @@ import { deflateSync } from 'node:zlib';
 import test from 'node:test';
 import { apply } from '../ctf-tools.js';
 import { pcapStream } from '../pcap-stream.js';
+import { inspectImage } from '../image-metadata.js';
+import { inspectExif } from '../exif.js';
 
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const python = execFileSync(process.platform === 'win32' ? 'python' : 'python3',
@@ -218,6 +220,38 @@ test('归档成员、PNG 连续位流和 PDF 附件可直接传给下一工具',
 
   const office = await call(tools, 'inspect_media', { file_path: 'challenge.docx', kind: 'office' }, execution);
   assert.match(office.sections[0].text, /office evidence/u);
+});
+
+test('PNG CRC 损坏会给出部分结果和偏移警告，并保留可解析的图像结构', () => {
+  const bytes = grayPng(2, 1, [1, 2]);
+  bytes[29] ^= 0x01; // IHDR CRC only; chunk length and following structure remain intact.
+  const report = inspectImage(bytes, { offset: 0, limit: 20 });
+  assert.equal(report.format, 'PNG');
+  assert.equal(report.status, 'partial');
+  assert.deepEqual(report.image, { width: 2, height: 1, bit_depth: 8, color_type: 0, color_mode: 'grayscale', interlaced: false, file_offset: 16 });
+  assert.match(report.warnings[0].reason, /IHDR.*CRC-32/u);
+  assert.equal(report.warnings[0].file_offset, 29);
+});
+
+test('EXIF UserComment 解码 ASCII 与按 TIFF 字节序标记的 Unicode', () => {
+  const makeExif = (comment, byteOrder = 'II') => {
+    const little = byteOrder === 'II';
+    const bytes = Buffer.alloc(46 + comment.length);
+    bytes.write(byteOrder, 0, 2, 'ascii');
+    const w16 = little ? bytes.writeUInt16LE.bind(bytes) : bytes.writeUInt16BE.bind(bytes);
+    const w32 = little ? bytes.writeUInt32LE.bind(bytes) : bytes.writeUInt32BE.bind(bytes);
+    w16(42, 2); w32(8, 4); w16(1, 8);
+    w16(0x8769, 10); w16(4, 12); w32(1, 14); w32(26, 18);
+    w16(1, 26); w16(0x9286, 28); w16(7, 30); w32(comment.length, 32); w32(46, 36);
+    comment.copy(bytes, 46);
+    return bytes;
+  };
+  const ascii = Buffer.concat([Buffer.from('ASCII\0\0\0'), Buffer.from('flag{ascii}')]);
+  assert.equal(inspectExif(makeExif(ascii), 0).user_comment.value, 'flag{ascii}');
+  const unicode = Buffer.concat([Buffer.from('UNICODE\0'), Buffer.from('flag{unicode}', 'utf16le')]);
+  const report = inspectExif(makeExif(unicode), 0);
+  assert.equal(report.user_comment.value, 'flag{unicode}');
+  assert.equal(report.user_comment.encoding, 'UTF-16LE');
 });
 
 function wav24ExtensibleWithPng(payload, startFrame = 3) {
@@ -461,4 +495,22 @@ test('经典 PCAP 与 PCAPNG 超过 64 MiB 时分块读取并保留哈希和过�
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+test('PCAPNG 大文件流式解析拒绝短 Section Header Block', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'dsh-pcapng-short-shb-'));
+  t.after(() => rm(cwd, { recursive: true, force: true, maxRetries: 8, retryDelay: 40 }));
+  const file = join(cwd, 'short.pcapng');
+  const shb = Buffer.alloc(12);
+  shb.writeUInt32BE(0x0a0d0d0a, 0);
+  shb.writeUInt32LE(12, 4);
+  shb.writeUInt32LE(0x1a2b3c4d, 8);
+  const handle = await open(file, 'w');
+  try {
+    await handle.write(shb, 0, shb.length, 0);
+    await handle.truncate(64 * 1024 * 1024 + 1);
+  } finally {
+    await handle.close();
+  }
+  await assert.rejects(pcapStream({ file_path: 'short.pcapng' }, { cwd }), /Section Header Block.*长度无效/u);
 });

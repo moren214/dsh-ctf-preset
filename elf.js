@@ -4,6 +4,7 @@ const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
 const MAX_HEADERS = 8192;
 const MAX_TABLE_ENTRIES = 65536;
 const PT_LOAD = 1;
+const PT_DYNAMIC = 2;
 const PT_INTERP = 3;
 const SHT_SYMTAB = 2;
 const SHT_STRTAB = 3;
@@ -20,6 +21,9 @@ const SHT_DYNAMIC = 6;
 const SHN_UNDEF = 0;
 const DT_NULL = 0n;
 const DT_NEEDED = 1n;
+const DT_STRTAB = 5n;
+const DT_SYMTAB = 6n;
+const DT_STRSZ = 10n;
 const DT_BIND_NOW = 24n;
 const DT_FLAGS = 30n;
 const DT_FLAGS_1 = 0x6ffffffbn;
@@ -313,9 +317,11 @@ function symbolFacts(elf) {
       if (nameOffset >= strings.size) continue;
       const name = tableString(elf, strings, nameOffset);
       if (name === '') continue;
-      if (name === '__stack_chk_fail' || name === '__stack_chk_guard') canary = true;
-      if (name.endsWith('_chk')) fortify = true;
-      if (section.type === SHT_DYNSYM && elf.u16(offset + (elf.is64 ? 6 : 14)) === SHN_UNDEF) {
+      if (name === '__stack_chk_fail' || name === '__stack_chk_fail_local' || name === '__stack_chk_guard') canary = true;
+      const undefinedDynamicSymbol = section.type === SHT_DYNSYM
+        && elf.u16(offset + (elf.is64 ? 6 : 14)) === SHN_UNDEF;
+      if (undefinedDynamicSymbol && /^__[A-Za-z0-9_]+_chk$/u.test(name)) fortify = true;
+      if (undefinedDynamicSymbol) {
         importTotal++;
         names.add(name);
       }
@@ -333,24 +339,41 @@ function symbolFacts(elf) {
 
 function dynamicFacts(elf) {
   const section = elf.sections.find(item => item.type === SHT_DYNAMIC);
-  if (section === undefined) return undefined;
   const entrySize = elf.is64 ? 16 : 8;
-  const table = sectionTable(elf, section, entrySize);
-  if (!table) return undefined;
-  const strings = elf.sections[section.link];
-  const hasStrings = strings?.type === SHT_STRTAB && fileRange(elf.bytes, strings.offset, strings.size);
+  let table;
+  let stringFileOffset;
+  let stringSize = 0n;
+  if (section !== undefined) {
+    table = sectionTable(elf, section, entrySize);
+    if (!table) return undefined;
+    const strings = elf.sections[section.link];
+    if (strings?.type === SHT_STRTAB && fileRange(elf.bytes, strings.offset, strings.size)) {
+      stringFileOffset = strings.offset;
+      stringSize = strings.size;
+    }
+  } else {
+    const segment = elf.programs.find(item => item.type === PT_DYNAMIC);
+    if (segment === undefined || segment.fileSize % BigInt(entrySize) !== 0n
+      || !fileRange(elf.bytes, segment.fileOffset, segment.fileSize)) return undefined;
+    const count = segment.fileSize / BigInt(entrySize);
+    if (count > MAX_TABLE_ENTRIES) return undefined;
+    table = { offset: Number(segment.fileOffset), count: Number(count) };
+  }
   let flags = 0;
   let flags1 = 0;
   let bindNow = false;
   const needed = [];
+  let stringAddress;
+  let dynamicStringSize;
+  let hasDynamicSymbols = false;
   for (let index = 0; index < table.count; index++) {
     const offset = table.offset + index * entrySize;
     const tag = elf.word(offset);
     const value = elf.word(offset + (elf.is64 ? 8 : 4));
     if (tag === DT_NULL) break;
     if (tag === DT_NEEDED) {
-      if (hasStrings && needed.length < MAX_NEEDED && value < strings.size) {
-        const name = tableString(elf, strings, value);
+      if (needed.length < MAX_NEEDED && value < stringSize && stringFileOffset !== undefined) {
+        const name = tableString(elf, { offset: stringFileOffset, size: stringSize }, value);
         if (name !== '') needed.push(name);
       }
     } else if (tag === DT_FLAGS) {
@@ -359,9 +382,33 @@ function dynamicFacts(elf) {
       flags1 = Number(value);
     } else if (tag === DT_BIND_NOW) {
       bindNow = true;
+    } else if (tag === DT_STRTAB) {
+      stringAddress = value;
+    } else if (tag === DT_STRSZ) {
+      dynamicStringSize = value;
+    } else if (tag === DT_SYMTAB) {
+      hasDynamicSymbols = true;
     }
   }
-  return { flags, flags1, bindNow, needed };
+  if (stringFileOffset === undefined && stringAddress !== undefined && dynamicStringSize !== undefined) {
+    const mapped = mappedFileOffset(elf, stringAddress, dynamicStringSize, false);
+    if (mapped !== undefined && fileRange(elf.bytes, mapped, dynamicStringSize)) {
+      stringFileOffset = mapped;
+      stringSize = dynamicStringSize;
+      // Re-read DT_NEEDED after locating the dynamic string table.
+      for (let index = 0; index < table.count && needed.length < MAX_NEEDED; index++) {
+        const offset = table.offset + index * entrySize;
+        if (elf.word(offset) === DT_NULL) break;
+        if (elf.word(offset) !== DT_NEEDED) continue;
+        const value = elf.word(offset + (elf.is64 ? 8 : 4));
+        if (value < stringSize) {
+          const name = tableString(elf, { offset: stringFileOffset, size: stringSize }, value);
+          if (name) needed.push(name);
+        }
+      }
+    }
+  }
+  return { flags, flags1, bindNow, needed, hasDynamicSymbols };
 }
 
 function gadgetFacts(elf) {
@@ -395,11 +442,10 @@ function gadgetFacts(elf) {
   return { status: 'scanned', bytes_scanned: scanned, truncated, patterns };
 }
 
-function securityFacts(elf) {
+function securityFacts(elf, dynamic = dynamicFacts(elf)) {
   const stack = elf.programs.find(item => item.type === PT_GNU_STACK);
   const relroSegment = elf.programs.some(item => item.type === PT_GNU_RELRO);
   const interpreter = elf.programs.some(item => item.type === PT_INTERP);
-  const dynamic = dynamicFacts(elf);
   let pie = null;
   let pieEvidence = '没有可判定的装载类型。';
   if (elf.type === 2) {
@@ -636,6 +682,7 @@ function digest(bytes) {
 
 export function inspectElf(bytes, paging) {
   const elf = parseElf(bytes);
+  const dynamic = dynamicFacts(elf);
   const entryOffset = mappedFileOffset(elf, elf.entry, 1n);
   const hasInterpreter = elf.programs.some(segment => segment.type === PT_INTERP);
   const facts = {
@@ -651,8 +698,8 @@ export function inspectElf(bytes, paging) {
     section_headers: elf.sections.length,
     has_interpreter: hasInterpreter,
     has_static_symbols: elf.sections.some(section => section.type === SHT_SYMTAB),
-    has_dynamic_symbols: elf.sections.some(section => section.type === SHT_DYNSYM),
-    security: securityFacts(elf),
+    has_dynamic_symbols: elf.sections.some(section => section.type === SHT_DYNSYM) || dynamic?.hasDynamicSymbols === true,
+    security: securityFacts(elf, dynamic),
     pwn: pwnFacts(elf),
     startup: startupEvidence(elf),
   };

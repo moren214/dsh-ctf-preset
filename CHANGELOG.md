@@ -1,5 +1,27 @@
 # 变更记录
 
+## 0.51.0
+
+- **审计回归与可复现构建**：新增 `test/audit-regressions.test.js` 锁定本轮修复的六处缺陷（PCAP 按 UTC 时间过滤、GGUF 字符串数组模板注入、Safetensors `__metadata__` 模板注入、Ghidra `image_base`/相对地址契约、`ctf_sandbox` 的 `result_id` 链路、提交账本坏行容错）；CI 增加 Python worker 编译检查与真实容器隔离冒烟；`docker/Dockerfile` 的基础镜像改为按 digest 固定，`bkcrack`/`ffuf`/`pwninit`/`gef` 与 `Dockerfile.heavy` 的 `ghidra`/`jadx`/`apktool` 均校验 SHA-256。
+- **提交账本可观测性**：`check_flag`/`submit_flag` 现在回报 `corrupted_receipts` 计数，坏行不再静默消失；实例账本解析失败时退化为空表而不是让 `ctf_instance`/`ctf_arena`/`submit_flag` 一起失败。
+
+
+- **P0 安全与模型扫描修复**：要求隔离的沙箱任务在 `backend: "auto"` 下不再静默回退到共享宿主权限的 WSL2；动态靶机授权按会话/工作区隔离、限时并支持删除撤销；`ctf_arena detail` 不再从自由文本描述授权 URL；GDB stdin 路径改用 POSIX 安全引用；Pickle、GGUF 与 PyTorch ZIP 扫描截断会报告 `incomplete` 且至少为中风险，并补充危险 Torch 加载入口识别。
+- **P0 平台凭据边界**：`ctf_arena fetch_files` 的同源附件下载复用 CTFd/GZCTF 适配器认证；跳转到其他来源时仍不携带平台凭据。
+- **P1 图谱租约与分页**：未认领的 Intent 不能直接结案；`board` 的 `ruled_out` 现与 Facts/Intents 共用 offset 并在 `paging` 中报告总量和后续页状态。
+- **P1 Python 配置热重载**：`resolvePython()` 每次先检查配置文件版本；更改 `pythonPath` 后会重新探测解释器，不再返回旧缓存。
+- **P1 ELF 防护识别**：`__stack_chk_fail_local` 计入 canary 证据；FORTIFY 只由未定义的标准 `__*_chk` 动态导入触发，避免把自定义函数误报为保护。
+- **P1 平台跳转**：允许通过逐跳来源授权的同源 API 跳转；跨来源跳转仍被阻断，POST 等请求体不会被自动重放。
+- **P1 跨平台与反编译诊断**：Linux 沙箱执行前规范化 `.sh` 的 CRLF；Ghidra/r2 非零退出或空函数结果会显式报错或标出回退；平台自动探测不再吞掉认证、网络和取消异常。
+- **P1 只读与续接错误契约**：只读会话仍可查看实时榜单（`recorded: false`）；`ctf_progress` 只读拒绝和过期 revision 分别报告 `permission` / `conflict`，handoff 同时保留旧值与只读告警；补齐 `FS_STALE_VERSION`、`FS_NOT_OBSERVED` 与 `EBUSY` 的冲突分类。
+- **P1 取证与密码学回归**：覆盖 PNG CRC 损坏告警、EXIF UserComment、无节头 ELF、RSA 明文长度、广义 LCG CRT、PCAP 缓冲区与畸形节头、浏览器隧道超时及 Ghidra/r2 边界。
+- **P1 动态网络与大抓包保护**：支持经结构化靶机信息授权 IPv6 TCP 地址；动态授权表达到上限时不再驱逐仍有效端点；TCP 乱序缓存增加 16 MiB 全局字节预算并复制小片段，超限状态显式可见。
+- **P1 附件部分成功契约**：`ctf_arena fetch_files` 超过单次 8 个附件时返回 `partial`、总数、遗漏数及 `fetch_attachment` 补充路径。
+- **P1 ONNX 扫描完整性**：ONNX GraphProto 节点尚未遍历时，扫描结果明确标为 `incomplete` 且风险至少为中；外部路径特征扫描覆盖完整输入。真实大模型边界用例验证超过 2 MiB 的载荷仍会被检查。
+- **P1 未覆盖模块与容器运行加固**：新增真实磁盘/字节与 Python worker 用例覆盖此前 10 个函数覆盖率为 0% 的 JS 模块；Docker 容器改以 UID 10001 运行，RAM 与 swap 限额相同，Python 工具装入共享系统包的 venv 以避免覆盖 apt 管理的 NumPy/fpylll；构建支持 apt、pip、GitHub 与 RubyGems 镜像参数，`r2ghidra` 安装失败会让镜像构建失败。
+- **P1 动态 flag 新鲜度**：`ctf_arena` 的容器 create/extend/delete 写入共享实例账本；`ctf_arena(submit)` 与 `submit_flag` 忽略调用方自报的 `refreshed_at`，只接受账本中 30 分钟内且未删除的实例记录。
+- **跨平台契约说明**：同步 README 与 SKILL 的沙箱回退行为和题面动态授权边界。未新增运行时依赖、配置字段或文件，因此 `package.json` 的 `files` 清单无需变更。
+
 ## 0.50.0
 
 - **Schema 瘦身、图谱分页与 Writeup 导出（包 A）**：
@@ -181,7 +203,8 @@
 
 | 插件版本 | DSH 版本 | 说明 |
 |---|---|---|
-| 0.50.x | `>=0.2.2-rc.5 <0.3.0` | 当前版本。保持 Core Tier（27 核心 / 45 全量）；精简 `ctf_progress` schema、新增 `ctf_graph` 分页/`export_writeup`、`ctf_arena` GZCTF Cookie/续期/solves 排优、`browser_session` Web 进阶、Docker 加固与 `bkcrack`/`ffuf`/`sqlmap` 等兵器、`mobile_apk` 沙箱桥接、`inspect_media(kind: "model")` 及 3 个密码学脚手架。 |
+| 0.51.x | `>=0.2.2-rc.5 <0.3.0` | 当前版本。补审计回归用例、CI 容器冒烟与镜像 digest/SHA-256 锁定，提交账本坏行可见。 |
+| 0.50.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。保持 Core Tier（27 核心 / 45 全量）；精简 `ctf_progress` schema、新增 `ctf_graph` 分页/`export_writeup`、`ctf_arena` GZCTF Cookie/续期/solves 排优、`browser_session` Web 进阶、Docker 加固与 `bkcrack`/`ffuf`/`sqlmap` 等兵器、`mobile_apk` 沙箱桥接、`inspect_media(kind: "model")` 及 3 个密码学脚手架。 |
 | 0.49.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。默认 Core Tier（27 工具，`enableExtendedAudit: true` 恢复全部 45 工具）；新增 `ctf_sandbox`（双层镜像自动路由/WSL2 兜底）、`ctf_graph`、`ctf_arena` 与 `crypto_solver solve`。 |
 | 0.48.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。函数级 Rev 控制流分析，以及 ZIP 候选检查、文件片段复读和压缩附件链路需要对应工具及宿主能力。 |
 | 0.45.x–0.47.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本；依具体功能需要相应工具及宿主能力。 |

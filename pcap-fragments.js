@@ -41,7 +41,7 @@ export function ipv4Fragments() {
       }
       if (record.pieces.length >= MAX_PIECES) return invalid();
       if (!more) record.end = end;
-      record.pieces.push({ offset, end, bytes, more });
+      record.pieces.push({ offset, end, bytes: Buffer.from(bytes), more });
       if (record.end === undefined) return null;
       record.pieces.sort((left, right) => left.offset - right.offset);
       let cursor = 0;

@@ -18,7 +18,8 @@ export const ARENA_PROPERTIES = {
   challenge_id: { type: 'string', maxLength: 120 },
   category: { type: 'string', maxLength: 120 },
   unsolved_only: { type: 'boolean', default: true },
-  limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
+  limit: { type: 'integer', minimum: 1, maximum: 200, default: 20 },
+  offset: { type: 'integer', minimum: 0, maximum: 5000, default: 0, description: '分页起始偏移（支持超过 50 题的大型赛场）。' },
   container_action: { type: 'string', enum: ['create', 'delete', 'extend'] },
   flag: { type: 'string', maxLength: 512 },
   pattern: { type: 'string', maxLength: 200 },
@@ -26,6 +27,7 @@ export const ARENA_PROPERTIES = {
   dynamic: { type: 'boolean' },
   instance: { type: 'string', maxLength: 200 },
   refreshed_at: { type: 'string', maxLength: 40 },
+  retry_unknown: { type: 'boolean', description: '上次提交为 unknown/pending（如 429/超时）时允许重提。' },
 };
 
 function safeId(value, label) {
@@ -76,26 +78,24 @@ export async function resolveAdapter(config, requestedType, gameId, signal, requ
     throw new ToolError('unsupported', `platform_type 须为 ${ARENA_ADAPTERS.join('、')} 之一。`);
   }
   if (configured !== 'auto') return configured;
+  const checkProbeAuth = response => {
+    if ([401, 403].includes(Number(response?.status))) {
+      throw new ToolError('permission', '平台自动探测收到认证拒绝，请核对平台凭据及权限。');
+    }
+    return response;
+  };
   if (gameId) {
-    try {
-      const gz = await requestFn(adapterConfig(config, 'gzctf'), signal, 'GET', `/api/game/${encodeURIComponent(gameId)}/details`);
-      if (okHttp(gz)) return 'gzctf';
-    } catch { /* fall through */ }
+    const gz = checkProbeAuth(await requestFn(adapterConfig(config, 'gzctf'), signal, 'GET', `/api/game/${encodeURIComponent(gameId)}/details`));
+    if (okHttp(gz)) return 'gzctf';
   }
-  try {
-    const ctfd = await requestFn(adapterConfig(config, 'ctfd'), signal, 'GET', '/api/v1/challenges');
-    const body = parseJsonBody(ctfd);
-    if (okHttp(ctfd) && body && typeof body === 'object' && body.success === true && Array.isArray(body.data)) {
-      return 'ctfd';
-    }
-  } catch { /* fall through */ }
-  try {
-    const gz = await requestFn(adapterConfig(config, 'gzctf'), signal, 'GET', '/api/game');
-    const body = parseJsonBody(gz);
-    if (okHttp(gz) && (Array.isArray(body) || Array.isArray(body?.data))) {
-      return 'gzctf';
-    }
-  } catch { /* fall through */ }
+  const ctfd = checkProbeAuth(await requestFn(adapterConfig(config, 'ctfd'), signal, 'GET', '/api/v1/challenges'));
+  const ctfdBody = parseJsonBody(ctfd);
+  if (okHttp(ctfd) && ctfdBody && typeof ctfdBody === 'object' && ctfdBody.success === true && Array.isArray(ctfdBody.data)) {
+    return 'ctfd';
+  }
+  const gz = checkProbeAuth(await requestFn(adapterConfig(config, 'gzctf'), signal, 'GET', '/api/game'));
+  const gzBody = parseJsonBody(gz);
+  if (okHttp(gz) && (Array.isArray(gzBody) || Array.isArray(gzBody?.data))) return 'gzctf';
   return 'generic';
 }
 
@@ -197,7 +197,7 @@ function normalizeSubmitResponse(adapter, response) {
   const label = typeof parsed === 'string' ? parsed : String(parsed?.data ?? parsed?.status ?? parsed?.result ?? '');
   const lower = label.trim().toLowerCase();
   let mapped;
-  if (['accepted', 'correct', 'ok'].includes(lower)) mapped = { status: 'accepted', raw: label };
+  if (['accepted', 'correct'].includes(lower)) mapped = { status: 'accepted', raw: label };
   else if (['wronganswer', 'wrong', 'incorrect', 'rejected', 'invalid'].includes(lower)) mapped = { status: 'rejected', raw: label };
   else if (['flagsubmitted', 'alreadysolved', 'duplicate'].includes(lower)) mapped = { status: 'duplicate', raw: label };
   return mapped ? { ...response, body: JSON.stringify(mapped) } : response;
@@ -247,7 +247,11 @@ export async function runArena(args, {
   signal,
   writable,
   network,
+  networkScope,
   authorizeResponse,
+  revokeTargets,
+  recordInstance,
+  lookupInstance,
   requestFn = platformRequest,
   syncGraphFact,
   fetchFile,
@@ -321,7 +325,25 @@ export async function runArena(args, {
     else route = config?.platformChallengesPath ?? '/challenges';
     const res = await requestFn(cfg, signal, 'GET', route);
     if (!okHttp(res)) return { ok: false, request: res };
-    let challenges = normalizeChallengeList(adapter, parseJsonBody(res));
+    const rawBody = parseJsonBody(res);
+    let allRaw = normalizeChallengeList(adapter, rawBody);
+    // Support generic REST pagination when the platform returns a same-origin `next` path.
+    if (adapter === 'generic' && rawBody && typeof rawBody === 'object' && typeof rawBody.next === 'string') {
+      const seenRoutes = new Set([route]);
+      let nextRoute = rawBody.next;
+      for (let page = 0; page < 10 && typeof nextRoute === 'string' && nextRoute.startsWith('/') && !seenRoutes.has(nextRoute); page += 1) {
+        seenRoutes.add(nextRoute);
+        const pageRes = await requestFn(cfg, signal, 'GET', nextRoute);
+        if (!okHttp(pageRes)) break;
+        const pageBody = parseJsonBody(pageRes);
+        const pageItems = normalizeChallengeList(adapter, pageBody);
+        if (pageItems.length === 0) break;
+        allRaw = allRaw.concat(pageItems);
+        nextRoute = pageBody && typeof pageBody === 'object' && typeof pageBody.next === 'string' ? pageBody.next : '';
+      }
+    }
+    const totalRaw = allRaw.length;
+    let challenges = allRaw;
     if (typeof args.category === 'string' && args.category.trim() !== '') {
       const wanted = args.category.trim().toLowerCase();
       challenges = challenges.filter(c => c.category.toLowerCase() === wanted);
@@ -329,20 +351,27 @@ export async function runArena(args, {
     if (args.unsolved_only === true) {
       challenges = challenges.filter(c => !c.solved);
     }
-    return { ok: true, challenges };
+    return { ok: true, totalRaw, challenges };
   }
 
   if (action === 'challenges') {
     const listed = await fetchChallengeList();
     if (!listed.ok) return { action: 'challenges', adapter, status: 'failed', request: listed.request };
-    const limit = args.limit ?? 50;
-    const shown = listed.challenges.slice(0, limit);
+    const offset = Number.isSafeInteger(args.offset) && args.offset >= 0 ? args.offset : 0;
+    const limit = Math.min(Number.isSafeInteger(args.limit) && args.limit >= 1 ? args.limit : 20, 200);
+    const shown = listed.challenges.slice(offset, offset + limit);
+    const hasMore = offset + shown.length < listed.challenges.length;
     return {
       action: 'challenges',
       adapter,
       status: 'ok',
       total: listed.challenges.length,
+      total_raw: listed.totalRaw,
+      total_matched: listed.challenges.length,
+      offset,
       shown: shown.length,
+      has_more: hasMore,
+      ...(hasMore ? { next_offset: offset + shown.length } : {}),
       challenges: shown,
     };
   }
@@ -355,15 +384,15 @@ export async function runArena(args, {
     const res = await requestFn(cfg, signal, 'GET', route);
     if (!okHttp(res)) return { ok: false, request: res };
     const detail = normalizeChallengeDetail(adapter, base, parseJsonBody(res));
-    const authJson = authorizeResponse?.(res) ?? { http: [], tcp: [] };
-    const fromText = extractEndpointsFromText([detail.connection_info, detail.description].filter(Boolean).join('\n'));
+    const leaseScope = networkScope ? { ...networkScope, leaseId: `challenge:${challengeId}` } : undefined;
+    // Only the platform's designated connection field can describe a target.
+    // The raw response includes free-form description text and is not authorization.
+    const fromText = extractEndpointsFromText(detail.connection_info ?? '');
     const grantedHttp = [...new Set([
-      ...(authJson.http ?? []),
-      ...fromText.http.map(u => network?.grantHttp(u)).filter(Boolean),
+      ...fromText.http.map(u => network?.grantHttp(u, leaseScope)).filter(Boolean),
     ])];
     const grantedTcp = [...new Set([
-      ...(authJson.tcp ?? []),
-      ...fromText.tcp.map(({ host, port }) => network?.grantTcp(host, port)).filter(Boolean),
+      ...fromText.tcp.map(({ host, port }) => network?.grantTcp(host, port, leaseScope)).filter(Boolean),
     ])];
     return {
       ok: true,
@@ -391,8 +420,10 @@ export async function runArena(args, {
   if (action === 'sync_graph') {
     const listed = await fetchChallengeList();
     if (!listed.ok) return { action: 'sync_graph', adapter, status: 'failed', request: listed.request };
-    const limit = Math.min(args.limit ?? 20, 50);
-    const slice = listed.challenges.slice(0, limit);
+    const offset = Number.isSafeInteger(args.offset) && args.offset >= 0 ? args.offset : 0;
+    const limit = Math.min(Number.isSafeInteger(args.limit) && args.limit >= 1 ? args.limit : 20, 200);
+    const slice = listed.challenges.slice(offset, offset + limit);
+    const hasMore = offset + slice.length < listed.challenges.length;
     const imported = [];
     let deduplicated = 0;
     for (const item of slice) {
@@ -423,7 +454,11 @@ export async function runArena(args, {
       action: 'sync_graph',
       adapter,
       status: 'ok',
+      total: listed.challenges.length,
+      offset,
       scanned: slice.length,
+      has_more: hasMore,
+      ...(hasMore ? { next_offset: offset + slice.length } : {}),
       imported_count: imported.length,
       deduplicated_count: deduplicated,
       imported,
@@ -435,21 +470,25 @@ export async function runArena(args, {
     const id = safeId(args.challenge_id, 'challenge_id');
     const fetched = await fetchChallengeDetail(id);
     if (!fetched.ok) return { action: 'fetch_files', adapter, status: 'failed', request: fetched.request };
-    const files = fetched.detail.files.slice(0, 8);
+    const allFiles = fetched.detail.files;
+    const files = allFiles.slice(0, 8);
     if (files.length === 0) {
       return { action: 'fetch_files', adapter, status: 'ok', challenge_id: id, downloaded: [], note: '该题目未提供附件下载链接。' };
     }
     const downloaded = [];
     for (const url of files) {
-      downloaded.push(await fetchFile(url));
+      downloaded.push(await fetchFile(url, cfg));
     }
     return {
       action: 'fetch_files',
       adapter,
-      status: 'ok',
+      status: files.length < allFiles.length ? 'partial' : 'ok',
       challenge_id: id,
       challenge_name: fetched.detail.name,
+      total_files: allFiles.length,
+      omitted_file_count: allFiles.length - files.length,
       downloaded,
+      ...(files.length < allFiles.length ? { note: '本次最多下载 8 个附件；请从 detail 返回的 URL 中选择其余附件并逐个调用 fetch_attachment。' } : {}),
     };
   }
 
@@ -467,16 +506,22 @@ export async function runArena(args, {
     const method = op === 'delete' ? 'DELETE' : 'POST';
     const res = await requestFn(cfg, signal, method, route, op === 'delete' ? undefined : {});
     if (!okHttp(res)) return { action: 'container', container_action: op, adapter, status: 'failed', request: res };
-    const authorized = op !== 'delete' ? authorizeResponse?.(res) : undefined;
+    const leaseId = `container:${id}`;
+    const authorized = op !== 'delete' ? authorizeResponse?.(res, leaseId) : undefined;
+    if (op === 'delete') revokeTargets?.(leaseId);
     const statusLabel = op === 'create' ? 'created' : op === 'extend' ? 'extended' : 'deleted';
+    const instanceId = `container:${id}`;
+    const instanceRecorded = recordInstance ? await recordInstance(instanceId, op === 'delete' ? 'deleted' : 'created') : undefined;
     return {
       action: 'container',
       container_action: op,
       adapter,
-      status: statusLabel,
+      status: instanceRecorded === false ? 'partial' : statusLabel,
       challenge_id: id,
+      ...(instanceRecorded !== undefined ? { instance_id: instanceId, instance_recorded: instanceRecorded } : {}),
       container: parseJsonBody(res),
       ...(authorized ? { authorized_targets: authorized } : {}),
+      ...(instanceRecorded === false ? { note: '平台容器操作已完成，但实例账本写入失败；动态 flag 提交前请重试容器刷新并确认 instance_recorded。' } : {}),
     };
   }
 
@@ -485,6 +530,19 @@ export async function runArena(args, {
     if (typeof args.flag !== 'string' || args.flag.trim() === '') {
       throw new ToolError('unsupported', 'submit 需要提供非空 flag。');
     }
+    let refreshedAt = args.refreshed_at;
+    if (args.dynamic === true) {
+      const instanceId = typeof args.instance === 'string' ? args.instance.trim() : '';
+      const record = instanceId && lookupInstance ? await lookupInstance(instanceId) : undefined;
+      const age = record?.state === 'created' ? Date.now() - Date.parse(record.observed_at ?? '') : Infinity;
+      if (!Number.isFinite(age) || age < -5 * 60000 || age > 30 * 60000) {
+        return {
+          action: 'submit', adapter, challenge_id: id, status: 'rejected', verdict: 'rejected_local',
+          reason: '动态 flag 需要 30 分钟内由 ctf_instance 或 ctf_arena 容器操作写入的实例记录；调用方提供的 refreshed_at 不作为可信刷新时间。',
+        };
+      }
+      refreshedAt = record.observed_at;
+    }
     const submitArgs = {
       flag: args.flag,
       challenge: id,
@@ -492,7 +550,8 @@ export async function runArena(args, {
       ...(args.source !== undefined ? { source: args.source } : {}),
       ...(args.dynamic !== undefined ? { dynamic: args.dynamic } : {}),
       ...(args.instance !== undefined ? { instance: args.instance } : {}),
-      ...(args.refreshed_at !== undefined ? { refreshed_at: args.refreshed_at } : {}),
+      ...(refreshedAt !== undefined ? { refreshed_at: refreshedAt } : {}),
+      ...(args.retry_unknown === true ? { retry_unknown: true } : {}),
     };
     const outcome = await handleSubmission(submitArgs, submissionFiles, async () => {
       if (adapter === 'ctfd') {

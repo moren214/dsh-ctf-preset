@@ -335,24 +335,37 @@ function solveMultiplierAndIncrement(states, m) {
   for (let i = 0; i < states.length - 1; i += 1) {
     diffs.push(modBigInt(states[i + 1] - states[i], m));
   }
+  let multiplierResidue = 0n;
+  let multiplierModulus = 1n;
   for (let i = 0; i < diffs.length - 1; i += 1) {
     const t0 = diffs[i];
     const t1 = diffs[i + 1];
-    if (t0 === 0n) continue;
+    if (t0 === 0n) {
+      if (t1 !== 0n) return null;
+      continue;
+    }
     const d = gcdBigInt(t0, m);
     if (t1 % d !== 0n) continue;
-    if (d > 64n) continue;
     const mReduced = m / d;
-    const inv = modInverseBigInt(t0 / d, mReduced);
-    if (inv === null) continue;
-    const aBase = modBigInt((t1 / d) * inv, mReduced);
-    for (let k = 0n; k < d; k += 1n) {
-      const a = aBase + k * mReduced;
-      const c = modBigInt(states[i + 1] - a * states[i], m);
-      if (verify(a, c)) return { a, c };
+    let residue = 0n;
+    if (mReduced > 1n) {
+      const inv = modInverseBigInt(t0 / d, mReduced);
+      if (inv === null) return null;
+      residue = modBigInt((t1 / d) * inv, mReduced);
     }
+    const common = gcdBigInt(multiplierModulus, mReduced);
+    const difference = residue - multiplierResidue;
+    if (difference % common !== 0n) return null;
+    const rightModulus = mReduced / common;
+    const factor = rightModulus === 1n ? 0n
+      : modBigInt((difference / common) * (modInverseBigInt(multiplierModulus / common, rightModulus) ?? 0n), rightModulus);
+    if (rightModulus > 1n && modInverseBigInt(multiplierModulus / common, rightModulus) === null) return null;
+    multiplierResidue = modBigInt(multiplierResidue + multiplierModulus * factor, multiplierModulus * rightModulus);
+    multiplierModulus *= rightModulus;
   }
-  return null;
+  const a = multiplierResidue;
+  const c = modBigInt(states[1] - a * states[0], m);
+  return verify(a, c) ? { a, c, candidateCount: m / multiplierModulus } : null;
 }
 
 function recoverLcg(args) {
@@ -394,19 +407,23 @@ function recoverLcg(args) {
   if (!solved && modulusRecovered) {
     const maxState = states.reduce((acc, cur) => (cur > acc ? cur : acc), 0n);
     const smallPrimes = [2n, 3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n];
-    let candidate = m;
-    for (const p of smallPrimes) {
-      while (candidate % p === 0n && candidate / p > maxState) {
-        const nextM = candidate / p;
+    const visited = new Set([m]);
+    const queue = [m];
+    while (queue.length > 0 && !solved && visited.size <= 256) {
+      const current = queue.shift();
+      for (const p of smallPrimes) {
+        if (current % p !== 0n) continue;
+        const nextM = current / p;
+        if (nextM <= maxState || visited.has(nextM)) continue;
+        visited.add(nextM);
         const attempt = solveMultiplierAndIncrement(states, nextM);
         if (attempt) {
           m = nextM;
           solved = attempt;
           break;
         }
-        candidate = nextM;
+        queue.push(nextM);
       }
-      if (solved) break;
     }
   }
 
@@ -428,6 +445,8 @@ function recoverLcg(args) {
     modulus: m.toString(),
     multiplier: solved.a.toString(),
     increment: solved.c.toString(),
+    parameter_candidates: solved.candidateCount.toString(),
+    parameters_unique: solved.candidateCount === 1n,
     verified_inputs: states.length,
     predictions,
   };

@@ -3,6 +3,8 @@ const ORIENTATION = 0x0112;
 const EXIF_IFD = 0x8769;
 const GPS_IFD = 0x8825;
 const DATE_TIME_ORIGINAL = 0x9003;
+const USER_COMMENT = 0x9286;
+const MAX_USER_COMMENT_BYTES = 2048;
 const ROOT_TEXT = new Map([[0x010e, 'description'], [0x010f, 'make'], [0x0110, 'model'],
   [0x0131, 'software'], [0x0132, 'date_time'], [0x013b, 'artist'], [0x8298, 'copyright']]);
 const DETAIL_TEXT = new Map([[0x9004, 'date_time_digitized'], [0x9011, 'offset_time_original'],
@@ -31,6 +33,7 @@ export function inspectExif(bytes, fileOffset) {
     let exifDirectory;
     let gpsDirectory;
     let dateTimeOriginal;
+    let userComment;
     const fields = {};
     const warnings = [];
     const valueAt = (entry, type, width, count, maximum = count) => {
@@ -65,9 +68,10 @@ export function inspectExif(bytes, fileOffset) {
       if (tag === ORIENTATION) {
         const value = read16(entry + 8);
         if (read16(entry + 2) !== 3 || read32(entry + 4) !== 1 || value < 1 || value > 8) {
-          throw new Error('EXIF Orientation 字段无效。');
+          warnings.push('EXIF Orientation 字段无效，已忽略并继续解析其余字段。');
+        } else {
+          orientation = { value, file_offset: fileOffset + entry + 8 };
         }
-        orientation = { value, file_offset: fileOffset + entry + 8 };
       } else if (tag === EXIF_IFD || tag === GPS_IFD) {
         const pointer = valueAt(entry, 4, 4, read32(entry + 4), 1);
         if (!pointer) warnings.push('EXIF 子目录指针无效。');
@@ -79,6 +83,41 @@ export function inspectExif(bytes, fileOffset) {
       directoryEntries(bytes, exifDirectory, read16, (tag, entry) => {
         if (DETAIL_TEXT.has(tag)) add(DETAIL_TEXT.get(tag), ascii(entry));
         if (RATIONAL_FIELDS.has(tag)) add(RATIONAL_FIELDS.get(tag), rational(entry, 1));
+        if (tag === USER_COMMENT) {
+          const count = read32(entry + 4);
+          const part = valueAt(entry, 7, 1, count, MAX_USER_COMMENT_BYTES);
+          if (!part) {
+            warnings.push('EXIF UserComment 类型、长度或偏移无效。');
+          } else {
+            const prefix = bytes.toString('latin1', part.offset, Math.min(part.offset + 8, part.offset + part.length));
+            let encoding = 'ASCII';
+            let start = part.offset;
+            if (prefix.startsWith('ASCII\0\0\0')) start += 8;
+            else if (prefix.startsWith('UNICODE\0')) {
+              encoding = byteOrder === 'II' ? 'UTF-16LE' : 'UTF-16BE';
+              start += 8;
+            } else {
+              encoding = 'raw';
+              warnings.push('EXIF UserComment 使用未识别的字符集标记。');
+            }
+            let valueBytes = bytes.subarray(start, part.offset + part.length);
+            if (encoding === 'UTF-16BE') {
+              if (valueBytes.length % 2 !== 0) {
+                warnings.push('EXIF UserComment 的 UTF-16 字节数为奇数。');
+                valueBytes = valueBytes.subarray(0, valueBytes.length - 1);
+              }
+              const swapped = Buffer.alloc(valueBytes.length);
+              for (let index = 0; index < valueBytes.length; index += 2) {
+                swapped[index] = valueBytes[index + 1];
+                swapped[index + 1] = valueBytes[index];
+              }
+              valueBytes = swapped;
+            }
+            const value = valueBytes.toString(encoding === 'UTF-16LE' || encoding === 'UTF-16BE' ? 'utf16le' : 'latin1')
+              .replace(/\0+$/u, '').replace(/[\p{Cc}\p{Cf}]/gu, '?').trim();
+            if (value) userComment = { value, encoding, file_offset: fileOffset + start };
+          }
+        }
         if (tag === 0x8827 && read32(entry + 4) === 1) {
           const part = valueAt(entry, 3, 2, 1);
           if (part) add('iso', { value: read16(part.offset), file_offset: part.file_offset });
@@ -121,7 +160,8 @@ export function inspectExif(bytes, fileOffset) {
       }
     }
     return { status: 'ok', file_offset: fileOffset, orientation, date_time_original: dateTimeOriginal,
-      ...fields, ...(warnings.length > 0 ? { warnings } : {}) };
+      ...(userComment ? { user_comment: userComment } : {}), ...fields,
+      ...(warnings.length > 0 ? { warnings } : {}) };
   } catch (error) {
     return { status: 'invalid', file_offset: fileOffset, reason: error.message };
   }

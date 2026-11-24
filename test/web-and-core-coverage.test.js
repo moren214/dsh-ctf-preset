@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { inspectAudioMetadata } from '../audio-metadata.js';
 import { browserGateway } from '../browser-gateway.js';
-import { handleCdpEvent } from '../browser-session.js';
+import { createBrowserSession, handleCdpEvent } from '../browser-session.js';
 import { apply } from '../ctf-tools.js';
 import { inspectElf, verifyElf } from '../elf.js';
 import { inspectMedia, parseMediaRequest } from '../media-reader.js';
@@ -155,7 +155,7 @@ function buildCraftedElf64() {
   // Craft a rich ELF64 x86-64 binary with PT_LOAD, PT_GNU_STACK (NX), PT_GNU_RELRO,
   // .text (pop rdi; ret + syscall; ret), .rodata (/bin/sh), .dynsym, .dynstr, .dynamic (DT_BIND_NOW).
   const shstrtab = Buffer.from('\0.text\0.rodata\0.dynstr\0.dynsym\0.dynamic\0.shstrtab\0', 'ascii');
-  const dynstr = Buffer.from('\0libc.so.6\0__stack_chk_fail\0system\0gets\0printf\0', 'ascii');
+  const dynstr = Buffer.from('\0libc.so.6\0__stack_chk_fail_local\0system\0gets\0printf\0user_chk\0', 'ascii');
   const text = Buffer.from([
     0x5f, 0xc3, // pop rdi; ret
     0x5e, 0xc3, // pop rsi; ret
@@ -164,8 +164,8 @@ function buildCraftedElf64() {
   ]);
   const rodata = Buffer.from('hello\0/bin/sh\0padding_bytes_00', 'ascii');
 
-  // 5 Elf64_Sym entries (24 bytes each): NULL, __stack_chk_fail (UNDEF), system (UNDEF), gets (UNDEF), printf (DEFINED)
-  const dynsym = Buffer.alloc(24 * 5);
+  // 6 Elf64_Sym entries: local stack protector import, regular imports, one defined *_chk decoy.
+  const dynsym = Buffer.alloc(24 * 6);
   const writeSym = (idx, nameOff, info, shndx, value, size) => {
     const o = idx * 24;
     dynsym.writeUInt32LE(nameOff, o);
@@ -175,21 +175,26 @@ function buildCraftedElf64() {
     dynsym.writeBigUInt64LE(value, o + 8);
     dynsym.writeBigUInt64LE(size, o + 16);
   };
-  writeSym(1, dynstr.indexOf('__stack_chk_fail'), (1 << 4) | 2, 0, 0n, 0n);
+  writeSym(1, dynstr.indexOf('__stack_chk_fail_local'), (1 << 4) | 2, 0, 0n, 0n);
   writeSym(2, dynstr.indexOf('system'), (1 << 4) | 2, 0, 0n, 0n);
   writeSym(3, dynstr.indexOf('gets'), (1 << 4) | 2, 0, 0n, 0n);
   writeSym(4, dynstr.indexOf('printf'), (1 << 4) | 2, 1, 0x401000n, 16n);
+  writeSym(5, dynstr.indexOf('user_chk'), (1 << 4) | 2, 1, 0x401010n, 8n);
 
   // .dynamic: DT_NEEDED(1) -> libc.so.6, DT_BIND_NOW(24), DT_NULL(0)
-  const dynamic = Buffer.alloc(16 * 3);
+  const dynamic = Buffer.alloc(16 * 5);
   dynamic.writeBigInt64LE(1n, 0);
   dynamic.writeBigUInt64LE(BigInt(dynstr.indexOf('libc.so.6')), 8);
   dynamic.writeBigInt64LE(24n, 16);
   dynamic.writeBigUInt64LE(0n, 24);
-  dynamic.writeBigInt64LE(0n, 32);
+  dynamic.writeBigInt64LE(5n, 32); // DT_STRTAB
+  dynamic.writeBigUInt64LE(0x400280n, 40);
+  dynamic.writeBigInt64LE(10n, 48); // DT_STRSZ
+  dynamic.writeBigUInt64LE(BigInt(dynstr.length), 56);
+  dynamic.writeBigInt64LE(0n, 64);
 
   const phoff = 64;
-  const phnum = 3; // PT_LOAD, PT_GNU_STACK, PT_GNU_RELRO
+  const phnum = 4; // PT_LOAD, PT_GNU_STACK, PT_GNU_RELRO, PT_DYNAMIC
   const textOff = 0x200;
   const rodataOff = 0x240;
   const dynstrOff = 0x280;
@@ -231,6 +236,7 @@ function buildCraftedElf64() {
   writePh(0, 1, 5, 0n, 0x400000n, BigInt(shoff), BigInt(shoff), 0x1000n); // PT_LOAD R|X
   writePh(1, 0x6474e551, 6, 0n, 0n, 0n, 0n, 0x10n); // PT_GNU_STACK RW (NX enabled)
   writePh(2, 0x6474e552, 4, BigInt(dynamicOff), 0x400000n + BigInt(dynamicOff), BigInt(dynamic.length), BigInt(dynamic.length), 1n);
+  writePh(3, 2, 6, BigInt(dynamicOff), 0x400000n + BigInt(dynamicOff), BigInt(dynamic.length), BigInt(dynamic.length), 8n);
 
   // Copy section payloads
   text.copy(buf, textOff);
@@ -290,6 +296,19 @@ test('inspect_media(kind: "model") 覆盖 Pickle/PyTorch ZIP/Safetensors/GGUF/ON
   assert.equal(safeReport.format, 'pickle');
   assert.equal(safeReport.risk_level, 'low');
 
+  // 不完整 Pickle 扫描不能把尚未检查的尾部当作低风险。
+  const hubLoadPickle = Buffer.from('ctorch.hub\nload\n.', 'latin1');
+  const hubLoadReport = await inspectMedia(hubLoadPickle, { kind: 'model' }, undefined, wb);
+  assert.equal(hubLoadReport.format, 'pickle');
+  assert.equal(hubLoadReport.risk_level, 'high');
+  assert.ok(hubLoadReport.findings.some(f => f.kind === 'pickle_global' && /torch\.hub\.load/u.test(f.target ?? '')));
+
+  const cappedPickle = Buffer.concat([Buffer.from([0x80, 0x04]), Buffer.alloc(200_001, 0x4e), hubLoadPickle]);
+  const cappedReport = await inspectMedia(cappedPickle, { kind: 'model' }, undefined, wb);
+  assert.equal(cappedReport.status, 'incomplete');
+  assert.equal(cappedReport.risk_level, 'medium');
+  assert.ok(cappedReport.findings.some(f => f.kind === 'incomplete_pickle_scan'));
+
   // 3) PyTorch ZIP（含恶意 data.pkl 与 TorchScript code/net.py）
   const ptZip = buildZipStore([
     { name: 'archive/version', data: '3\n' },
@@ -303,6 +322,16 @@ test('inspect_media(kind: "model") 覆盖 Pickle/PyTorch ZIP/Safetensors/GGUF/ON
   assert.equal(ptReport.pickle_members.length, 1);
   assert.equal(ptReport.code_files.length, 1);
   assert.ok(ptReport.findings.some(f => f.kind === 'dangerous_call' && f.member === 'archive/code/net.py'));
+
+  const cappedPtZip = buildZipStore([
+    ...Array.from({ length: 8 }, (_, i) => ({ name: `archive/weight-${i}.pkl`, data: Buffer.from('N.') })),
+    { name: 'archive/weight-hidden.pkl', data: hubLoadPickle },
+  ]);
+  const cappedPtReport = await inspectMedia(cappedPtZip, { kind: 'model' }, undefined, wb);
+  assert.equal(cappedPtReport.format, 'pytorch_zip');
+  assert.equal(cappedPtReport.status, 'incomplete');
+  assert.equal(cappedPtReport.risk_level, 'medium');
+  assert.equal(cappedPtReport.skipped_pickle_members, 1);
 
   // 4) Safetensors（__metadata__ + tensor 描述 + 尾部隐写数据检测）
   const stHeader = Buffer.from(JSON.stringify({
@@ -343,6 +372,20 @@ test('inspect_media(kind: "model") 覆盖 Pickle/PyTorch ZIP/Safetensors/GGUF/ON
   assert.equal(ggufReport.metadata['general.quant'], 7);
   assert.equal(ggufReport.risk_level, 'high');
 
+  const manyGgufFields = Array.from({ length: 65 }, (_, i) => [
+    ggufStr(i === 64 ? 'tokenizer.chat_template' : `meta.${i}`),
+    u32(8),
+    ggufStr(i === 64 ? '{{ cycler.__init__.__globals__.os.popen("id") }}' : `value-${i}`),
+  ]);
+  const cappedGguf = Buffer.concat([
+    Buffer.from('GGUF', 'ascii'), u32(3), u64(0), u64(manyGgufFields.length), ...manyGgufFields.flat(),
+  ]);
+  const cappedGgufReport = await inspectMedia(cappedGguf, { kind: 'model' }, undefined, wb);
+  assert.equal(cappedGgufReport.format, 'gguf');
+  assert.equal(cappedGgufReport.status, 'incomplete');
+  assert.equal(cappedGgufReport.risk_level, 'medium');
+  assert.ok(cappedGgufReport.findings.some(f => f.kind === 'gguf_metadata_scan_incomplete'));
+
   // 6) ONNX protobuf（ir_version + producer_name + 自定义 domain + 外部路径穿越）
   const pbStr = (field, s) => {
     const b = Buffer.from(s, 'utf8');
@@ -355,13 +398,22 @@ test('inspect_media(kind: "model") 覆盖 Pickle/PyTorch ZIP/Safetensors/GGUF/ON
     pbStr(6, '../../etc/passwd'),
   ]);
   const onnxReport = await inspectMedia(onnxBytes, { kind: 'model' }, undefined, wb);
-  assert.equal(onnxReport.status, 'ok');
+  assert.equal(onnxReport.status, 'incomplete');
   assert.equal(onnxReport.format, 'onnx');
   assert.equal(onnxReport.ir_version, 9);
   assert.equal(onnxReport.producer_name, 'pytorch');
   assert.equal(onnxReport.risk_level, 'high');
   assert.ok(onnxReport.findings.some(f => f.kind === 'custom_onnx_domain'));
   assert.ok(onnxReport.findings.some(f => f.kind === 'suspicious_external_path'));
+  assert.ok(onnxReport.findings.some(f => f.kind === 'onnx_graph_scan_incomplete'));
+
+  const longGraph = Buffer.alloc(2 * 1024 * 1024 + 64, 0x41);
+  Buffer.from('../etc/shadow', 'ascii').copy(longGraph, 2 * 1024 * 1024);
+  const longOnnx = Buffer.concat([Buffer.from([0x08, 0x09]), pbStr(7, longGraph)]);
+  const longOnnxReport = await inspectMedia(longOnnx, { kind: 'model' }, undefined, wb);
+  assert.equal(longOnnxReport.status, 'incomplete');
+  assert.equal(longOnnxReport.risk_level, 'high');
+  assert.ok(longOnnxReport.findings.some(f => f.kind === 'suspicious_external_path' && f.sample.includes('../etc/shadow')));
 
   // 7) 通过完整工具链路：read_archive_member -> inspect_media(kind: "model", source_result_id)
   const cwd = await mkdtemp(join(tmpdir(), 'ctf-model-chain-'));
@@ -491,17 +543,23 @@ test('browser-session CDP 事件处理（含弹窗自动捕获/放行）与 brow
 test('browser-gateway 本地 HTTP 代理与 CONNECT 隧道授权放行/拒绝', async () => {
   const upstream = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Backend': 'ok' });
-    res.end('proxied:' + req.url);
+    if (req.url === '/slow') {
+      res.write('first');
+      setTimeout(() => res.end('second'), 30);
+    } else res.end('proxied:' + req.url);
   });
   await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
   const upstreamPort = upstream.address().port;
+  const tunnel = net.createServer(socket => setTimeout(() => socket.write('late-pong'), 100));
+  await new Promise(resolve => tunnel.listen(0, '127.0.0.1', resolve));
+  const tunnelPort = tunnel.address().port;
 
   const gateway = await browserGateway(async url => {
-    if (url.hostname === '127.0.0.1' && Number(url.port) === upstreamPort) {
+    if (url.hostname === '127.0.0.1' && [upstreamPort, tunnelPort].includes(Number(url.port))) {
       return { address: '127.0.0.1', family: 4 };
     }
     throw new Error('origin denied');
-  });
+  }, { timeoutMs: 50 });
   const proxyUrl = new URL(gateway.address);
 
   try {
@@ -524,6 +582,19 @@ test('browser-gateway 本地 HTTP 代理与 CONNECT 隧道授权放行/拒绝', 
     assert.equal(allowed.status, 200);
     assert.equal(allowed.body, 'proxied:/hello');
     assert.equal(allowed.backend, 'ok');
+
+    // The total response lasts longer than timeoutMs, but regular body traffic must keep it alive.
+    const slow = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port: Number(proxyUrl.port), method: 'GET',
+        path: `http://127.0.0.1:${upstreamPort}/slow`, headers: { Host: `127.0.0.1:${upstreamPort}` } }, res => {
+        let body = '';
+        res.on('data', chunk => { body += chunk; });
+        res.on('end', () => resolve(body));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(slow, 'firstsecond');
 
     // 2) 拦截未授权 HTTP 请求 -> 403
     const denied = await new Promise((resolve, reject) => {
@@ -569,10 +640,44 @@ test('browser-gateway 本地 HTTP 代理与 CONNECT 隧道授权放行/拒绝', 
       sock.on('error', reject);
     });
     assert.match(okConnect, /200 Connection Established/u);
+
+    // An established tunnel survives beyond the connection establishment deadline.
+    const longConnect = await new Promise((resolve, reject) => {
+      const sock = net.connect(Number(proxyUrl.port), '127.0.0.1', () => {
+        sock.write(`CONNECT 127.0.0.1:${tunnelPort} HTTP/1.1\r\nHost: 127.0.0.1:${tunnelPort}\r\n\r\n`);
+      });
+      let text = '';
+      const timer = setTimeout(() => { sock.destroy(); reject(new Error('tunnel data timed out')); }, 1000);
+      sock.on('data', chunk => {
+        text += chunk.toString('utf8');
+        if (text.includes('late-pong')) { clearTimeout(timer); sock.destroy(); resolve(text); }
+      });
+      sock.on('error', error => { clearTimeout(timer); reject(error); });
+    });
+    assert.match(longConnect, /200 Connection Established/u);
+    assert.match(longConnect, /late-pong/u);
   } finally {
     gateway.dispose();
     await new Promise(resolve => upstream.close(resolve));
+    await new Promise(resolve => tunnel.close(resolve));
   }
+});
+
+test('browser-session 单次操作超时后保留会话，不触发全局清理', async () => {
+  let stopped = 0;
+  const session = createBrowserSession({
+    resolveBinary: async () => undefined,
+    authorize: async () => undefined,
+    environment: () => process.env,
+    onStart() {},
+    onStop() { stopped++; },
+  });
+  await assert.rejects(session.run(20, undefined, signal => new Promise((_, reject) => {
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+  })), /浏览器操作超时/u);
+  assert.equal(stopped, 0);
+  await session.close();
+  assert.equal(stopped, 1);
 });
 
 test('net-session 长连接 TCP 全流程（connect/list/read_until/send/recv/二进制 hexdump/close/权限拦截）', async () => {
@@ -653,6 +758,7 @@ test('elf.js: inspectElf / verifyElf 完整校验 checksec、导入、gadget、/
   assert.equal(report.security.pie.enabled, false);
   assert.equal(report.security.relro.status, 'full');
   assert.equal(report.security.canary, true);
+  assert.equal(report.security.fortify, false, 'a defined user symbol ending in _chk is not a fortified import');
   assert.ok(report.security.needed.includes('libc.so.6'));
   assert.ok(report.security.imports.notable.includes('system'));
   assert.ok(report.security.imports.notable.includes('gets'));
@@ -662,6 +768,15 @@ test('elf.js: inspectElf / verifyElf 完整校验 checksec、导入、gadget、/
   assert.equal(report.pwn.strings.bin_sh.section, '.rodata');
   assert.equal(report.layout.rows.length, 2);
   assert.equal(report.layout.next_offset, 2);
+
+  const sectionless = Buffer.from(elf);
+  sectionless.writeBigUInt64LE(0n, 40); // e_shoff
+  sectionless.writeUInt16LE(0, 60); // e_shnum
+  sectionless.writeUInt16LE(0, 62); // e_shstrndx
+  const sectionlessReport = inspectElf(sectionless);
+  assert.equal(sectionlessReport.section_headers, 0);
+  assert.equal(sectionlessReport.security.relro.status, 'full');
+  assert.ok(sectionlessReport.security.needed.includes('libc.so.6'));
 
   const sha = createHash('sha256').update(elf).digest('hex');
   const verified = verifyElf(elf, {

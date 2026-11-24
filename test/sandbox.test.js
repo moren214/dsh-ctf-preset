@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmod, lstat as fsLstat, mkdir, mkdtemp, readFile, rm, stat as fsStat, writeFile } from 'node:fs/promises';
+import { chmod, lstat as fsLstat, mkdir, mkdtemp, open, readFile, rm, stat as fsStat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import test from 'node:test';
@@ -15,8 +15,10 @@ import {
   parseWslList,
   resolveConfiguredImages,
   resolveExecutionPlan,
+  runSandboxCommand,
   runSandbox,
 } from '../sandbox-runner.js';
+import { quoteGdbInputPath } from '../extra-tools.js';
 
 function tinyStaticElf64({ withSections = true } = {}) {
   if (!withSections) {
@@ -151,7 +153,7 @@ test('parseWslList 正确解析 UTF-16LE 与 UTF-8 输出，chooseWslDistro 自�
 test('docker/Dockerfile 与 docker/Dockerfile.heavy 双层镜像定义完整且包含关键安全工具链', async () => {
   const baseDf = await readFile(new URL('../docker/Dockerfile', import.meta.url), 'utf8');
   const heavyDf = await readFile(new URL('../docker/Dockerfile.heavy', import.meta.url), 'utf8');
-  for (const token of ['FROM ubuntu:24.04', 'libc6:i386', 'qemu-user', 'gdb-multiarch', 'python3-fpylll', 'pwntools', 'volatility3', 'zsteg', '/opt/gef/gef.py', 'radare2', 'cpio', 'wabt', 'sleuthkit', 'pillow', 'numpy', 'scipy', 'scapy', 'xdis', 'WORKDIR /work']) {
+  for (const token of ['ARG UBUNTU_BASE_IMAGE=ubuntu:24.04', 'FROM ${UBUNTU_BASE_IMAGE}', 'libc6:i386', 'qemu-user', 'gdb-multiarch', 'python3-fpylll', 'pwntools', 'volatility3', 'zsteg', '/opt/gef/gef.py', 'radare2', 'cpio', 'wabt', 'sleuthkit', 'pillow', 'numpy', 'scipy', 'scapy', 'xdis', 'WORKDIR /work']) {
     assert.ok(baseDf.includes(token), `Dockerfile should include ${token}`);
   }
   for (const token of ['ARG BASE_IMAGE=dsh-ctf-sandbox:latest', 'FROM ${BASE_IMAGE}', 'WITH_GHIDRA', 'WITH_ANGR', 'WITH_APK', 'WITH_SAGE', 'GHIDRA_HOME=/opt/ghidra', 'analyzeHeadless', 'jadx', 'apktool', 'WORKDIR /work']) {
@@ -333,6 +335,36 @@ test('ctf_sandbox 智能需求识别、探测缓存、单次 backend 强制隔�
   );
 });
 
+test('auto 不会把要求隔离的命令静默交给 WSL2', async t => {
+  const detected = await detectSandbox({ sandboxBackend: 'auto' }, undefined, { fresh: true });
+  if (!detected.available || detected.backend !== 'wsl') {
+    t.skip('需要真实探测到 WSL2 且 Docker 隔离后端不可用');
+    return;
+  }
+  const workDir = await mkdtemp(join(tmpdir(), 'ctf-auto-isolation-'));
+  try {
+    await assert.rejects(runSandboxCommand(['sh', '-c', 'touch isolation-breach'], {
+      cwd: workDir,
+      config: { sandboxBackend: 'auto' },
+      detected,
+      requiresIsolation: true,
+    }), error => error.kind === 'dependency' && /无法满足此任务的隔离要求/u.test(error.message));
+    await assert.rejects(fsStat(join(workDir, 'isolation-breach')));
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+});
+
+test('GDB stdin 路径在真实 POSIX shell 中不会执行 $(...) 文件名载荷', async () => {
+  const target = quoteGdbInputPath('./input$(touch pwned)', true);
+  const command = `set -eu; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; cd "$tmp"; printf fixture > ${target}; cat < ${target} >/dev/null; test ! -e pwned`;
+  if (process.platform === 'win32') {
+    execFileSync('wsl.exe', ['--exec', 'sh', '-c', command], { stdio: 'pipe' });
+  } else {
+    execFileSync('/bin/sh', ['-c', command], { stdio: 'pipe' });
+  }
+});
+
 test('WSL2/Linux 沙箱集成测试：status、中文路径 exec、decompile、pwn_triage 与 gdb_driver 自动桥接 Linux ELF', async t => {
   const detected = await detectSandbox({ sandboxBackend: 'auto' });
   if (!detected.available) {
@@ -348,8 +380,10 @@ test('WSL2/Linux 沙箱集成测试：status、中文路径 exec、decompile、p
     await writeFile(join(cwd, 'sectionless_elf'), tinyStaticElf64({ withSections: false }));
     await writeFile(join(cwd, 'hello.py'), 'print("sandbox-py-ok:" + str(21 * 2))\n', 'utf8');
     await writeFile(join(cwd, 'angr_probe.py'), 'try:\n  import angr\n  print("has-angr")\nexcept ImportError:\n  print("no-angr-graceful")\n', 'utf8');
+    await writeFile(join(cwd, 'crlf.sh'), Buffer.from('#!/bin/bash\r\nif true; then\r\n  printf "crlf-script-ok\\n"\r\nelse\r\n  exit 7\r\nfi\r\n', 'utf8'));
 
-    const { tools, execution } = realDirContext(cwd, { sandboxBackend: 'auto' }, true);
+    const sandboxBackend = detected.backend === 'wsl' ? 'wsl' : 'auto';
+    const { tools, execution } = realDirContext(cwd, { sandboxBackend }, true);
 
     const status = JSON.parse(await tools.get('ctf_sandbox').execute({ action: 'status' }, execution));
     assert.equal(status.status, 'ok', JSON.stringify(status));
@@ -373,9 +407,14 @@ test('WSL2/Linux 沙箱集成测试：status、中文路径 exec、decompile、p
     assert.equal(execPy.status, 'ok', JSON.stringify(execPy));
     assert.match(execPy.stdout, /sandbox-py-ok:42/u);
     if (execPy.backend === 'wsl') {
-      assert.equal(typeof execPy.fallback_reason, 'string');
-      assert.equal(typeof execPy.arsenal_note, 'string');
+      assert.equal(execPy.network, 'host_shared_wsl');
     }
+
+    const execCrlf = JSON.parse(await tools.get('ctf_sandbox').execute({
+      action: 'exec', script_path: 'crlf.sh',
+    }, execution));
+    assert.equal(execCrlf.status, 'ok', JSON.stringify(execCrlf));
+    assert.match(execCrlf.stdout, /crlf-script-ok/u);
 
     const execHeavyProbe = JSON.parse(await tools.get('ctf_sandbox').execute({
       action: 'exec', script_path: 'angr_probe.py',
@@ -393,13 +432,13 @@ test('WSL2/Linux 沙箱集成测试：status、中文路径 exec、decompile、p
       action: 'decompile', file_path: 'tiny_elf', function: '0x400078',
     }, execution));
     assert.equal(decomp.status, 'ok', JSON.stringify(decomp));
-    assert.match(decomp.disassembly, /syscall|0x3c/iu);
+    assert.match(decomp.pseudocode || decomp.disassembly, /syscall|0x3c/iu);
 
     const decompRaw = JSON.parse(await tools.get('ctf_sandbox').execute({
       action: 'decompile', file_path: 'sectionless_elf', function: '0x400078',
     }, execution));
     assert.equal(decompRaw.status, 'ok', JSON.stringify(decompRaw));
-    assert.match(decompRaw.disassembly, /syscall|0x3c/iu);
+    assert.match(decompRaw.pseudocode || decompRaw.disassembly, /syscall|0x3c/iu);
 
     const triage = JSON.parse(await tools.get('ctf_sandbox').execute({
       action: 'pwn_triage', file_path: 'tiny_elf',
@@ -487,6 +526,29 @@ test('DECOMPILE_SCRIPT：r2 单次进程分析回退 pdc，Ghidra 按二进制 S
     const r2Calls = (await readFile(r2Log, 'utf8')).trim().split(/\r?\n/u);
     assert.equal(r2Calls.length, 1, 'r2 function decompile should invoke r2 only once');
 
+    // r2 非零退出和空成功结果都必须被报告为失败，不能交给外层包装成 status: ok。
+    const badR2Dir = join(workDir, 'bad-r2-bin');
+    await mkdir(badR2Dir, { recursive: true });
+    const badR2Py = join(badR2Dir, 'bad_r2.py');
+    await writeFile(badR2Py, 'import os, sys\nprint("synthetic r2 failure", file=sys.stderr)\nsys.exit(int(os.environ.get("FAKE_R2_EXIT", "0")))\n', 'utf8');
+    if (process.platform === 'win32') {
+      await writeFile(join(badR2Dir, 'r2.cmd'), `@echo off\r\n"${python}" "${badR2Py}" %*\r\n`, 'utf8');
+    } else {
+      const badR2Sh = join(badR2Dir, 'r2');
+      await writeFile(badR2Sh, `#!/bin/sh\nexec "${python}" "${badR2Py}" "$@"\n`, 'utf8');
+      await chmod(badR2Sh, 0o755);
+    }
+    const failedR2 = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'main', 'auto'], {
+      cwd: workDir, encoding: 'utf8',
+      env: { ...process.env, PATH: badR2Dir + delimiter + (process.env.PATH ?? ''), FAKE_R2_EXIT: '7' },
+    }).trim());
+    assert.match(failedR2.error, /退出码 7/u);
+    const emptyR2 = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'main', 'auto'], {
+      cwd: workDir, encoding: 'utf8',
+      env: { ...process.env, PATH: badR2Dir + delimiter + (process.env.PATH ?? ''), FAKE_R2_EXIT: '0' },
+    }).trim());
+    assert.match(emptyR2.error, /没有返回伪代码或反汇编/u);
+
     // 2) Mock analyzeHeadless：验证首次 -import 建缓存、二次 -process -noanalysis -readOnly 命中缓存、文件改动后失效重建
     const ghLog = join(workDir, 'ghidra-calls.log');
     const ghPy = join(ghidraDir, 'fake_ghidra.py');
@@ -499,9 +561,11 @@ test('DECOMPILE_SCRIPT：r2 单次进程分析回退 pdc，Ghidra 按二进制 S
       '    open(os.path.join(proj_dir, "proj.gpr"), "w").write("gpr")',
       '    os.makedirs(os.path.join(proj_dir, "proj.rep"), exist_ok=True)',
       'target = os.environ.get("DSH_TARGET") or ""',
-      'res = {"engine": "ghidra", "mode": "function" if target else "list", "program_name": "sample.bin", "target": target, "pseudocode": "void check() {}", "disassembly": ""}',
+      'pseudocode = "" if os.environ.get("FAKE_GHIDRA_EMPTY") == "1" else "void check() {}"',
+      'res = {"engine": "ghidra", "mode": "function" if target else "list", "program_name": "sample.bin", "target": target, "pseudocode": pseudocode, "disassembly": ""}',
       'with open(os.environ["DSH_OUT"], "w", encoding="utf-8") as fh:',
       '    fh.write(json.dumps(res))',
+      'if os.environ.get("FAKE_GHIDRA_EXIT"): sys.exit(int(os.environ["FAKE_GHIDRA_EXIT"]))',
     ].join('\n'), 'utf8');
     if (process.platform === 'win32') {
       await writeFile(join(ghidraDir, 'analyzeHeadless.cmd'), `@echo off\r\n"${python}" "${ghPy}" %*\r\n`, 'utf8');
@@ -519,6 +583,15 @@ test('DECOMPILE_SCRIPT：r2 单次进程分析回退 pdc，Ghidra 按二进制 S
     assert.equal(first.cached_project, false);
     assert.equal(first.program_name, undefined);
 
+    const emptyGhidra = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
+      cwd: workDir, encoding: 'utf8', env: { ...ghEnv, FAKE_GHIDRA_EMPTY: '1' },
+    }).trim());
+    assert.match(emptyGhidra.fallback_warning, /没有伪代码或反汇编/u);
+    const failedGhidra = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
+      cwd: workDir, encoding: 'utf8', env: { ...ghEnv, FAKE_GHIDRA_EXIT: '9' },
+    }).trim());
+    assert.match(failedGhidra.fallback_warning, /退出码 9/u);
+
     const second = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
       cwd: workDir, encoding: 'utf8', env: ghEnv,
     }).trim());
@@ -532,14 +605,50 @@ test('DECOMPILE_SCRIPT：r2 单次进程分析回退 pdc，Ghidra 按二进制 S
     assert.equal(third.engine, 'ghidra');
     assert.equal(third.cached_project, false);
 
+    // 64 MiB 前缀相同而尾字节不同的真实大文件必须使用不同缓存键。
+    const large = await open(samplePath, 'w');
+    const largeSize = 64 * 1024 * 1024 + 1;
+    try {
+      await large.truncate(largeSize);
+      await large.write(Buffer.from('A'), 0, 1, largeSize - 1);
+    } finally { await large.close(); }
+    const largeFirst = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
+      cwd: workDir, encoding: 'utf8', env: ghEnv,
+    }).trim());
+    assert.equal(largeFirst.cached_project, false);
+    const tailEdit = await open(samplePath, 'r+');
+    try { await tailEdit.write(Buffer.from('B'), 0, 1, largeSize - 1); }
+    finally { await tailEdit.close(); }
+    const largeSecond = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
+      cwd: workDir, encoding: 'utf8', env: ghEnv,
+    }).trim());
+    assert.equal(largeSecond.cached_project, false);
+
+    // Execute the real worker with a caller deadline and pin the timeout contract.
+    const deadlineRun = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra', '2000'], {
+      cwd: workDir, encoding: 'utf8', env: ghEnv,
+    }).trim());
+    assert.equal(deadlineRun.engine, 'ghidra');
+    assert.match(DECOMPILE_SCRIPT, /headless_timeout = max\(1, int\(sys\.argv\[4\]\) \/\/ 1000 - 2\)/u);
+    assert.match(DECOMPILE_SCRIPT, /timeout=headless_timeout/u);
+    assert.doesNotMatch(DECOMPILE_SCRIPT, /timeout=90/u);
+
+    assert.doesNotMatch(DECOMPILE_SCRIPT, /removeprefix\(/u);
+    assert.match(DECOMPILE_SCRIPT, /def norm_addr\(raw\):.*s\.lstrip\('0'\) or '0'.*target_norm = norm_addr\(target\)/su);
+
     const ghCalls = (await readFile(ghLog, 'utf8')).trim().split(/\r?\n/u).map(line => JSON.parse(line));
-    assert.equal(ghCalls.length, 3);
+    assert.equal(ghCalls.length, 8);
     assert.ok(ghCalls[0].includes('-import'));
     assert.ok(!ghCalls[0].includes('-deleteProject'));
     assert.ok(ghCalls[1].includes('-process'));
-    assert.ok(ghCalls[1].includes('-noanalysis'));
-    assert.ok(ghCalls[1].includes('-readOnly'));
-    assert.ok(ghCalls[2].includes('-import'));
+    assert.ok(ghCalls[2].includes('-process'));
+    assert.ok(ghCalls[3].includes('-process'));
+    assert.ok(ghCalls[4].includes('-import'));
+    assert.ok(ghCalls[5].includes('-import'));
+    assert.ok(ghCalls[6].includes('-import'));
+    assert.ok(ghCalls[7].includes('-process'));
+    assert.ok(ghCalls[3].includes('-noanalysis'));
+    assert.ok(ghCalls[3].includes('-readOnly'));
   } finally {
     await rm(workDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 120 });
   }
@@ -561,6 +670,7 @@ test('buildDockerArgs 容器加固（cap-drop/no-new-privileges/只读挂载）�
   assert.ok(baseArgs.includes('/tmp/ws:/work:ro'));
   assert.ok(!baseArgs.includes('--cap-add=SYS_PTRACE'));
   assert.ok(baseArgs.includes('--memory=2g'));
+  assert.ok(baseArgs.includes('--memory-swap=2g'), 'swap must be capped at the same limit as RAM');
 
   const heavyPwnArgs = buildDockerArgs(['gdb', '--version'], {
     cwd: '/tmp/ws',
@@ -576,6 +686,7 @@ test('buildDockerArgs 容器加固（cap-drop/no-new-privileges/只读挂载）�
   assert.equal(heavyPwnArgs[heavyPwnArgs.indexOf('--network') + 1], 'bridge');
   assert.ok(heavyPwnArgs.includes('/tmp/ws:/work'));
   assert.ok(heavyPwnArgs.includes('--memory=4g'));
+  assert.ok(heavyPwnArgs.includes('--memory-swap=4g'));
 
   // 新增高频 CLI 识别
   for (const cmd of ['bkcrack -C a.zip -c f.txt -p plain', 'ffuf -u http://x/FUZZ', 'sqlmap -u http://x', 'john hash.txt', 'tesseract img.png stdout', 'pyinstxtractor-ng app.exe', 'pwninit']) {
@@ -597,4 +708,14 @@ test('buildDockerArgs 容器加固（cap-drop/no-new-privileges/只读挂载）�
   ]) {
     assert.ok(dockerfile.includes(token), `docker/Dockerfile 应包含 ${token}`);
   }
+  assert.match(dockerfile, /USER 10001:10001/u);
+  assert.match(dockerfile, /ARG APT_MIRROR=/u);
+  assert.match(dockerfile, /ARG GITHUB_BASE_URL=/u);
+  assert.match(dockerfile, /ARG GITHUB_RAW_BASE_URL=/u);
+  assert.match(dockerfile, /ARG RUBYGEMS_SOURCE_URL=/u);
+  assert.doesNotMatch(dockerfile, /r2ghidra optional plugin install failed/u);
+  assert.match(dockerfile, /&& r2pm -ci r2ghidra/u);
+  const heavyDockerfile = await readFile(new URL('../docker/Dockerfile.heavy', import.meta.url), 'utf8');
+  assert.match(heavyDockerfile, /USER root[\s\S]*USER 10001:10001/u);
+  assert.match(heavyDockerfile, /ARG APT_MIRROR=/u);
 });

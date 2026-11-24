@@ -69,12 +69,16 @@ export async function platformRequest(config, signal, method, route, body, reque
     throw new ToolError('permission', '平台令牌只通过 HTTPS 发送；内网 HTTP 平台请在配置中显式设置 allowInsecurePlatformHttp: true。');
   }
   const url = base.replace(/[\\/]+$/u, '') + (route.startsWith('/') ? route : '/' + route);
+  const headers = { Accept: 'application/json', ...platformAuthHeaders(config) };
+  const requestBody = body === undefined ? undefined : JSON.stringify(body);
+  if (requestBody !== undefined) headers['Content-Type'] = 'application/json';
   const response = await request({
     url, method,
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...platformAuthHeaders(config) },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    headers,
+    ...(requestBody === undefined ? {} : { body: requestBody }),
+    ...(config?.allowInsecurePlatformTls === true ? { allow_insecure: true } : {}),
     timeout_ms: 30000,
-    follow_redirects: false,
+    follow_redirects: true,
   }, {
     signal,
     authorize(target, requestSignal) {

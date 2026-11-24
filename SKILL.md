@@ -53,7 +53,7 @@ whenToUse: "需要检查 CTF 附件、运行解题脚本、分析二进制或整
 | 附件下载链接 | `fetch_attachment` | shell `curl -o` |
 | 提交前本地校验 / 平台提交 | `check_flag` / `submit_flag` | 平台网页 / shell `curl` |
 | 实例管理（自动授权返回的靶机） | `ctf_instance` | 平台网页 |
-| 榜单与分数 | `ctf_status board` | 平台网页 |
+| 榜单与分数 | `ctf_status board`（只读会话可查看实时榜单，`recorded:false` 表示未落盘） | 平台网页 |
 | 扩展取证审计（`verify_*`/`pwn_cyclic`/`mobile_apk` 等） | 开启 `enableExtendedAudit: true` 后使用 | `ctf_sandbox` 或对应核心工具 |
 
 回退时记录：尝试次数、失败现象、改用哪条命令、为什么。
@@ -63,15 +63,15 @@ whenToUse: "需要检查 CTF 附件、运行解题脚本、分析二进制或整
 解题时不要盲目每题都起容器，按成本与需求自动分级：
 
 1. **L0 本机零延迟层（默认优先）**：纯 Web（`http_request` / `browser_session`）、编解码与内置密码求解（`calculate_offline` / `crypto_solver solve`）、归档/媒体/抓包（`inspect_attachment` / `read_png_pixels` / `inspect_media` / `pcap_stream`）以及快速二进制静态体检（`inspect_elf` / `rev_query triage/strings`），全部直接在本机完成，不触发 Docker。
-2. **L1 自动升级到 `ctf_sandbox`（默认 `backend: "auto", profile: "auto"`，Docker 优先、WSL2 自动兜底）**：满足以下任一条件时自动切入 `ctf_sandbox`：
+2. **L1 自动升级到 `ctf_sandbox`（默认 `backend: "auto", profile: "auto"`，隔离任务只使用 Docker）**：满足以下任一条件时自动切入 `ctf_sandbox`：
    - **Pwn / 逆向深度分析**：`pwn_triage`、`decompile`、`pwntools`、`ROPgadget`、`seccomp-tools`、`one_gadget`、`radare2` 或 Windows 下调试 Linux ELF（`gdb_driver` 会自动桥接）；
    - **杂项/流量专用 Linux 工具**：需要 `binwalk`、`steghide`、`zsteg`、`tshark`、`volatility3` 等；
    - **宿主机 Python 缺库**：当 `crypto_solver(check)` 返回 `sandbox_fallback` 或 `rev_query` 提示缺少 `capstone` 时，直接把脚本交给 `ctf_sandbox(exec)` 执行，不再反复在宿主机报错。
 3. **L1.5 重型镜像自动按需启用（`dsh-ctf-sandbox:heavy`）**：无需手工改配置文件，本机已构建 `heavy` 镜像时：
    - **自动触发**：`exec` 命令或 `.py` 脚本头部命中 `angr`/`cle`/`claripy`/`ghidra`/`analyzeHeadless`/`jadx`/`apktool`/`sage`、运行 `.sage`/`.apk` 任务，或 `base` 镜像缺少 `r2` 时跑 `decompile`，均会自动升级到 `heavy` 镜像并自动扩容内存上限至 `4g`；
    - **AI 主动触发**：遇到去符号、混淆、复杂结构体/控制流导致 `r2`/汇编难以阅读时，直接调用 `ctf_sandbox(action: "decompile", profile: "heavy", ...)` 优先使用 Ghidra Headless 输出伪 C 代码（自动给足 120 秒默认超时）。
-4. **L2 强隔离强制容器层（显式传 `backend: "docker", network: "none"`）**：需要直接运行来源不明的题目二进制或可疑脚本时，显式传 `backend: "docker"` 禁止降级到共享宿主机网络的 WSL2；仅当 `pwntools` 连接远程靶机时再传 `network: "bridge"`。
-5. **降级识别**：若 `ctf_sandbox` 返回 `fallback_reason` / `arsenal_note` / `profile_fallback_reason`，说明当前已降级到 WSL2 或基础镜像（Docker 未启动或对应镜像尚未构建），不要对同一缺失工具反复重试。
+4. **L2 强隔离容器层**：`exec`、`decompile`、`pwn_triage` 以及自动桥接的 GDB/APK 任务要求 Docker 隔离；`backend: "auto"` 在 Docker 不可用时会停止并提示，不会把任务交给共享宿主权限与网络的 WSL2。若确实接受该边界，可显式设置 `sandboxBackend: "wsl"`；需要无网络容器时使用 `backend: "docker", network: "none"`，只有 `pwntools` 连接远程靶机时才传 `network: "bridge"`。
+5. **后端检查**：先用 `ctf_sandbox(action: "status")` 检查 Docker 镜像和 WSL2 是否可用。Docker 镜像以 UID 10001 运行，RAM 与 swap 使用同一上限；WSL2 已启动不代表隔离任务会自动使用它。任务被拒绝时，启动 Docker 并构建所需镜像，或明确选择 `sandboxBackend: "wsl"` 并接受共享宿主边界。
 
 ## 时间盒与心跳
 
@@ -88,7 +88,7 @@ whenToUse: "需要检查 CTF 附件、运行解题脚本、分析二进制或整
 
 1. 格式与长度：题面给了格式就传 `pattern`；默认要求 `prefix{...}` 形式。
 2. 来源：传 `source`（result_id、命令或提示位置），没有来源不要提交。
-3. 动态 flag：先刷新实例，再传 `dynamic: true`、`instance` 和 30 分钟内的 `refreshed_at`；实例轮换后旧 flag 直接作废。
+3. 动态 flag：先用 `ctf_instance` 创建/轮换实例，或用 `ctf_arena(container create/extend)` 刷新题目容器；后者返回 `instance_id: "container:<challenge_id>"`。提交时传 `dynamic: true` 和该账本实例 ID。系统只信任工作区实例账本中的 30 分钟内刷新记录，调用方提供的 `refreshed_at` 不会覆盖账本时间；实例删除或轮换后旧 flag 作废。
 4. 重复检查读取 `.ctf-submissions.jsonl`。预检需传 `record: true` 才写本地回执。`ready:false` 时按 `checks` 修正。同一题目标不超过两次正式提交，第一次失败后先复核来源与实例。
 5. 配置了 `platformUrl` 时，预检通过后用 `submit_flag` 提交。`accepted` 表示接受，`duplicate` 表示已经提交，`rejected` 时先复核。未配置平台时可在 `check_flag` 传 `record: true` 留本地回执。实例管理用 `ctf_instance`。
 
@@ -133,7 +133,7 @@ whenToUse: "需要检查 CTF 附件、运行解题脚本、分析二进制或整
 
 - **开场同步（Commander）**：若配置了赛题平台，先用 `ctf_arena(action: "sync_graph")` 拉取未解题目按分值排序写入 `.ctf-graph/`；无平台时手动用 `ctf_graph(add_fact + spawn_intents)` 建题。
 - **生成分工计划**：主代理调用 `ctf_graph(action: "dispatch_plan", max_workers: 3)` 自动避开进行中题目并产出各子代理的 `recommended_prompt` 及超时接管清单（`overdue_recovery`）。
-- **子代理互斥攻坚（Worker）**：主代理按 `assignments` 并行派生 `subagent`；每个子代理第一步必须调用 `ctf_graph(claim_intent)`（遇 `conflict` 立刻退出不撞车），用 `expand` 读必要上下文，解题结束原子调用 `finish_intent` 写回产出的 `facts`（含 flag/关键证据）与下游 `spawn_intents`。
+- **子代理互斥攻坚（Worker）**：主代理按 `assignments` 并行派生 `subagent`；每个子代理第一步必须调用 `ctf_graph(claim_intent)`（遇 `conflict` 立刻退出不撞车），用 `expand` 读必要上下文，解题结束原子调用 `finish_intent` 写回产出的 `facts`（可含已验证的比赛 flag/关键证据）与下游 `spawn_intents`。不要把平台令牌、Cookie 或其他账号凭据写入图谱；对外分享题解前检查并脱敏。
 - **超时止损与提交**：主代理定期查 `ctf_graph(board)` 或 `dispatch_plan`，对 `overdue` 任务用 `steal_overdue: true` 接管或换方向；子代理返回后由主代理复核 flag 来源，经 `check_flag` 预检再调用 `ctf_arena(submit)` / `submit_flag` 提交。
 
 ## 收尾清单
@@ -157,6 +157,11 @@ whenToUse: "需要检查 CTF 附件、运行解题脚本、分析二进制或整
 - **跨文件证据。** 默认核心层直接用 `ctf_progress check` 核对 `result_id`；开启 `enableExtendedAudit: true` 后可用 `verify_evidence` 比较原件路径与文本前缀，或引用 `read_binary_range` / `read_log_range` 返回的 `result_id`。编号过期时可提供 `file_path`、`byte_offset`、`byte_length` 和原件 `sha256` 复算。引用实际值和原件位置。
 - **本地 HTTP 记录。** 开启 `enableExtendedAudit: true` 后可用 `verify_http_evidence` 核对已知方法和不带查询串的路径（HAR 与 JSONL 中记录了同一个请求 ID 时传入 `request_id`）；默认核心层用 `read`/`grep` 或脚本分析 HAR/日志。
 - **HTTP 响应。** 核对状态码、完整响应头（含 `Set-Cookie`/`WWW-Authenticate`，仅脱敏平台令牌）、正文范围和 SHA-256。允许自定义 `Host` 头；需要维持登录态或多账号隔离时使用 `cookie_jar`；文件上传题使用 `multipart`。空正文可以正常返回。自动跳转只适用于同源且无请求体的 GET/HEAD，保留被拦截的 3xx 响应及原因。
+- **平台附件。** `ctf_arena(fetch_files)` 对平台同源附件沿用 CTFd/GZCTF 适配器认证；确认最终 URL 仍在平台来源内，跨来源下载不会发送平台令牌。单次最多下载 8 个附件；返回 `status: partial` 或 `omitted_file_count` 时，按 `detail` 给出的剩余 URL 使用 `fetch_attachment`。
+- **动态 flag 提交。** `ctf_arena(container create/extend)` 会写入带时间的 `container:<challenge_id>` 实例账本记录；`ctf_arena(submit)` 与 `submit_flag` 的动态预检只认账本中 30 分钟内且未删除的实例，忽略调用方自报的 `refreshed_at`。账本写入失败时容器响应返回 `status: partial`，先重试刷新并确认 `instance_recorded`。
+- **平台跳转。** API GET/HEAD 请求可跟随同源重定向；跨来源或要求重放请求体的跳转会保留首个响应并报告阻断原因。
+- **平台自动探测。** CTFd/GZCTF 自动探测遇到 401/403、网络故障或取消时会明确失败；正常响应未匹配平台形状时才继续尝试其他适配器。
+- **Linux 脚本与反编译。** `ctf_sandbox(exec)` 会将 `.sh` 的 CRLF 行尾规范化后交给 Bash；`decompile` 的引擎失败或空函数结果会返回错误或回退诊断，不把空结果当成成功。
 - **Flask 源码与返回事件。** 开启 `enableExtendedAudit: true` 后可用 `trace_flask_route` 追踪已知方法和路径，并用 `verify_flask_response` 对照同一请求的 HTTP 观测、返回事件和源码行；默认核心层直接用 `grep`/`read` 追踪路由并用 `http_request` 复现。
 - **二进制和浏览器。** `gdb_driver inspect` 查看文件/节；`gdb_driver debug` 用受限命令运行题目二进制并读取寄存器、栈、回溯或反汇编。`browser_session` 可查看已授权页面、DOM、Cookie（默认含赛题值）、local/sessionStorage、捕获的网络请求（`network`，传 `request_id` 可读响应体）、控制台日志（`console`）以及自动捕获放行的 JS 弹窗（`dialogs`），等待动态元素并截图；可写会话中支持点击、填表、选下拉项、发送常用按键、`evaluate` 页面 JS 求值、`set_cookie`、`set_headers` 与工作区文件 `upload_file`。交互使用唯一匹配的 CSS selector。
 - **压缩包与音频。** `archive_crack` 检查 ZIP 结构并尝试 ZipCrypto 口令（`passwords`、`wordlist`、`mask` 和内置弱口令，默认 30 秒）；明文攻击、AES 压缩包或需要 `bkcrack`/`john`/`hashcat` 时转 `ctf_sandbox`。`stego_audio` 支持 PCM 8/16/24 位 WAV，可按时间段和声道读取 LSB，或生成频谱 PNG。
@@ -177,8 +182,8 @@ whenToUse: "需要检查 CTF 附件、运行解题脚本、分析二进制或整
 - **归档附件。** 用 `inspect_attachment` 查看目录并取得 `member_index`，再用 `read_archive_member` 读取解压后最多 1 MiB 的普通成员。单文件 gzip、zlib、bzip2 和 xz 使用成员 0；压缩 TAR 按展开后的目录读取。bzip2/xz 需要 Python 3.11 标准库；7z/RAR 依赖不可用时保留格式与原件哈希。
 - **压缩流。** `inspect_attachment` 自动识别带校验的 zlib、bzip2 和 xz 流。Raw Deflate 没有固定头部，先根据来源证据判断格式后传 `format_hint: deflate_raw`。解出的成员或 TAR 可继续通过 `source_result_id` 交给其他附件工具，并核对原件与成员 SHA-256。
 - **图像 LSB 到二维码。** `read_png_pixels operation: bitstream` 用 `next_bit_offset` 按整字节续页。把连续页的 `result_id` 按顺序交给 `inspect_media kind: qr`，工具会核对来源、帧和位偏移，自动拼接原始字节。
-- **PDF、数据库、Office 与 AI 模型。** PDF 可检查文本、渲染指定页或读取嵌入附件；页面 PNG 和附件都能通过 `result_id` 继续读图、识别二维码或检查格式。SQLite 只允许只读查询。Office 读取常见 OpenXML/ODF 文本和单元格，不执行宏。遇到 `.pkl`/`.pt`/`.pth`/`.safetensors`/`.gguf`/`.onnx` 等模型附件时，先用 `inspect_media(kind: "model")` 做纯静态零执行安全体检（绝不直接 `pickle.load`/`torch.load` 不可信模型），同样支持 `source_result_id` 承接归档成员。
-- **抓包。** `inspect_attachment` 可按节、接口和时间范围统计 PCAPNG，`packet_count` 代表筛选结果；`pcap_stream` 可按地址、协议、端口和 UTC 时间筛选。64 MiB 以上按包/块分块流读，最大 1 GiB。输出保留全文件范围、筛选范围、`analysis_status` 和结构化 `warnings[]`。TCP 重组遇到缺包时依然显示不完整标志。
+- **PDF、数据库、Office 与 AI 模型。** PDF 可检查文本、渲染指定页或读取嵌入附件；页面 PNG 和附件都能通过 `result_id` 继续读图、识别二维码或检查格式。SQLite 只允许只读查询。Office 读取常见 OpenXML/ODF 文本和单元格，不执行宏。遇到 `.pkl`/`.pt`/`.pth`/`.safetensors`/`.gguf`/`.onnx` 等模型附件时，先用 `inspect_media(kind: "model")` 做纯静态零执行安全体检（绝不直接 `pickle.load`/`torch.load` 不可信模型），同样支持 `source_result_id` 承接归档成员。ONNX GraphProto 节点尚未遍历，结果会明确标记 `status: incomplete` 且风险至少为中。
+- **抓包。** `inspect_attachment` 可按节、接口和时间范围统计 PCAPNG，`packet_count` 代表筛选结果；`pcap_stream` 可按地址、协议、端口和 UTC 时间筛选。64 MiB 以上按包/块分块流读，最大 1 GiB；TCP 乱序缓存最多保留 16 MiB，超出时看 `pending_segments_dropped` 和不完整标记。输出保留全文件范围、筛选范围、`analysis_status` 和结构化 `warnings[]`。
 - **ELF 与 pwn triage。** `inspect_elf` 从原件读取入口和符号表，并给出 NX、PIE、RELRO、canary、FORTIFY、动态导入和 `DT_NEEDED`；x86-64 另有 PLT/GOT、常见符号及 `/bin/sh` 位置。Gadget 扫描只是字节匹配，可能命中数据。深度 Pwn 侦察优先用 `ctf_sandbox(action: "pwn_triage")`；开启 `enableExtendedAudit: true` 后还可直接用 `pwn_cyclic` 定位栈溢出偏移及 `pwn_payload` 组装基础 `ret2libc_x64` 载荷。
 - **TCP 远程交互。** 用 `net_session` 连接题目服务：`connect` 建会话，`send` 发字节（单次 1 MiB），`recv`/`read_until` 收包。文本安全时返回 UTF-8，二进制返回 Hex 和 hexdump；收到分隔符或 64 KiB 上限即返回。用 `list` 查看会话，`close` 关闭；取消操作会销毁 socket。
 - **GDB 调试。** `gdb_driver` 的 `inspect` 只查文件/节；`debug` 在可写会话中运行题目工作区的二进制，可用受限白名单命令（支持偏移表达式、只读解引用、常用缩写与 `args` 传参）设断点、运行/单步并读取寄存器、栈、回溯和反汇编；Windows 下遇 Linux ELF 且沙箱可用时自动桥接 Linux `gdb`。`stdin_file` 只能指向工作区文件，须同时传 `run`。不支持 `script`、shell、Python、写内存或 `source`；stdout 与 stderr 各限 32 KiB，限时 120 秒。

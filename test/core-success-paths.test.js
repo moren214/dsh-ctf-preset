@@ -146,7 +146,7 @@ test('平台响应脱敏，并在发请求前拒绝未配置或明文令牌', as
     });
     assert.equal(sent.request.url, 'https://board.example/api/status');
     assert.equal(sent.request.headers.Authorization, 'Bearer secret-token');
-    assert.equal(sent.request.follow_redirects, false);
+    assert.equal(sent.request.follow_redirects, true);
     assert.equal(typeof sent.options.authorize, 'function');
     assert.equal(successful.body, '[已脱敏]');
     await assert.rejects(platformRequest({ platformUrl: 'https://board.example' }, undefined, 'GET', '/status', undefined,

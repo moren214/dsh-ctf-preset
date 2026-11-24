@@ -1021,17 +1021,27 @@ function plaintextFields(value) {
 
 function attackResult(mode, fields) {
   const output = { mode };
+  if (fields.plaintext !== undefined) Object.assign(output, plaintextFields(fields.plaintext));
   if (fields.factors !== undefined) output.factors = fields.factors;
   if (fields.d !== undefined) output.d = fields.d;
-  if (fields.plaintext !== undefined) Object.assign(output, plaintextFields(fields.plaintext));
   if (fields.iterations !== undefined) output.iterations = fields.iterations;
   if (fields.note !== undefined) output.note = fields.note;
   let text = JSON.stringify(output);
   if (text.length > MAX_VALUE_CHARACTERS && output.plaintext !== undefined) {
-    delete output.plaintext;
+    // Keep the recoverable plaintext. Optional factor/key diagnostics are the
+    // first fields to shed when the worker's JSON result budget is exceeded.
+    delete output.factors;
+    delete output.d;
+    delete output.iterations;
+    if (output.note !== undefined) delete output.note;
+    text = JSON.stringify(output);
+  }
+  if (text.length > MAX_VALUE_CHARACTERS && output.plaintext !== undefined) {
+    // Decimal plaintext is the lossless representation. Drop only its
+    // redundant display encoding before considering any precision loss.
     delete output.plaintext_hex;
     delete output.text;
-    output.note = (output.note === undefined ? '' : output.note + ' ') + '明文字段超过 4096 字符上限，已省略。';
+    output.plaintext_representation_truncated = true;
     text = JSON.stringify(output);
   }
   return text;
@@ -1320,8 +1330,8 @@ function rsaKnownD(n, e, d, maxTrials) {
   if (multiple <= 0n || (multiple & 1n) !== 0n) {
     throw new CalculationError('e·d−1 须为正偶数；请核对公钥和私钥指数。');
   }
-  if (multiple.toString(2).length > MAX_MODULAR_BITS) {
-    throw new CalculationError('e·d−1 超过 4096 位二进制上限。');
+  if (multiple.toString(2).length > MAX_MODULAR_BITS * 2) {
+    throw new CalculationError('e·d−1 超过 8192 位二进制上限。');
   }
   let oddPart = multiple;
   let powersOfTwo = 0;

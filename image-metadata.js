@@ -94,6 +94,7 @@ function inspectPng(bytes, paging) {
   requireBytes(bytes, 0, PNG_SIGNATURE.length, 'PNG 文件签名');
   if (!PNG_SIGNATURE.equals(bytes.subarray(0, 8))) throw new ImageStructureError('invalid', 0, 'PNG 文件签名无效。');
   const rows = [];
+  const warnings = [];
   let cursor = PNG_SIGNATURE.length;
   let count = 0;
   let image;
@@ -112,7 +113,7 @@ function inspectPng(bytes, paging) {
     const dataEnd = dataStart + dataSize;
     requireBytes(bytes, dataStart, dataSize + 4, `PNG ${type} 数据或 CRC`);
     if (crc32(bytes.subarray(cursor + 4, dataEnd)) !== bytes.readUInt32BE(dataEnd)) {
-      throw new ImageStructureError('invalid', dataEnd, `PNG ${type} 的 CRC-32 校验失败。`);
+      warnings.push({ file_offset: dataEnd, reason: `PNG ${type} 的 CRC-32 校验失败；结构字段按未校验数据解析。` });
     }
     if (type === 'IHDR') image = readPngHeader(bytes, dataStart, dataSize);
     if (type === 'eXIf' && exif?.status !== 'ok') exif = inspectExif(bytes.subarray(dataStart, dataEnd), dataStart);
@@ -128,7 +129,8 @@ function inspectPng(bytes, paging) {
     count++;
     if (type === 'IEND') {
       if (dataSize !== 0 || !seenImageData) throw new ImageStructureError('invalid', cursor, 'PNG IEND 长度无效或缺少 IDAT。');
-      return { status: 'ok', image, ...(exif ? { exif } : {}), ...(animation ? { animation } : {}),
+      return { status: warnings.length > 0 ? 'partial' : 'ok', image, ...(exif ? { exif } : {}),
+        ...(animation ? { animation } : {}), ...(warnings.length > 0 ? { warnings } : {}),
         ...trailing(bytes, dataEnd + 4), layout: page('chunks', count, rows, paging.offset) };
     }
     cursor = dataEnd + 4;

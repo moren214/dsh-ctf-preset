@@ -26,7 +26,7 @@ export const SANDBOX_PROPERTIES = {
     enum: ['status', 'exec', 'decompile', 'pwn_triage'],
     description: 'status 探测沙箱；exec 跑命令/脚本；decompile 列出函数或反编译；pwn_triage 采集 checksec/libc/gadget/seccomp。',
   },
-  backend: { type: 'string', enum: ['auto', 'docker', 'wsl'], description: '单次覆盖后端；需离线隔离或完整兵器库传 docker，默认 auto。' },
+  backend: { type: 'string', enum: ['auto', 'docker', 'wsl'], description: '单次覆盖后端；要求隔离时选 docker。auto 不会将隔离任务静默降级到 WSL。' },
   profile: { type: 'string', enum: ['auto', 'base', 'heavy'], description: '镜像档位：auto 自动按需升级重型镜像；base 轻量全栈；heavy 重器（Ghidra/angr/jadx/Sage，自动扩容 4g 内存）。' },
   command: { type: 'string', maxLength: MAX_COMMAND_CHARS, description: 'exec 单行命令。' },
   script_path: { type: 'string', maxLength: 1024, description: 'exec 工作区脚本路径（.py/.sh/.sage）。' },
@@ -374,10 +374,13 @@ export async function detectSandbox(config = {}, signal, { fresh = false } = {})
 export function buildDockerArgs(argv, { cwd, containerName, targetImage, isHeavy = false, network = 'none', ptrace = false, readOnlyWork = false }) {
   return [
     'run', '--rm', '--init', '--name', containerName,
+    '--read-only',
+    '--tmpfs', '/tmp:rw,nosuid,size=512m',
     '--cap-drop=ALL',
     '--security-opt=no-new-privileges:true',
     `--pids-limit=${isHeavy ? 512 : 256}`,
     `--memory=${isHeavy ? '4g' : '2g'}`,
+    `--memory-swap=${isHeavy ? '4g' : '2g'}`,
     '--cpus=2',
     '--network', network === 'bridge' ? 'bridge' : 'none',
     ...(ptrace ? ['--cap-add=SYS_PTRACE'] : []),
@@ -388,11 +391,15 @@ export function buildDockerArgs(argv, { cwd, containerName, targetImage, isHeavy
   ];
 }
 
-export async function runSandboxCommand(argv, { cwd, config = {}, signal, timeoutMs = DEFAULT_TIMEOUT_MS, network = 'none', ptrace = false, readOnlyWork = false, detected, image, profile = 'base' } = {}) {
+export async function runSandboxCommand(argv, { cwd, config = {}, signal, timeoutMs = DEFAULT_TIMEOUT_MS, network = 'none', ptrace = false, readOnlyWork = false, requiresIsolation = false, detected, image, profile = 'base' } = {}) {
   const env = detected ?? await detectSandbox(config, signal);
   if (!env.available) {
     throw new ToolError('dependency',
       `Linux 沙箱不可用（Docker: ${env.docker.reason}；WSL2: ${env.wsl.reason}）。请构建 ${config?.sandboxImage ?? DEFAULT_IMAGE} 或启用 WSL2 Ubuntu。`);
+  }
+  if (requiresIsolation && env.backend !== 'docker' && env.preference === 'auto') {
+    throw new ToolError('dependency',
+      'Docker 不可用，auto 后端只能使用共享宿主网络和权限的 WSL2，无法满足此任务的隔离要求。请启动 Docker 并构建沙箱镜像；如仍要在 WSL2 中运行，请显式设置 backend: "wsl"。');
   }
   const started = Date.now();
   if (env.backend === 'docker') {
@@ -432,27 +439,27 @@ import hashlib, json, os, re, shutil, struct, subprocess, sys, tempfile
 binary = sys.argv[1]
 target = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
 prefer_engine = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else "auto"
+headless_timeout = max(1, int(sys.argv[4]) // 1000 - 2) if len(sys.argv) > 4 else 88
 r2 = shutil.which("r2") or shutil.which("radare2") or shutil.which("rizin")
 ghidra = shutil.which("analyzeHeadless")
 if not ghidra and os.environ.get("GHIDRA_HOME"):
     cand = os.path.join(os.environ["GHIDRA_HOME"], "support", "analyzeHeadless")
     if os.path.isfile(cand):
         ghidra = cand
+ghidra_diagnostic = None
 
 def run(cmd, timeout=45):
     proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
     return proc.returncode, proc.stdout, proc.stderr
 
-def file_sha256(path, limit=64 * 1024 * 1024):
+def file_sha256(path):
     h = hashlib.sha256()
-    total = 0
     with open(path, "rb") as fh:
-        while total < limit:
-            chunk = fh.read(min(1024 * 1024, limit - total))
+        while True:
+            chunk = fh.read(1024 * 1024)
             if not chunk:
                 break
             h.update(chunk)
-            total += len(chunk)
     return h.hexdigest()
 
 def parse_r2_sections(output):
@@ -471,40 +478,68 @@ def parse_r2_sections(output):
 def clean_r2_pseudo(text):
     if not text:
         return ""
-    for bad in ("Cannot find", "Invalid command", "Unknown command"):
-        if bad in text:
-            return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    if len(lines) <= 3 and any(
+        line.startswith(("Cannot find", "Invalid command", "Unknown command", "ERROR:"))
+        for line in lines
+    ):
+        return ""
     return text
 
 def decompile_ghidra(ghidra_bin, bin_path, func_target):
+    global ghidra_diagnostic
     script_dir = tempfile.mkdtemp(prefix="dsh_ghidra_script_")
     script_path = os.path.join(script_dir, "DshDecomp.py")
     out_path = os.path.join(script_dir, "out.json")
     py_script = (
+        "# -*- coding: utf-8 -*-\n"
+        "from __future__ import unicode_literals\n"
         "import json, os\n"
         "from ghidra.app.decompiler import DecompInterface\n"
+        "def norm_addr(raw):\n"
+        "    s = str(raw).strip().lower()\n"
+        "    if s.startswith('0x'): s = s[2:]\n"
+        "    if not s or any(ch not in '0123456789abcdef' for ch in s): return None\n"
+        "    return '0x' + (s.lstrip('0') or '0')\n"
         "target = os.environ.get('DSH_TARGET') or None\n"
         "prog_name = currentProgram.getName()\n"
+        "img_base = int(currentProgram.getImageBase().getOffset())\n"
+        "img_base_hex = hex(img_base).rstrip('L')\n"
         "fm = currentProgram.getFunctionManager()\n"
         "if not target:\n"
         "    funcs = []\n"
         "    for f in fm.getFunctions(True):\n"
-        "        funcs.append({'name': f.getName(), 'address': '0x' + f.getEntryPoint().toString(), 'size': int(f.getBody().getNumAddresses())})\n"
+        "        entry_off = int(f.getEntryPoint().getOffset())\n"
+        "        entry_norm = norm_addr(f.getEntryPoint().toString()) or ('0x' + f.getEntryPoint().toString())\n"
+        "        item = {'name': f.getName(), 'address': entry_norm, 'size': int(f.getBody().getNumAddresses())}\n"
+        "        if img_base > 0 and entry_off >= img_base:\n"
+        "            item['offset'] = hex(entry_off - img_base).rstrip('L')\n"
+        "        funcs.append(item)\n"
         "        if len(funcs) >= 200: break\n"
-        "    res = {'engine': 'ghidra', 'mode': 'list', 'program_name': prog_name, 'function_count': len(funcs), 'functions': funcs}\n"
+        "    res = {'engine': 'ghidra', 'mode': 'list', 'program_name': prog_name, 'image_base': img_base_hex, 'function_count': len(funcs), 'functions': funcs}\n"
+        "    if not funcs: res['warning'] = 'Ghidra 没有识别到函数。'\n"
         "else:\n"
+        "    target_norm = norm_addr(target)\n"
         "    hit = None\n"
         "    for f in fm.getFunctions(True):\n"
-        "        addr_s = '0x' + f.getEntryPoint().toString().lstrip('0') or '0x0'\n"
-        "        if f.getName() == target or addr_s.lower() == target.lower():\n"
+        "        entry_off = int(f.getEntryPoint().getOffset())\n"
+        "        addr_s = norm_addr(f.getEntryPoint().toString())\n"
+        "        rel_s = norm_addr(hex(entry_off - img_base).rstrip('L')) if (img_base > 0 and entry_off >= img_base) else None\n"
+        "        if f.getName() == target or (target_norm is not None and (addr_s == target_norm or rel_s == target_norm)):\n"
         "            hit = f; break\n"
         "    if hit is None:\n"
-        "        res = {'engine': 'ghidra', 'mode': 'function', 'program_name': prog_name, 'target': target, 'error': 'Ghidra 未找到目标函数。'}\n"
+        "        res = {'engine': 'ghidra', 'mode': 'function', 'program_name': prog_name, 'image_base': img_base_hex, 'target': target, 'error': 'Ghidra 未找到目标函数。'}\n"
         "    else:\n"
         "        ifc = DecompInterface(); ifc.openProgram(currentProgram)\n"
         "        dec = ifc.decompileFunction(hit, 30, monitor)\n"
-        "        code_txt = dec.getDecompiledFunction().getC() if dec and dec.decompileCompleted() else ''\n"
-        "        res = {'engine': 'ghidra', 'mode': 'function', 'program_name': prog_name, 'target': target, 'pseudocode': code_txt[:32768], 'disassembly': ''}\n"
+        "        completed = bool(dec and dec.decompileCompleted())\n"
+        "        code_fn = dec.getDecompiledFunction() if completed else None\n"
+        "        code_txt = code_fn.getC() if code_fn else ''\n"
+        "        if not completed: res = {'engine': 'ghidra', 'mode': 'function', 'target': target, 'error': 'Ghidra 反编译未完成。'}\n"
+        "        elif not code_txt.strip(): res = {'engine': 'ghidra', 'mode': 'function', 'target': target, 'error': 'Ghidra 返回了空伪代码。'}\n"
+        "        else: res = {'engine': 'ghidra', 'mode': 'function', 'program_name': prog_name, 'image_base': img_base_hex, 'target': target, 'pseudocode': code_txt[:32768], 'disassembly': ''}\n"
         "with open(os.environ['DSH_OUT'], 'w') as fh: fh.write(json.dumps(res))\n"
     )
     def run_headless(args, env):
@@ -513,20 +548,36 @@ def decompile_ghidra(ghidra_bin, bin_path, func_target):
                 os.unlink(out_path)
             except OSError:
                 pass
-        subprocess.run(
+        proc = subprocess.run(
             [ghidra_bin, *args],
-            capture_output=True, text=True, errors="replace", timeout=90, env=env,
+            capture_output=True, text=True, errors="replace", timeout=headless_timeout, env=env,
         )
-        if os.path.isfile(out_path):
-            with open(out_path) as fh:
-                return json.loads(fh.read())
-        return None
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()[:2048]
+            raise RuntimeError(f"analyzeHeadless 退出码 {proc.returncode}。{detail}")
+        if not os.path.isfile(out_path):
+            raise RuntimeError("analyzeHeadless 成功退出但没有生成结果 JSON。")
+        with open(out_path) as fh:
+            result = json.loads(fh.read())
+        if not isinstance(result, dict):
+            raise RuntimeError("Ghidra 结果不是 JSON 对象。")
+        if result.get("mode") == "function" and not result.get("error") \
+                and not (result.get("pseudocode") or result.get("disassembly")):
+            raise RuntimeError("Ghidra 结果没有伪代码或反汇编。")
+        return result
     try:
         with open(script_path, "w") as fh:
             fh.write(py_script)
         env = dict(os.environ)
         env["DSH_TARGET"] = func_target or ""
         env["DSH_OUT"] = out_path
+        ghidra_home_tmp = os.path.join(script_dir, "home")
+        os.makedirs(ghidra_home_tmp, exist_ok=True)
+        env["HOME"] = ghidra_home_tmp
+        env["XDG_CONFIG_HOME"] = os.path.join(ghidra_home_tmp, ".config")
+        env["XDG_CACHE_HOME"] = os.path.join(ghidra_home_tmp, ".cache")
+        java_opts = env.get("JAVA_TOOL_OPTIONS", "").strip()
+        env["JAVA_TOOL_OPTIONS"] = (java_opts + f" -Duser.home={ghidra_home_tmp}").strip()
 
         cache_parent = os.path.join(".ctf-cache", "ghidra")
         cache_dir = None
@@ -598,10 +649,16 @@ def decompile_ghidra(ghidra_bin, bin_path, func_target):
             return res
         finally:
             shutil.rmtree(ephemeral_dir, ignore_errors=True)
-    except Exception:
+    except Exception as exc:
+        ghidra_diagnostic = str(exc)[:2048] or type(exc).__name__
         return None
     finally:
         shutil.rmtree(script_dir, ignore_errors=True)
+
+def with_ghidra_fallback(report):
+    if ghidra_diagnostic:
+        report["fallback_warning"] = "Ghidra 失败，已尝试其他分析器：" + ghidra_diagnostic
+    return report
 
 def disasm_elf_ptload(objdump_bin, bin_path, addr):
     try:
@@ -663,7 +720,12 @@ if r2:
                 funcs.append({"name": item.get("name"), "address": hex(item.get("offset", 0)), "size": item.get("size", 0)})
         except Exception:
             pass
-        print(json.dumps({"engine": engine_name, "mode": "list", "function_count": len(funcs), "functions": funcs, "exit_code": code, "stderr": err[:2048]}))
+        r2_report = {"engine": engine_name, "mode": "list", "function_count": len(funcs), "functions": funcs, "exit_code": code, "stderr": err[:2048]}
+        if code != 0:
+            r2_report["error"] = f"r2 列出函数失败，退出码 {code}。"
+        elif not funcs:
+            r2_report["warning"] = "r2 没有识别到函数。"
+        print(json.dumps(with_ghidra_fallback(r2_report)))
         sys.exit(0)
     r2_cmds = "; ".join([
         "e scr.color=0",
@@ -678,8 +740,16 @@ if r2:
     code, out, err = run([r2, "-e", "bin.relocs.apply=true", "-2", "-A", "-q", "-c", r2_cmds, "--", binary], timeout=60)
     sections = parse_r2_sections(out)
     pseudo = clean_r2_pseudo(sections["__DSH_R2_PDG__"]) or clean_r2_pseudo(sections["__DSH_R2_PDC__"])
-    asm = sections["__DSH_R2_ASM__"] or (out.strip() if not pseudo else "")
-    print(json.dumps({"engine": engine_name, "mode": "function", "target": target, "pseudocode": pseudo[:32768], "disassembly": asm[:32768], "exit_code": code, "stderr": err[:2048]}))
+    asm = sections["__DSH_R2_ASM__"]
+    if not asm and not pseudo:
+        asm = "\n".join(line for line in out.splitlines()
+                          if line.strip() not in ("__DSH_R2_PDG__", "__DSH_R2_PDC__", "__DSH_R2_ASM__")).strip()
+    r2_report = {"engine": engine_name, "mode": "function", "target": target, "pseudocode": pseudo[:32768], "disassembly": asm[:32768], "exit_code": code, "stderr": err[:2048]}
+    if code != 0:
+        r2_report["error"] = f"r2 反编译失败，退出码 {code}。"
+    elif not pseudo and not asm:
+        r2_report["error"] = "r2 没有返回伪代码或反汇编。"
+    print(json.dumps(with_ghidra_fallback(r2_report)))
     sys.exit(0)
 
 if ghidra and prefer_engine != "ghidra":
@@ -692,7 +762,7 @@ objdump = shutil.which("objdump")
 readelf = shutil.which("readelf")
 nm = shutil.which("nm")
 if not objdump:
-    print(json.dumps({"engine": "none", "error": "沙箱内未找到 r2/radare2 或 objdump。"}))
+    print(json.dumps(with_ghidra_fallback({"engine": "none", "error": "沙箱内未找到 r2/radare2 或 objdump。"})))
     sys.exit(2)
 
 if target is None:
@@ -721,7 +791,10 @@ if target is None:
         if key not in seen:
             seen.add(key)
             unique.append(item)
-    print(json.dumps({"engine": "objdump", "mode": "list", "function_count": len(unique), "functions": unique[:200], "note": "沙箱内未安装 radare2/Ghidra，已降级为符号函数表；指定 function 可用 objdump 反汇编。"}))
+    objdump_report = {"engine": "objdump", "mode": "list", "function_count": len(unique), "functions": unique[:200], "note": "沙箱内未安装 radare2/Ghidra，已降级为符号函数表；指定 function 可用 objdump 反汇编。"}
+    if not unique:
+        objdump_report["warning"] = "没有识别到可列出的符号函数。"
+    print(json.dumps(with_ghidra_fallback(objdump_report)))
     sys.exit(0)
 
 if re.fullmatch(r"0x[0-9a-fA-F]+", target):
@@ -751,7 +824,10 @@ if not re.search(r"^\s*[0-9a-f]+:\s+[0-9a-f]{2}", out, re.M):
             g_code, g_out, g_err = run(gdb_cmd, timeout=30)
             if g_code == 0 and g_out.strip():
                 code, out, err, engine = g_code, g_out, g_err, "gdb"
-print(json.dumps({"engine": engine, "mode": "function", "target": target, "pseudocode": None, "disassembly": out[:49152], "exit_code": code, "stderr": err[:2048], "note": "当前使用汇编输出；安装 radare2/r2ghidra 可输出伪 C。"}))
+objdump_report = {"engine": engine, "mode": "function", "target": target, "pseudocode": None, "disassembly": out[:49152], "exit_code": code, "stderr": err[:2048], "note": "当前使用汇编输出；安装 radare2/r2ghidra 可输出伪 C。"}
+if code != 0 or not out.strip():
+    objdump_report["error"] = "objdump 没有成功返回反汇编结果。"
+print(json.dumps(with_ghidra_fallback(objdump_report)))
 `;
 
 const PWN_TRIAGE_SCRIPT = String.raw`
@@ -787,6 +863,18 @@ if shutil.which("readelf"):
     m = re.search(r"Requesting program interpreter:\s*([^\]]+)\]", interp.get("stdout", ""))
     report["needed"] = needed[:32]
     report["interpreter"] = m.group(1).strip() if m else None
+if shutil.which("ldd"):
+    ldd_res = run(["ldd", "--", binary], timeout=10)
+    libc_m = re.search(r"libc\.so\.\d+\s*=>\s*(\S+)", ldd_res.get("stdout", ""))
+    if libc_m:
+        libc_path = libc_m.group(1)
+        libc_info = {"path": libc_path}
+        if shutil.which("strings"):
+            st = run(["strings", "-n", "12", "--", libc_path], timeout=10)
+            bm = re.search(r"GNU C Library[^\n]{0,160}", st.get("stdout", ""))
+            if bm:
+                libc_info["banner"] = bm.group(0).strip()
+        report["libc"] = libc_info
 
 rop = shutil.which("ROPgadget")
 if rop:
@@ -935,7 +1023,7 @@ export async function runSandbox(args, { cwd, config = {}, signal, writable, che
       } else if (rel.endsWith('.sage')) {
         argv = ['sage', rel];
       } else if (rel.endsWith('.sh')) {
-        argv = ['bash', '--', rel];
+        argv = ['bash', '-c', "set -o pipefail; sed 's/\\r$//' -- \"$1\" | bash -s", 'ctf-script', rel];
       } else {
         argv = ['./' + rel];
       }
@@ -949,6 +1037,7 @@ export async function runSandbox(args, { cwd, config = {}, signal, writable, che
       network: args.network ?? 'none',
       ptrace: args.ptrace === true,
       readOnlyWork: args.read_only_work === true,
+      requiresIsolation: true,
       detected,
       image: plan.image,
       profile: plan.profile,
@@ -988,9 +1077,10 @@ export async function runSandbox(args, { cwd, config = {}, signal, writable, che
     const runDecompileOnce = async (currentPlan, preferEngine) => {
       const effectiveTimeout = !hasExplicitTimeout && preferEngine === 'ghidra'
         ? HEAVY_DECOMPILE_TIMEOUT_MS : timeoutMs;
-      const argv = ['python3', '-c', DECOMPILE_SCRIPT, rel, args.function ?? '', preferEngine];
+      const argv = ['python3', '-c', DECOMPILE_SCRIPT, rel, args.function ?? '', preferEngine, String(effectiveTimeout)];
       return runSandboxCommand(argv, {
         cwd, config: effectiveConfig, signal, timeoutMs: effectiveTimeout, detected,
+        requiresIsolation: true,
         image: currentPlan.image, profile: currentPlan.profile,
       });
     };
@@ -1044,6 +1134,7 @@ export async function runSandbox(args, { cwd, config = {}, signal, writable, che
   const argv = ['python3', '-c', PWN_TRIAGE_SCRIPT, rel, args.allow_exec === true ? '1' : '0'];
   const result = await runSandboxCommand(argv, {
     cwd, config: effectiveConfig, signal, timeoutMs, ptrace: args.allow_exec === true, readOnlyWork: true, detected,
+    requiresIsolation: true,
     image: plan.image, profile: plan.profile,
   });
   if (result.timedOut) {

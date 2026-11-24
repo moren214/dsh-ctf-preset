@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { ToolError } from './tool-errors.js';
 import { decodeEvidenceText, lineBounds, parseEvidenceJson } from './evidence.js';
 import { EXPERIMENT_TOOLS, experimentRequestHash } from './experiment-input.js';
 import {
@@ -752,7 +753,7 @@ export async function manageProgress(args, files) {
   const current = progressRevision(notes, state);
   if (revision !== undefined && current !== revision.toLowerCase()) {
     const operation = action === 'repair' ? '修复' : action === 'save' ? '保存' : '生成题解';
-    throw new Error(`notes.md 已被更新，请重新读取后再${operation}。`);
+    throw new ToolError('conflict', `notes.md 已被更新，请重新读取后再${operation}。`);
   }
   let record;
   try {
@@ -877,12 +878,14 @@ export async function manageProgress(args, files) {
     const projection = files.canWrite === false ? undefined : await writeProjection(files, 'handoff.md', 'handoff', briefing);
     const persisted = projection !== undefined;
     const handoffRevision = projection?.revision;
+    const warnings = [];
+    if (legacyHeading) warnings.push(LEGACY_VALUES_WARNING);
+    if (!persisted) warnings.push('只读会话未写入 handoff.md，只返回简报文本。');
     return { status: 'handoff', file: 'notes.md', revision: current, cwd, ...context, briefing,
       handoff_file: projection?.target ?? 'handoff.md', ...(handoffRevision === undefined ? {} : { handoff_revision: handoffRevision }),
       persisted, progress: stored,
       evidence_status: Object.fromEntries(evidenceStatus), value_status: valueChecks,
-      ...(legacyHeading ? { warning: LEGACY_VALUES_WARNING } : {}),
-      ...(persisted ? {} : { warning: '只读会话未写入 handoff.md，只返回简报文本。' }) };
+      ...(warnings.length ? { warning: warnings.join(' ') } : {}) };
   }
 
   const body = '续接记录版本 ' + current + '。\n\n' + renderProgress(verified, '## 题解草稿', valueStates);

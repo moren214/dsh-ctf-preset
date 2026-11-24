@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
 import { browserGateway } from './browser-gateway.js';
+import { ToolError } from './tool-errors.js';
 import { httpRequest } from './http-client.js';
 
 const PROFILE_PREFIX = 'dsh-ctf-browser-';
@@ -139,7 +140,7 @@ async function removeProfile(profile, root) {
   }
 }
 
-export function createBrowserSession({ resolveBinary, authorize, environment, onStart, onStop }) {
+export function createBrowserSession({ resolveBinary, authorize, environment, allowInsecureTls, onStart, onStop }) {
   let state;
   let active;
   let cleanup;
@@ -233,8 +234,8 @@ export function createBrowserSession({ resolveBinary, authorize, environment, on
     if (state?.sessionId && state.socket?.readyState === 1) return state;
     const binary = await resolveBinary();
     signal.throwIfAborted();
-    if (!binary || !path.isAbsolute(binary)) throw new Error('缺少可用的本机 Chrome/Edge 浏览器绝对路径。');
-    if (typeof WebSocket !== 'function') throw new Error('当前 DSH 的 Node 运行时缺少 WebSocket。');
+    if (!binary || !path.isAbsolute(binary)) throw new ToolError('dependency', '缺少可用的本机 Chrome/Edge 浏览器绝对路径。');
+    if (typeof WebSocket !== 'function') throw new ToolError('dependency', '当前 DSH 的 Node 运行时缺少 WebSocket。');
     if (state) await shutdown();
     onStart();
     const browser = { pending: new Map(), nextId: 0, exited: false, networkLogs: [], networkById: new Map(), consoleLogs: [], dialogLogs: [] };
@@ -245,10 +246,12 @@ export function createBrowserSession({ resolveBinary, authorize, environment, on
       browser.root = await realpath(tmpdir());
       browser.profile = await mkdtemp(path.join(browser.root, PROFILE_PREFIX));
       signal.throwIfAborted();
+      const insecureTls = typeof allowInsecureTls === 'function' ? allowInsecureTls() === true : allowInsecureTls === true;
       browser.child = spawn(binary, [
         '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
         '--disable-extensions', '--mute-audio', '--remote-debugging-port=0', '--disable-background-networking',
         '--disable-quic', '--dns-prefetch-disable', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+        ...(insecureTls ? ['--ignore-certificate-errors'] : []),
         '--proxy-server=' + browser.gateway.address, '--proxy-bypass-list=<-loopback>',
         '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1',
         '--user-data-dir=' + browser.profile, 'about:blank',
@@ -315,9 +318,9 @@ export function createBrowserSession({ resolveBinary, authorize, environment, on
         signal.throwIfAborted();
         return await operation(signal);
       } catch (error) {
-        if (signal.aborted || state?.exited) await shutdown();
-        if (deadline.aborted && !parent?.aborted) throw new Error('浏览器操作超时（' + timeoutMs + ' ms）。');
-        if (signal.aborted) throw new Error('浏览器操作已取消。');
+        if (parent?.aborted || state?.exited) await shutdown();
+        if (deadline.aborted && !parent?.aborted) throw new ToolError('timeout', '浏览器操作超时（' + timeoutMs + ' ms）。');
+        if (signal.aborted) throw new ToolError('abort', '浏览器操作已取消。');
         throw error;
       } finally {
         active = undefined;

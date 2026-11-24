@@ -20,3 +20,35 @@ jobs:
         run: npm run check
       - name: Unit tests with coverage floor
         run: npm run test:coverage
+
+  python-workers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile every Python worker
+        run: >-
+          python -m py_compile
+          archive-directory-worker.py
+          compressed-stream-worker.py
+          flask-route-worker.py
+          media-reader-worker.py
+          rev-disasm-worker.py
+          workbench-base100-worker.py
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the base sandbox image（跳过 radare2 以控制 CI 时长）
+        run: docker build --build-arg WITH_R2=0 -t dsh-ctf-sandbox:ci docker/
+      - name: Assert the isolation defaults hold in a real container
+        run: |
+          set -eu
+          docker run --rm --read-only --network none dsh-ctf-sandbox:ci id | tee /tmp/id.txt
+          grep -q 'uid=10001' /tmp/id.txt
+          docker run --rm --read-only --network none dsh-ctf-sandbox:ci sh -c 'touch /ci-rootfs-write 2>/dev/null && exit 1 || echo rootfs-read-only'
+          docker run --rm --read-only --network none dsh-ctf-sandbox:ci sh -c 'touch /tmp/ci-ok && echo tmpfs-writable'
+          docker run --rm --read-only --network none dsh-ctf-sandbox:ci sh -c 'grep -q "CapEff:[[:space:]]*0000000000000000" /proc/self/status && echo caps-dropped'

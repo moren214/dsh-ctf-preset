@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { manageProgress } from '../ctf-progress.js';
+import { describeToolError } from '../tool-errors.js';
 
 function workspace() {
   const documents = new Map();
   return {
+    documents,
     cwd: '/work/challenge',
     sessionId: 'session-alpha',
     normalizePath: path => path.split(/[\\/]/u).filter(Boolean).join('/'),
@@ -70,4 +72,27 @@ test('save 的 revision 过期时拒绝写入', async () => {
     manageProgress({ action: 'save', revision: 'f'.repeat(64), progress: emptyProgress }, files),
     /已被更新/u,
   );
+});
+
+test('只读 handoff 合并旧工具值标题与未持久化告警', async () => {
+  const files = workspace();
+  files.readResult = () => ({ tool: 'inspect_elf', report: { answer: '42' }, sources: [] });
+  await manageProgress({
+    action: 'save', revision: 'absent',
+    progress: { ...emptyProgress, values: [{ label: '入口', result_id: 'a'.repeat(64), pointer: '/answer', value: '42' }] },
+  }, files);
+  const notes = await files.readDocument('notes.md');
+  files.documents.set('notes.md', { ...notes, text: notes.text + '\n### 已核对工具值\n' });
+  files.canWrite = false;
+
+  const handoff = await manageProgress({ action: 'handoff' }, files);
+  assert.equal(handoff.persisted, false);
+  assert.match(handoff.warning, /旧标题/u);
+  assert.match(handoff.warning, /只读会话未写入/u);
+});
+
+test('宿主文件版本冲突与锁冲突映射为可恢复 conflict', () => {
+  for (const code of ['FS_STALE_VERSION', 'FS_NOT_OBSERVED', 'EBUSY']) {
+    assert.equal(describeToolError(Object.assign(new Error('write conflict'), { code })).kind, 'conflict');
+  }
 });

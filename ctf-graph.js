@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { ToolError } from './tool-errors.js';
 
 export const GRAPH_DIR = '.ctf-graph';
@@ -6,9 +7,10 @@ export const GRAPH_BACKUP = '.ctf-graph/graph.saved.json';
 export const GRAPH_BOARD = '.ctf-graph/BOARD.md';
 
 const SCHEMA_VERSION = 1;
-const MAX_FACTS = 500;
-const MAX_INTENTS = 500;
-const ATTEMPTS = 6;
+const MAX_FACTS = 5000;
+const MAX_INTENTS = 5000;
+const ATTEMPTS = 24;
+const mutationQueues = new Map();
 const DEFAULT_PRIORITY = 3;
 const DEFAULT_BUDGET_MINUTES = 15;
 const FACT_KINDS = ['recon', 'vuln', 'credential', 'crypto', 'binary', 'flag', 'note'];
@@ -22,7 +24,7 @@ export const GRAPH_PROPERTIES = {
   challenge: { type: 'string', maxLength: 120 },
   status_filter: { type: 'string', enum: ['all', 'active', 'open', 'claimed', 'done', 'dead', 'overdue'], description: 'board 按状态筛选 Intent（active=open+claimed）。' },
   limit: { type: 'integer', minimum: 1, maximum: 500, description: 'board 每页最多返回的 Fact/Intent 条数（默认 50）。' },
-  offset: { type: 'integer', minimum: 0, maximum: 500, description: 'board 分页起始偏移（默认 0）。' },
+  offset: { type: 'integer', minimum: 0, maximum: 5000, description: 'board 分页起始偏移（默认 0）。' },
   summary_only: { type: 'boolean', default: false, description: 'board 仅返回按题汇总、统计与超时预警，不展开单条列表。' },
   fact_ids: { type: 'array', maxItems: 32, items: { type: 'string', maxLength: 32 } },
   intent_ids: { type: 'array', maxItems: 32, items: { type: 'string', maxLength: 32 } },
@@ -39,6 +41,7 @@ export const GRAPH_PROPERTIES = {
   intent_id: { type: 'string', maxLength: 32 },
   next: { type: 'boolean' },
   owner: { type: 'string', maxLength: 120 },
+  lease_id: { type: 'string', maxLength: 64, description: 'finish_intent 使用 claim_intent 返回的租约 ID，阻止过期代理结案。' },
   steal_overdue: { type: 'boolean', default: false },
   max_workers: { type: 'integer', minimum: 1, maximum: 8, default: 3 },
   allow_same_challenge: { type: 'boolean', default: false },
@@ -211,6 +214,7 @@ function buildIntent(graph, input, challenge, defaultParents, nowIso) {
     budget_minutes: cleanBudget(input.budget_minutes),
     status: 'open',
     owner: null,
+    claim_lease: null,
     claimed_at: null,
     finished_at: null,
     outcome: null,
@@ -325,51 +329,86 @@ async function preserveSidecar(files, filePath, body, latestPrimaryBody) {
       await files.write(doc, body);
       return;
     } catch (error) {
-      if (attempt === 2 || (await files.read(filePath)).version === doc.version) throw error;
+      const current = await files.read(filePath);
+      const transientLock = ['EBUSY', 'EPERM'].includes(error?.code ?? error?.cause?.code);
+      if (attempt === 2 || (current.version === doc.version && !transientLock)) throw error;
+      await new Promise(resolve => setTimeout(resolve, Math.min(250, 8 * (2 ** attempt)) + Math.random() * 12));
+    }
+  }
+}
+
+async function withMutationQueue(lockKey, task) {
+  if (!lockKey) return task();
+  const previous = mutationQueues.get(lockKey) ?? Promise.resolve();
+  let release;
+  const current = new Promise(resolve => { release = resolve; });
+  const tail = previous.then(() => current, () => current);
+  mutationQueues.set(lockKey, tail);
+  await previous.catch(() => {});
+  try {
+    return await task();
+  } finally {
+    release();
+    if (mutationQueues.get(lockKey) === tail) {
+      mutationQueues.delete(lockKey);
     }
   }
 }
 
 async function commitMutation(files, nowMs, mutate) {
-  const nowIso = new Date(nowMs).toISOString();
-  for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
-    const { document, graph, recovered } = await readGraph(files);
-    const cloned = structuredClone(graph);
-    const outcome = mutate(cloned, nowIso, nowMs);
-    if (outcome.skipWrite) {
-      return { ...outcome.response, revision: cloned.revision, recovered };
+  let lockKey = null;
+  try {
+    const probe = await files.read(GRAPH_FILE);
+    if (typeof probe?.target === 'string' && probe.target !== '' && probe.target !== GRAPH_FILE) {
+      lockKey = probe.target;
     }
-    cloned.revision += 1;
-    cloned.updated_at = nowIso;
-    const body = JSON.stringify(cloned, null, 2) + '\n';
-    try {
-      await files.write(document, body);
-    } catch (error) {
-      const current = await files.read(GRAPH_FILE);
-      if (current.version === document.version) throw error;
-      if (attempt + 1 === ATTEMPTS) {
-        throw new ToolError('conflict', '图谱正被其他代理并发更新，CAS 重试次数已用完，请重试。');
-      }
-      continue;
-    }
-    const warnings = [];
-    try {
-      await preserveSidecar(files, GRAPH_BACKUP, body, body);
-    } catch {
-      warnings.push('图谱已提交，恢复副本尚未刷新。');
-    }
-    try {
-      await preserveSidecar(files, GRAPH_BOARD, renderBoardMarkdown(cloned, nowMs), body);
-    } catch {
-      warnings.push('图谱已提交，BOARD.md 看板尚未刷新。');
-    }
-    return {
-      ...outcome.response,
-      revision: cloned.revision,
-      recovered,
-      ...(warnings.length > 0 ? { warnings } : {}),
-    };
+  } catch {
+    // Fall back to unqueued CAS loop if probe fails.
   }
+  return withMutationQueue(lockKey, async () => {
+    const nowIso = new Date(nowMs).toISOString();
+    for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
+      const { document, graph, recovered } = await readGraph(files);
+      const cloned = structuredClone(graph);
+      const outcome = mutate(cloned, nowIso, nowMs);
+      if (outcome.skipWrite) {
+        return { ...outcome.response, revision: cloned.revision, recovered };
+      }
+      cloned.revision += 1;
+      cloned.updated_at = nowIso;
+      const body = JSON.stringify(cloned, null, 2) + '\n';
+      try {
+        await files.write(document, body);
+      } catch (error) {
+        const current = await files.read(GRAPH_FILE);
+        const transientLock = ['EBUSY', 'EPERM'].includes(error?.code ?? error?.cause?.code);
+        if (current.version === document.version && !transientLock) throw error;
+        if (attempt + 1 === ATTEMPTS) {
+          if (current.version === document.version) throw error;
+          throw new ToolError('conflict', '图谱正被其他代理并发更新，CAS 重试次数已用完，请重试。');
+        }
+        await new Promise(resolve => setTimeout(resolve, Math.min(180, Math.round(6 * (1.5 ** attempt))) + Math.random() * 15));
+        continue;
+      }
+      const warnings = [];
+      try {
+        await preserveSidecar(files, GRAPH_BACKUP, body, body);
+      } catch {
+        warnings.push('图谱已提交，恢复副本尚未刷新。');
+      }
+      try {
+        await preserveSidecar(files, GRAPH_BOARD, renderBoardMarkdown(cloned, nowMs), body);
+      } catch {
+        warnings.push('图谱已提交，BOARD.md 看板尚未刷新。');
+      }
+      return {
+        ...outcome.response,
+        revision: cloned.revision,
+        recovered,
+        ...(warnings.length > 0 ? { warnings } : {}),
+      };
+    }
+  });
 }
 
 const BOARD_STATUS_FILTERS = ['all', 'active', 'open', 'claimed', 'done', 'dead', 'overdue'];
@@ -447,7 +486,9 @@ function summarizeBoard(graph, challengeFilter, nowMs, { statusFilter = 'all', l
   const intents = matchedIntents.slice(offset, offset + limit);
   const hasMoreFacts = offset + facts.length < allFacts.length;
   const hasMoreIntents = offset + intents.length < matchedIntents.length;
-  const truncated = hasMoreFacts || hasMoreIntents;
+  const ruledOutPage = ruledOut.slice(offset, offset + limit);
+  const hasMoreRuledOut = offset + ruledOutPage.length < ruledOut.length;
+  const truncated = hasMoreFacts || hasMoreIntents || hasMoreRuledOut;
   return {
     ...base,
     facts,
@@ -458,12 +499,14 @@ function summarizeBoard(graph, challengeFilter, nowMs, { statusFilter = 'all', l
         limit,
         total_facts: allFacts.length,
         total_intents: matchedIntents.length,
+        total_ruled_out: ruledOut.length,
         has_more_facts: hasMoreFacts,
         has_more_intents: hasMoreIntents,
+        has_more_ruled_out: hasMoreRuledOut,
         ...(truncated ? { next_offset: offset + limit } : {}),
       },
     } : {}),
-    ...(ruledOut.length > 0 ? { ruled_out: ruledOut.slice(0, limit), ...(ruledOut.length > limit ? { ruled_out_truncated: true } : {}) } : {}),
+    ...(ruledOut.length > 0 ? { ruled_out: ruledOutPage, ...(hasMoreRuledOut ? { ruled_out_truncated: true } : {}) } : {}),
     ...(overdueCount > 0 ? { hint: `有 ${overdueCount} 条已认领 Intent 超过时间预算；可核对进展或用 claim_intent(steal_overdue: true) 接管止损。` } : {}),
   };
 }
@@ -582,7 +625,7 @@ function buildDispatchPlan(graph, { challengeFilter, maxWorkers, allowSameChalle
       .map(id => factMap.get(id))
       .filter(Boolean)
       .map(f => ({ id: f.id, kind: f.kind, title: f.title }));
-    const slot = `worker-${assignments.length + 1}`;
+    const slot = `worker-${assignments.length + 1}-${randomUUID()}`;
     assignments.push({
       worker_slot: slot,
       intent_id: intent.id,
@@ -592,7 +635,7 @@ function buildDispatchPlan(graph, { challengeFilter, maxWorkers, allowSameChalle
       budget_minutes: intent.budget_minutes,
       ...(intent.hypothesis ? { hypothesis: intent.hypothesis } : {}),
       parent_facts: parentFacts,
-      recommended_prompt: `你是 ${slot}。先执行 ctf_graph(action: "claim_intent", intent_id: "${intent.id}", owner: "${slot}") 认领任务（若返回 conflict 立即停止），用 ctf_graph(action: "expand", intent_ids: ["${intent.id}"]${parentFacts.length ? `, fact_ids: ${JSON.stringify(parentFacts.map(f => f.id))}` : ''}) 读完整上下文；在 ${intent.budget_minutes} 分钟预算内完成「${intent.challenge} — ${intent.title}」，结束后用 ctf_graph(action: "finish_intent", intent_id: "${intent.id}", status: "done"|"dead", outcome: "...", facts: [...], spawn_intents: [...]) 原子写回结论与证据。`,
+      recommended_prompt: `你是 ${slot}。先执行 ctf_graph(action: "claim_intent", intent_id: "${intent.id}", owner: "${slot}") 认领任务（若返回 conflict 立即停止），保存返回的 lease_id；用 ctf_graph(action: "expand", intent_ids: ["${intent.id}"]${parentFacts.length ? `, fact_ids: ${JSON.stringify(parentFacts.map(f => f.id))}` : ''}) 读完整上下文；在 ${intent.budget_minutes} 分钟预算内完成「${intent.challenge} — ${intent.title}」，结束后用 ctf_graph(action: "finish_intent", intent_id: "${intent.id}", lease_id: "<claim 返回值>", status: "done"|"dead", outcome: "...", facts: [...], spawn_intents: [...]) 原子写回结论与证据。`,
     });
   }
   return {
@@ -623,8 +666,8 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
       throw new ToolError('unsupported', 'limit 须为 1 至 500 的整数。');
     }
     const offset = args.offset ?? 0;
-    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 500) {
-      throw new ToolError('unsupported', 'offset 须为 0 至 500 的整数。');
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 5000) {
+      throw new ToolError('unsupported', 'offset 须为 0 至 5000 的整数。');
     }
     const summaryOnly = args.summary_only === true;
     const { graph, recovered } = await readGraph(files);
@@ -679,8 +722,10 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
     const missingIntents = [];
     for (const id of intentIds) {
       const hit = intentMap.get(id);
-      if (hit) intents.push({ ...hit, overdue: isIntentOverdue(hit, nowMs) });
-      else missingIntents.push(id);
+      if (hit) {
+        const { claim_lease: _hiddenLease, ...publicIntent } = hit;
+        intents.push({ ...publicIntent, overdue: isIntentOverdue(hit, nowMs) });
+      } else missingIntents.push(id);
     }
     return {
       action: 'expand',
@@ -804,6 +849,7 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
       target.status = 'claimed';
       target.owner = actor;
       target.claimed_at = nowIso;
+      target.claim_lease = randomUUID();
       if (args.budget_minutes !== undefined) target.budget_minutes = cleanBudget(args.budget_minutes);
       return {
         skipWrite: false,
@@ -811,6 +857,7 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
           action: 'claim_intent',
           status: previousOwner ? 'stolen' : 'claimed',
           ...(previousOwner ? { previous_owner: previousOwner } : {}),
+          lease_id: target.claim_lease,
           intent: target,
         },
       };
@@ -848,6 +895,19 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
           },
         };
       }
+      if (target.status !== 'claimed') {
+        return {
+          skipWrite: true,
+          response: {
+            action: 'finish_intent',
+            status: 'conflict',
+            intent_id: target.id,
+            intent_status: target.status,
+            attempted_owner: actor,
+            message: `Intent ${target.id} 尚未认领；请先用 claim_intent 获取租约，再提交结论。`,
+          },
+        };
+      }
       if (target.status === 'claimed' && target.owner && target.owner !== actor) {
         return {
           skipWrite: true,
@@ -862,9 +922,24 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
           },
         };
       }
+      if (target.status === 'claimed' && target.claim_lease && args.lease_id !== target.claim_lease) {
+        return {
+          skipWrite: true,
+          response: {
+            action: 'finish_intent',
+            status: 'conflict',
+            intent_id: target.id,
+            owner: target.owner,
+            attempted_owner: actor,
+            claimed_at: target.claimed_at,
+            message: `Intent ${target.id} 的租约已变化或缺失；请使用最近一次 claim_intent 返回的 lease_id。`,
+          },
+        };
+      }
       target.status = finalStatus;
       target.outcome = outcome;
       target.finished_at = nowIso;
+      target.claim_lease = null;
       if (!target.owner) target.owner = actor;
 
       const producedFacts = [];

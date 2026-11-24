@@ -213,7 +213,7 @@ test('ctf_doctor 探测本机原生 libarchive 而非 pip libarchive-c，并安�
   assert.match(badLib.detail, /绝对路径/u);
 });
 
-test('只读权限错误统一归为 permission，且文件已存在（EEXIST）归为 conflict', async () => {
+test('只读写入统一归为 permission，未配置的只读榜单归为 dependency，EEXIST 归为 conflict', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'ctf-errkind-'));
   try {
     const buildCtx = writable => {
@@ -257,7 +257,7 @@ test('只读权限错误统一归为 permission，且文件已存在（EEXIST）
 
     const boardRo = JSON.parse(await ro.tools.get('ctf_status').execute({ action: 'board' }, ro.execution));
     assert.equal(boardRo.ok, false);
-    assert.equal(boardRo.error.kind, 'permission');
+    assert.equal(boardRo.error.kind, 'dependency');
 
     const rw = buildCtx(true);
     const first = JSON.parse(await rw.tools.get('crypto_solver').execute({ action: 'template', kind: 'z3_bitvec' }, rw.execution));

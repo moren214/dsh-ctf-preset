@@ -573,6 +573,8 @@ HIGH_RISK_CALLABLES = {
     ("operator", "attrgetter"), ("operator", "methodcaller"), ("operator", "itemgetter"),
     ("types", "FunctionType"), ("types", "CodeType"), ("functools", "partial"),
     ("torch.serialization", "load"), ("torch.jit", "load"), ("torch", "load"),
+    ("torch.hub", "load"), ("torch", "load_inline"),
+    ("torch.utils.cpp_extension", "load"), ("torch.utils.cpp_extension", "load_inline"),
     ("numpy", "load"), ("joblib", "load"), ("dill", "loads"), ("cloudpickle", "loads"),
 }
 BENIGN_MODULES = {
@@ -602,7 +604,7 @@ def classify_pickle_global(module, name):
         return "high"
     if module in ("builtins", "__builtin__"):
         return "low" if name in BENIGN_BUILTINS else "medium"
-    if module in BENIGN_MODULES or base_mod in ("torch", "numpy", "collections"):
+    if module in BENIGN_MODULES:
         return "low"
     return "medium"
 
@@ -663,6 +665,22 @@ def scan_pickle_bytes(data, max_ops=200000):
                 stack.append(arg)
             elif name in ("EMPTY_LIST", "EMPTY_DICT", "EMPTY_TUPLE", "EMPTY_SET"):
                 stack.append(None)
+            elif name == "APPEND":
+                if stack:
+                    stack.pop()
+                else:
+                    risk = max_risk(risk, "medium")
+            elif name in ("APPENDS", "SETITEMS", "ADDITEMS"):
+                if mark in stack:
+                    marker = len(stack) - 1 - stack[::-1].index(mark)
+                    del stack[marker:]
+                else:
+                    risk = max_risk(risk, "medium")
+            elif name == "SETITEM":
+                if len(stack) >= 2:
+                    del stack[-2:]
+                else:
+                    risk = max_risk(risk, "medium")
             elif name == "MARK":
                 stack.append(mark)
             elif name == "POP":
@@ -722,8 +740,19 @@ def scan_pickle_bytes(data, max_ops=200000):
                         "opcode": name, "offset": pos, "code": int(arg),
                     })
                 stack.append(None)
+            elif name in ("PERSID", "BINPERSID"):
+                risk = max_risk(risk, "high")
+                if name == "BINPERSID" and stack:
+                    stack.pop()
+                stack.append(None)
+                if len(findings) < 64:
+                    findings.append({"severity": "high", "kind": "pickle_persistent_id", "opcode": name, "offset": pos})
             elif name in ("REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "BUILD"):
                 call_ops[name] = call_ops.get(name, 0) + 1
+                if name in ("NEWOBJ", "NEWOBJ_EX", "BUILD"):
+                    risk = max_risk(risk, "medium")
+                    if len(findings) < 64:
+                        findings.append({"severity": "medium", "kind": "pickle_object_hook", "opcode": name, "offset": pos})
                 if name == "REDUCE":
                     if len(stack) >= 2:
                         stack.pop()
@@ -749,10 +778,24 @@ def scan_pickle_bytes(data, max_ops=200000):
                 saw_stop = True
                 stop_pos = pos + 1
                 break
+            elif name in ("PROTO", "FRAME", "READONLY_BUFFER"):
+                pass
+            elif name == "NEXT_BUFFER":
+                stack.append("<buffer>")
+            else:
+                risk = max_risk(risk, "medium")
+                if len(findings) < 64:
+                    findings.append({"severity": "medium", "kind": "unhandled_pickle_opcode", "opcode": name, "offset": pos})
     except Exception as exc:
         parse_error = str(exc)[:200]
 
     trailing = max(0, len(data) - stop_pos) if saw_stop and stop_pos is not None else 0
+    incomplete = truncated or not saw_stop or parse_error is not None
+    if incomplete:
+        risk = max_risk(risk, "medium")
+        if len(findings) < 64:
+            findings.append({"severity": "medium", "kind": "incomplete_pickle_scan",
+                             "reason": "operation_limit" if truncated else "parse_error" if parse_error else "missing_stop"})
     if trailing > 0:
         risk = max_risk(risk, "medium")
         if len(findings) < 64:
@@ -762,6 +805,7 @@ def scan_pickle_bytes(data, max_ops=200000):
             })
 
     return {
+        "status": "incomplete" if incomplete else "ok",
         "protocol": protocol,
         "op_count": op_count,
         "op_truncated": truncated,
@@ -774,6 +818,21 @@ def scan_pickle_bytes(data, max_ops=200000):
         "string_samples": strings,
         **({"parse_error": parse_error} if parse_error else {}),
     }
+
+
+MODEL_SSTI_TOKENS = (
+    "__class__", "__subclasses__", "__globals__", "__builtins__", "__import__",
+    "__mro__", "__base__", "__bases__", "__init__", "_TemplateReference",
+    "popen", "os.system", "subprocess", "lipsum", "cycler", "joiner",
+    "namespace", "url_for", "get_flashed_messages", "attr(",
+)
+
+
+def has_suspicious_template(key, val):
+    if not isinstance(val, str):
+        return False
+    has_template_syntax = ("{{" in val or "{%" in val or "chat_template" in str(key).lower() or "os.system" in val or "subprocess" in val)
+    return has_template_syntax and any(tok in val for tok in MODEL_SSTI_TOKENS)
 
 
 def try_inspect_safetensors(data):
@@ -809,18 +868,37 @@ def try_inspect_safetensors(data):
         if len(tensors) < 64:
             tensors.append({"name": str(name)[:256], "dtype": str(info["dtype"]), "shape": info["shape"], "data_offsets": offsets})
     metadata = {}
-    if isinstance(raw_meta, dict):
-        for k, v in list(raw_meta.items())[:64]:
-            metadata[str(k)[:128]] = str(v)[:1024]
-    expected_end = 8 + header_len + max_data_end
-    trailing = max(0, len(data) - expected_end)
     findings = []
     risk = "low"
+    if isinstance(raw_meta, dict):
+        for k, v in list(raw_meta.items())[:64]:
+            short_key = str(k)[:128]
+            full_val = str(v)
+            metadata[short_key] = full_val[:256]
+            scan_val = full_val[:65536]
+            if has_suspicious_template(short_key, scan_val):
+                risk = max_risk(risk, "high")
+                if len(findings) < 64:
+                    findings.append({"severity": "high", "kind": "suspicious_metadata_template", "key": short_key})
+            else:
+                for pattern, level, kind in SUSPICIOUS_CODE_PATTERNS:
+                    if pattern.search(scan_val):
+                        risk = max_risk(risk, level)
+                        if len(findings) < 64:
+                            findings.append({"severity": level, "kind": f"metadata_{kind}", "key": short_key})
+                        break
+    expected_end = 8 + header_len + max_data_end
+    trailing = max(0, len(data) - expected_end)
     if trailing > 0:
-        risk = "medium"
+        risk = max_risk(risk, "medium")
         findings.append({"severity": "medium", "kind": "trailing_bytes", "offset": expected_end, "byte_length": trailing})
+    incomplete = isinstance(raw_meta, dict) and len(raw_meta) > 64
+    if incomplete:
+        risk = max_risk(risk, "medium")
+        findings.append({"severity": "medium", "kind": "safetensors_metadata_scan_incomplete",
+                         "scanned": len(metadata), "declared": len(raw_meta)})
     return {
-        "status": "ok",
+        "status": "incomplete" if incomplete else "ok",
         "format": "safetensors",
         "byte_length": len(data),
         "header_length": header_len,
@@ -867,14 +945,23 @@ def try_inspect_gguf(data):
             raise EOFError()
         return struct.unpack("<I", data[offset:offset + 4])[0], offset + 4
 
-    def read_str(offset):
+    GGUF_SCAN_STRING_BYTES = 65536
+    string_scan_truncated = False
+    scanned_strings = []
+
+    def read_str(offset, record_for_scan=False):
+        nonlocal string_scan_truncated
         length, offset = read_u64(offset)
         if length > 16 * 1024 * 1024 or offset + length > len(data):
             raise EOFError()
         raw = data[offset:offset + length]
+        if record_for_scan:
+            if length > GGUF_SCAN_STRING_BYTES:
+                string_scan_truncated = True
+            scanned_strings.append(raw[:GGUF_SCAN_STRING_BYTES].decode("utf-8", errors="replace"))
         return raw[:1024].decode("utf-8", errors="replace"), offset + length
 
-    def read_value(vtype, offset):
+    def read_value(vtype, offset, key_hint=""):
         if vtype in GGUF_SCALAR:
             _, fmt, size = GGUF_SCALAR[vtype]
             if offset + size > len(data):
@@ -882,7 +969,8 @@ def try_inspect_gguf(data):
             val = struct.unpack(fmt, data[offset:offset + size])[0]
             return val, offset + size
         if vtype == 8:
-            return read_str(offset)
+            val, next_off = read_str(offset, record_for_scan=True)
+            return val, next_off
         if vtype == 9:
             elem_type, offset = read_u32(offset)
             count, offset = read_u64(offset)
@@ -901,34 +989,48 @@ def try_inspect_gguf(data):
                 if count > 65536:
                     raise EOFError()
                 for idx in range(count):
-                    item, offset = read_str(offset)
+                    item, offset = read_str(offset, record_for_scan=(idx < 512))
                     if idx < 8:
                         preview.append(item[:128])
+                if count > 512:
+                    nonlocal string_scan_truncated
+                    string_scan_truncated = True
                 return {"type": "array", "element_type": "string", "count": count, "preview": preview}, offset
             raise EOFError()
         raise EOFError()
 
     metadata = {}
+    full_str_metadata = {}
     parse_truncated = False
     limit = min(kv_count, 64)
     try:
         for _ in range(limit):
             key, pos = read_str(pos)
             vtype, pos = read_u32(pos)
-            val, pos = read_value(vtype, pos)
-            metadata[key[:128]] = val
+            before_scan_len = len(scanned_strings)
+            val, pos = read_value(vtype, pos, key)
+            short_key = key[:128]
+            metadata[short_key] = val
+            if len(scanned_strings) > before_scan_len:
+                full_str_metadata[short_key] = scanned_strings[before_scan_len:]
     except EOFError:
         parse_truncated = True
 
     findings = []
     risk = "low"
-    for key, val in metadata.items():
-        if isinstance(val, str) and ("chat_template" in key or "{{" in val or "os.system" in val):
-            if any(tok in val for tok in ("__class__", "__subclasses__", "popen", "os.system", "lipsum", "cycler")):
-                risk = "high"
+    for key, values in full_str_metadata.items():
+        if any(has_suspicious_template(key, val) for val in values):
+            risk = "high"
+            if len(findings) < 64:
                 findings.append({"severity": "high", "kind": "suspicious_metadata_template", "key": key})
+    incomplete = kv_count > 64 or parse_truncated or string_scan_truncated
+    if incomplete:
+        risk = max_risk(risk, "medium")
+        findings.append({"severity": "medium", "kind": "gguf_metadata_scan_incomplete",
+                         "scanned": len(metadata), "declared": kv_count,
+                         **({"string_scan_truncated": True} if string_scan_truncated else {})})
     return {
-        "status": "ok",
+        "status": "incomplete" if incomplete else "ok",
         "format": "gguf",
         "version": version,
         "byte_length": len(data),
@@ -966,22 +1068,35 @@ def try_inspect_pytorch_zip(data):
         findings = []
         pickle_members = []
         code_files = []
+        skipped_pickle_members = 0
+        skipped_code_files = 0
+        oversized_pickle_members = 0
+        oversized_code_files = 0
+        member_scan_incomplete = False
         for info in infos:
             if info.is_dir():
                 continue
-            if info.filename.endswith(".pkl") and len(pickle_members) < 8:
+            if info.filename.endswith(".pkl") and len(pickle_members) >= 8:
+                skipped_pickle_members += 1
+                continue
+            if info.filename.endswith(".py") and len(code_files) >= 8:
+                skipped_code_files += 1
+                continue
+            if info.filename.endswith(".pkl"):
                 if info.file_size > 8 * 1024 * 1024:
                     findings.append({"severity": "medium", "kind": "oversized_pickle_member", "member": info.filename, "size": info.file_size})
                     risk = max_risk(risk, "medium")
+                    oversized_pickle_members += 1
                     continue
                 member_bytes = zf.read(info)
                 scan = scan_pickle_bytes(member_bytes)
                 risk = max_risk(risk, scan["risk_level"])
+                member_scan_incomplete = member_scan_incomplete or scan["status"] != "ok"
                 for item in scan["findings"]:
                     if len(findings) < 64:
                         findings.append({**item, "member": info.filename})
                 pickle_members.append({"member": info.filename, "size": len(member_bytes), **scan})
-            elif info.filename.endswith(".py") and len(code_files) < 8:
+            elif info.filename.endswith(".py"):
                 if info.file_size <= 256 * 1024:
                     text = zf.read(info).decode("utf-8", errors="replace")
                     code_files.append({"member": info.filename, "size": info.file_size, "preview": text[:1024], "truncated": len(text) > 1024})
@@ -990,8 +1105,21 @@ def try_inspect_pytorch_zip(data):
                             risk = max_risk(risk, level)
                             if len(findings) < 64:
                                 findings.append({"severity": level, "kind": kind, "member": info.filename})
+                else:
+                    oversized_code_files += 1
+        incomplete = (skipped_pickle_members > 0 or skipped_code_files > 0
+                      or oversized_pickle_members > 0 or oversized_code_files > 0
+                      or member_scan_incomplete)
+        if incomplete:
+            risk = max_risk(risk, "medium")
+            findings.append({"severity": "medium", "kind": "pytorch_zip_scan_incomplete",
+                             "skipped_pickle_members": skipped_pickle_members,
+                             "skipped_code_files": skipped_code_files,
+                             "oversized_pickle_members": oversized_pickle_members,
+                             "oversized_code_files": oversized_code_files,
+                             "member_scan_incomplete": member_scan_incomplete})
         return {
-            "status": "ok",
+            "status": "incomplete" if incomplete else "ok",
             "format": "pytorch_zip",
             "byte_length": len(data),
             "entry_count": len(infos),
@@ -999,6 +1127,10 @@ def try_inspect_pytorch_zip(data):
             "entries_truncated": len(infos) > 64,
             "pickle_members": pickle_members,
             "code_files": code_files,
+            "skipped_pickle_members": skipped_pickle_members,
+            "skipped_code_files": skipped_code_files,
+            "oversized_pickle_members": oversized_pickle_members,
+            "oversized_code_files": oversized_code_files,
             "risk_level": risk,
             "findings": findings,
         }
@@ -1115,14 +1247,22 @@ def try_inspect_onnx(data):
     if domain and domain not in ("", "ai.onnx", "ai.onnx.ml", "ai.onnx.preview.training"):
         risk = "medium"
         findings.append({"severity": "medium", "kind": "custom_onnx_domain", "domain": domain})
-    ext_hits = re.findall(rb"(?:\.\.[\\/]|/etc/|[A-Za-z]:\\)[\x20-\x7e]{1,120}", data[:2 * 1024 * 1024])
+    ext_hits = re.findall(rb"(?:\.\.[\\/]|/etc/|[A-Za-z]:\\)[\x20-\x7e]{1,120}", data)
     for hit in ext_hits[:8]:
         risk = "high"
         findings.append({"severity": "high", "kind": "suspicious_external_path", "sample": hit.decode("utf-8", errors="replace")})
+    # This parser only reads ONNX top-level metadata. It does not traverse GraphProto
+    # nodes, custom operators, or external tensor references, so never label it low risk.
+    risk = max_risk(risk, "medium")
+    findings.append({"severity": "medium", "kind": "onnx_graph_scan_incomplete",
+                     "graph_present": has_graph, "top_level_scanned_bytes": min(pos, end),
+                     "model_bytes": len(data), "graph_nodes_scanned": False})
     return {
-        "status": "ok",
+        "status": "incomplete",
         "format": "onnx",
         "byte_length": len(data),
+        "top_level_scanned_bytes": min(pos, end),
+        "graph_nodes_scanned": False,
         "ir_version": ir_version,
         **({"model_version": model_version} if model_version is not None else {}),
         **({"producer_name": producer_name} if producer_name is not None else {}),
@@ -1149,7 +1289,7 @@ def inspect_model(data):
     pickle_scan = scan_pickle_bytes(data)
     if looks_proto or (pickle_scan["saw_stop"] and pickle_scan["op_count"] >= 2 and not pickle_scan.get("parse_error")):
         return {
-            "status": "ok",
+            "status": pickle_scan["status"],
             "format": "pickle",
             "byte_length": len(data),
             **pickle_scan,
@@ -1193,4 +1333,5 @@ def main():
     print(json.dumps(report, allow_nan=False))
 
 
-main()
+if __name__ == "__main__":
+    main()

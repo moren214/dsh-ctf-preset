@@ -4,7 +4,7 @@ import { ToolError } from './tool-errors.js';
 export const STATUS_FILE = '.ctf-status.json';
 const STATUS_BACKUP = '.ctf/status.saved.json';
 const MAX_ENTRIES = 60;
-const ATTEMPTS = 3;
+const ATTEMPTS = 12;
 
 function entriesIn(document, normalizeEntry) {
   if (document.version === undefined) return [];
@@ -42,7 +42,10 @@ async function preserveLatest(files, body) {
       await files.write(backup, body);
       return;
     } catch (error) {
-      if (attempt + 1 === ATTEMPTS || (await files.read(STATUS_BACKUP)).version === backup.version) throw error;
+      const current = await files.read(STATUS_BACKUP);
+      const transientLock = ['EBUSY', 'EPERM'].includes(error?.code ?? error?.cause?.code);
+      if (attempt + 1 === ATTEMPTS || (current.version === backup.version && !transientLock)) throw error;
+      await new Promise(resolve => setTimeout(resolve, Math.min(250, 8 * (2 ** attempt)) + Math.random() * 12));
     }
   }
 }
@@ -65,8 +68,13 @@ export async function appendStatus(files, summary) {
       if (entriesIn(current, files.normalizeEntry)?.some(item => item.record_id === entry.record_id)) {
         return { entries: entriesIn(current, files.normalizeEntry), recovered, entry };
       }
-      if (current.version === document.version) throw error;
-      if (attempt + 1 === ATTEMPTS) throw new ToolError('conflict', '状态记录正被其他会话更新，重试次数已用完。');
+      const transientLock = ['EBUSY', 'EPERM'].includes(error?.code ?? error?.cause?.code);
+      if (current.version === document.version && !transientLock) throw error;
+      if (attempt + 1 === ATTEMPTS) {
+        if (current.version === document.version) throw error;
+        throw new ToolError('conflict', '状态记录正被其他会话更新，重试次数已用完。');
+      }
+      await new Promise(resolve => setTimeout(resolve, Math.min(250, 8 * (2 ** attempt)) + Math.random() * 12));
       continue;
     }
     let warning;

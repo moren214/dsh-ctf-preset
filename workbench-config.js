@@ -15,7 +15,10 @@ export const CONFIG_TEXT_FIELDS = ['base100Sha256', 'platformUrl', 'platformType
   'platformInstancesPath', 'platformSubmitPath', 'platformLeaderboardPath', 'platformTeamId',
   'sandboxBackend', 'sandboxImage', 'sandboxHeavyImage', 'sandboxWslDistro'];
 export const CONFIG_LIST_FIELDS = ['networkOrigins', 'tcpTargets', 'attachmentImportRoots'];
-export const CONFIG_BOOLEAN_FIELDS = ['compact', 'allowInsecurePlatformHttp', 'enableExtendedAudit'];
+export const CONFIG_BOOLEAN_FIELDS = [
+  'compact', 'allowInsecurePlatformHttp', 'allowInsecurePlatformTls',
+  'allowInsecureBrowserTls', 'allowLoopbackDynamicGrant', 'enableExtendedAudit',
+];
 const CONFIG_FIELDS = [...CONFIG_PATH_FIELDS, ...CONFIG_TEXT_FIELDS, ...CONFIG_LIST_FIELDS, ...CONFIG_BOOLEAN_FIELDS];
 
 function configuredValues(source) {
@@ -138,8 +141,8 @@ export function createWorkbenchEnvironment(overrides = {}, configFile) {
     },
     async resolvePython(signal) {
       signal?.throwIfAborted();
-      if (python !== undefined) return python;
       const configured = settings().pythonPath;
+      if (python !== undefined) return python;
       const tried = new Set();
       for (const [path, args] of pythonCandidates(configured)) {
         const key = WINDOWS && typeof path === 'string' ? path.toLowerCase() : path;
@@ -157,7 +160,9 @@ export function createWorkbenchEnvironment(overrides = {}, configFile) {
     },
     base100() {
       const { base100Source: source, base100Sha256: sha256 } = settings();
-      if (!isLocalWorkbenchPath(source) || basename(source) !== 'ctf_extra_ops.py'
+      const sourceName = basename(source ?? '');
+      const expectedName = WINDOWS ? sourceName.toLowerCase() : sourceName;
+      if (!isLocalWorkbenchPath(source) || expectedName !== 'ctf_extra_ops.py'
         || typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/iu.test(sha256)) {
         throw new WorkbenchDependencyError('Base100 工作台尚未配置。请填写 ctf-workbench.json 的 base100Source 和 base100Sha256。');
       }

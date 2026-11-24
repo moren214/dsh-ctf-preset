@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import http from 'node:http';
 import { lstat as fsLstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -118,8 +120,26 @@ test('network-boundary 支持通配端口、端口范围、子域通配、CIDR �
   // 动态授权仍拒绝云元数据保留地址
   assert.equal(boundary.grantHttp('http://169.254.169.254/latest/meta-data/'), undefined);
   assert.equal(boundary.grantTcp('169.254.169.254', 80), undefined);
-  assert.equal(boundary.grantHttp('http://127.0.0.1:54321/api'), 'http://127.0.0.1:54321');
-  assert.equal(boundary.isHttpAuthorized('http://127.0.0.1:54321/flag'), true);
+  const scopeA = { session: {}, workspaceKey: 'challenge-a' };
+  const scopeB = { session: {}, workspaceKey: 'challenge-a' };
+  assert.equal(boundary.grantHttp('http://127.0.0.1:9999/api'), undefined);
+  assert.equal(boundary.grantHttp('http://127.0.0.1:9999/api', scopeA), 'http://127.0.0.1:9999');
+  assert.equal(boundary.isHttpAuthorized('http://127.0.0.1:9999/flag', scopeA), true);
+  assert.equal(boundary.isHttpAuthorized('http://127.0.0.1:9999/flag', scopeB), false);
+  assert.equal(boundary.revoke(scopeA), 1);
+  assert.equal(boundary.isHttpAuthorized('http://127.0.0.1:9999/flag', scopeA), false);
+
+  const ipv6Scope = { session: {}, workspaceKey: 'ipv6-challenge' };
+  assert.equal(boundary.grantTcp('[2001:4860:4860::8888]', 443, ipv6Scope), '[2001:4860:4860::8888]:443');
+  assert.equal(boundary.isTcpAuthorized('2001:4860:4860::8888', 443, ipv6Scope), true);
+
+  const cappedScope = { session: {}, workspaceKey: 'many-targets' };
+  for (let index = 1; index <= 64; index += 1) {
+    assert.ok(boundary.grantHttp(`http://10.10.0.${index}:8080`, cappedScope));
+  }
+  assert.equal(boundary.grantHttp('http://10.20.0.1:8080', cappedScope), undefined);
+  assert.equal(boundary.isHttpAuthorized('http://10.10.0.1:8080/', cappedScope), true,
+    'a full grant table must not silently evict an unexpired endpoint');
 });
 
 test('workbench-config 支持配置文件热重载，动态修改白名单立即生效', async () => {
@@ -136,6 +156,47 @@ test('workbench-config 支持配置文件热重载，动态修改白名单立即
     await writeFile(file, JSON.stringify({ networkOrigins: ['http://10.0.0.0/8:*'], allowInsecurePlatformHttp: true }));
     assert.equal(boundary.isHttpAuthorized('http://10.0.0.2:9000/'), true);
     assert.equal(env.presetConfig().allowInsecurePlatformHttp, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('workbench-config 热重载 pythonPath 后重新探测真实 Python 可执行文件', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ctf-python-hot-reload-'));
+  const file = join(dir, 'ctf-workbench.json');
+  const venv = join(dir, 'venv');
+  try {
+    const python = execFileSync(process.platform === 'win32' ? 'py' : 'python3',
+      process.platform === 'win32'
+        ? ['-3', '-I', '-c', 'import sys; print(sys.executable)']
+        : ['-I', '-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).trim();
+    execFileSync(python, ['-I', '-m', 'venv', venv], { stdio: 'pipe' });
+    const venvPython = join(venv, process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
+    await writeFile(file, JSON.stringify({ pythonPath: python }));
+    const env = createWorkbenchEnvironment({}, file);
+    assert.equal(await env.resolvePython(), python);
+
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await writeFile(file, JSON.stringify({ pythonPath: venvPython }));
+    assert.equal(await env.resolvePython(), venvPython,
+      'resolvePython must observe a changed configuration before returning its cached interpreter');
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
+  }
+});
+
+test('workbench-config 在 Windows 接受大小写不同但等价的 Base100 文件名', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ctf-base100-case-'));
+  try {
+    const sourceName = process.platform === 'win32' ? 'CTF_EXTRA_OPS.PY' : 'ctf_extra_ops.py';
+    const source = join(dir, sourceName);
+    const bytes = Buffer.from('# trusted fixture\n', 'utf8');
+    await writeFile(source, bytes);
+    const env = createWorkbenchEnvironment({
+      base100Source: source,
+      base100Sha256: createHash('sha256').update(bytes).digest('hex'),
+    });
+    assert.equal(env.base100().source, source);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -320,6 +381,13 @@ test('ctf_instance 自动授权返回的动态靶机端口，内网 HTTP 平台�
     assert.equal(after.status, 200, JSON.stringify(after));
     assert.equal(after.body, 'challenge-alive:/ping');
 
+    const otherSession = {
+      ...execution,
+      agent: { session: { header: { cwd: dir }, id: 'different-session' } },
+    };
+    const isolated = JSON.parse(await tools.get('http_request').execute({ url: `${challengeServer.origin}/ping` }, otherSession));
+    assert.equal(isolated.ok, false);
+
     // 从内网 HTTP 平台下载需要 Token 认证的附件成功落盘
     const fetched = JSON.parse(await tools.get('fetch_attachment').execute({ url: `${platformServer.origin}/files/chall.bin` }, execution));
     assert.equal(fetched.status, 'imported', JSON.stringify(fetched));
@@ -370,4 +438,63 @@ test('redactPlatformToken 与 platformAuthHeaders 覆盖自定义头、空方案
     if (prev === undefined) delete process.env[envName];
     else process.env[envName] = prev;
   }
+});
+
+test('sandbox-runner Ghidra 脚本兼容 Jython 2.7 地址归一化，Dockerfile 向 UID 10001 复制 r2ghidra', async () => {
+  const runnerSrc = await readFile(new URL('../sandbox-runner.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(runnerSrc, /removeprefix\(/u, 'Ghidra Jython 2.7 脚本不得使用 Python 3.9 removeprefix');
+  assert.match(runnerSrc, /def norm_addr\(raw\):/u);
+  assert.match(runnerSrc, /target_norm = norm_addr\(target\)/u);
+  const dockerfile = await readFile(new URL('../docker/Dockerfile', import.meta.url), 'utf8');
+  assert.match(dockerfile, /\/home\/ctf\/\.local\/share\/radare2/u);
+  assert.match(dockerfile, /apt-get purge -y --auto-remove cmake ninja-build meson/u);
+});
+
+test('P1 回归：动态授权默认拦截回环地址，submit_flag 支持 retry_unknown，Docker 启用只读根文件系统', async () => {
+  const { createNetworkBoundary } = await import('../network-boundary.js');
+  const { handleSubmission } = await import('../submission.js');
+  const { buildDockerArgs } = await import('../sandbox-runner.js');
+
+  const session = {};
+  const scope = { session, workspaceKey: 'ws-p1' };
+  const strictNet = createNetworkBoundary(() => ({}));
+  assert.equal(strictNet.grantHttp('http://127.0.0.1:2375', scope), undefined);
+  assert.equal(strictNet.grantHttp('http://localhost:8080', scope), undefined);
+  assert.equal(strictNet.grantTcp('127.0.0.1', 6379, scope), undefined);
+  assert.equal(strictNet.grantTcp('::1', 6379, scope), undefined);
+  await assert.rejects(() => strictNet.http('https://example.invalid', undefined, scope), err => err.kind === 'permission');
+
+  const relaxedNet = createNetworkBoundary(() => ({ allowLoopbackDynamicGrant: true }));
+  assert.equal(relaxedNet.grantHttp('http://127.0.0.1:8080', scope), 'http://127.0.0.1:8080');
+
+  let stored = [];
+  const files = {
+    async read() { return { receipts: stored, document: { version: String(stored.length) } }; },
+    async write(_doc, next) { stored = next; },
+  };
+  const first = await handleSubmission(
+    { flag: 'flag{retry_unknown_429_case}', source: 'p1-test' },
+    files,
+    async () => ({ status: 429, body: JSON.stringify({ success: false }) }),
+    'https://ctf.example',
+  );
+  assert.equal(first.verdict, 'unknown');
+  const blocked = await handleSubmission(
+    { flag: 'flag{retry_unknown_429_case}', source: 'p1-test' },
+    files,
+    async () => ({ status: 200, body: JSON.stringify({ correct: true }) }),
+    'https://ctf.example',
+  );
+  assert.equal(blocked.verdict, 'rejected_local');
+  const retried = await handleSubmission(
+    { flag: 'flag{retry_unknown_429_case}', source: 'p1-test', retry_unknown: true },
+    files,
+    async () => ({ status: 200, body: JSON.stringify({ correct: true }) }),
+    'https://ctf.example',
+  );
+  assert.equal(retried.verdict, 'accepted');
+
+  const dockerArgs = buildDockerArgs(['id'], { cwd: '/tmp/w', containerName: 'c1', targetImage: 'dsh-ctf-sandbox:latest' });
+  assert.ok(dockerArgs.includes('--read-only'));
+  assert.ok(dockerArgs.includes('/tmp:rw,nosuid,size=512m'));
 });

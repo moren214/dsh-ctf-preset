@@ -1,5 +1,6 @@
 import { lookup } from 'node:dns/promises';
 import { BlockList, isIP } from 'node:net';
+import { ToolError } from './tool-errors.js';
 
 const nonglobal = new BlockList();
 for (const [prefix, length] of [
@@ -21,6 +22,29 @@ for (const [prefix, length] of [['::', 128], ['64:ff9b::', 96], ['64:ff9b:1::', 
   ['fe80::', 10], ['ff00::', 8], ['fd00:ec2::254', 128]]) infrastructure.addSubnet(prefix, length, 'ipv6');
 const mapped = new BlockList();
 mapped.addSubnet('::ffff:0:0', 96, 'ipv6');
+const loopback = new BlockList();
+loopback.addSubnet('127.0.0.0', 8, 'ipv4');
+loopback.addSubnet('::1', 128, 'ipv6');
+
+function isLoopbackHost(hostname, family) {
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true;
+  return family !== 0 && loopback.check(hostname, familyName(family));
+}
+
+function allowsLoopbackDynamic(config) {
+  if (config?.allowLoopbackDynamicGrant === true) return true;
+  if (typeof config?.platformUrl === 'string' && config.platformUrl.trim() !== '') {
+    try {
+      const host = hostName(new URL(config.platformUrl.trim()).hostname);
+      if (isLoopbackHost(host, isIP(host))) return true;
+    } catch { /* ignore invalid platformUrl */ }
+  }
+  const rules = [
+    ...(Array.isArray(config?.networkOrigins) ? config.networkOrigins : []),
+    ...(Array.isArray(config?.tcpTargets) ? config.tcpTargets : []),
+  ];
+  return rules.some(rule => typeof rule === 'string' && /(?:^|\/\/|\[)(?:127\.\d+\.\d+\.\d+|localhost|::1)(?:$|[:/\]])/iu.test(rule));
+}
 
 export function webUrl(value) {
   const url = new URL(value);
@@ -161,11 +185,11 @@ function parseTcpRule(value) {
 }
 
 const MAX_DYNAMIC_GRANTS = 64;
+const DYNAMIC_GRANT_TTL_MS = 30 * 60 * 1000;
 
 export function createNetworkBoundary(configSource = {}) {
   const getConfig = typeof configSource === 'function' ? configSource : () => configSource ?? {};
-  const dynamicOrigins = new Set();
-  const dynamicTcp = new Set();
+  const scopedGrants = new WeakMap();
   const list = value => Array.isArray(value) ? value.filter(item => typeof item === 'string') : [];
   let cachedOriginsKey = '';
   let cachedHttpRules = [];
@@ -192,49 +216,108 @@ export function createNetworkBoundary(configSource = {}) {
     return cachedTcpRules;
   }
 
-  function isHttpAuthorized(value) {
+  function grantStore(scope, create = false) {
+    if (!scope || !scope.session || typeof scope.session !== 'object'
+      || typeof scope.workspaceKey !== 'string' || scope.workspaceKey.length === 0) return undefined;
+    let workspaces = scopedGrants.get(scope.session);
+    if (!workspaces && create) {
+      workspaces = new Map();
+      scopedGrants.set(scope.session, workspaces);
+    }
+    if (!workspaces) return undefined;
+    let store = workspaces.get(scope.workspaceKey);
+    if (!store && create) {
+      store = { http: new Map(), tcp: new Map() };
+      workspaces.set(scope.workspaceKey, store);
+    }
+    return store;
+  }
+
+  function hasDynamicGrant(kind, key, scope) {
+    const grant = grantStore(scope)?.[kind]?.get(key);
+    if (!grant) return false;
+    if (grant.expiresAt <= Date.now()) {
+      grantStore(scope)[kind].delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  function pruneExpired(grants) {
+    const now = Date.now();
+    for (const [key, grant] of grants) {
+      if (grant.expiresAt <= now) grants.delete(key);
+    }
+  }
+
+  function isHttpAuthorized(value, scope) {
     let url;
     try { url = value instanceof URL ? value : webUrl(value); }
     catch { return false; }
-    return dynamicOrigins.has(url.origin) || httpRules().some(rule => rule(url));
+    return hasDynamicGrant('http', url.origin, scope) || httpRules().some(rule => rule(url));
   }
 
-  function isTcpAuthorized(host, port) {
+  function isTcpAuthorized(host, port, scope) {
     const key = hostName(host) + '/' + port;
-    return dynamicTcp.has(key) || tcpRules().some(rule => rule(host, port));
+    return hasDynamicGrant('tcp', key, scope) || tcpRules().some(rule => rule(host, port));
   }
 
-  function grantHttp(value) {
+  function grantHttp(value, scope) {
     let url;
     try { url = webUrl(value); }
     catch { return undefined; }
+    const store = grantStore(scope, true);
+    if (!store) return undefined;
     const hostname = hostName(url.hostname);
     const family = isIP(hostname);
     if (family && (infrastructure.check(hostname, familyName(family)) || (family === 6 && mapped.check(hostname, 'ipv6')))) {
       return undefined;
     }
-    if (!dynamicOrigins.has(url.origin) && dynamicOrigins.size >= MAX_DYNAMIC_GRANTS) {
-      dynamicOrigins.delete(dynamicOrigins.values().next().value);
+    if (!allowsLoopbackDynamic(getConfig()) && isLoopbackHost(hostname, family)) {
+      return undefined;
     }
-    dynamicOrigins.add(url.origin);
+    pruneExpired(store.http);
+    if (!store.http.has(url.origin) && store.http.size >= MAX_DYNAMIC_GRANTS) return undefined;
+    store.http.set(url.origin, { leaseId: scope.leaseId, expiresAt: Date.now() + DYNAMIC_GRANT_TTL_MS });
     return url.origin;
   }
 
-  function grantTcp(host, port) {
+  function grantTcp(host, port, scope) {
     const numericPort = Number(port);
     const normalized = hostName(String(host ?? ''));
-    if (!normalized || normalized.includes('%') || /[\s/\\:?#]/u.test(normalized)
-      || !Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65535) return undefined;
     const family = isIP(normalized);
+    if (!normalized || normalized.includes('%') || /[\s/\\?#]/u.test(normalized)
+      || (normalized.includes(':') && family !== 6)
+      || !Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65535) return undefined;
     if (family && (infrastructure.check(normalized, familyName(family)) || (family === 6 && mapped.check(normalized, 'ipv6')))) {
       return undefined;
     }
-    const key = normalized + '/' + numericPort;
-    if (!dynamicTcp.has(key) && dynamicTcp.size >= MAX_DYNAMIC_GRANTS) {
-      dynamicTcp.delete(dynamicTcp.values().next().value);
+    if (!allowsLoopbackDynamic(getConfig()) && isLoopbackHost(normalized, family)) {
+      return undefined;
     }
-    dynamicTcp.add(key);
-    return normalized + ':' + numericPort;
+    const store = grantStore(scope, true);
+    if (!store) return undefined;
+    const key = normalized + '/' + numericPort;
+    pruneExpired(store.tcp);
+    if (!store.tcp.has(key) && store.tcp.size >= MAX_DYNAMIC_GRANTS) return undefined;
+    store.tcp.set(key, { leaseId: scope.leaseId, expiresAt: Date.now() + DYNAMIC_GRANT_TTL_MS });
+    return (family === 6 ? '[' + normalized + ']' : normalized) + ':' + numericPort;
+  }
+
+  function revoke(scope, leaseId) {
+    const workspaces = scope?.session && scopedGrants.get(scope.session);
+    const store = workspaces?.get(scope?.workspaceKey);
+    if (!store) return 0;
+    let removed = 0;
+    for (const kind of ['http', 'tcp']) {
+      for (const [key, grant] of store[kind]) {
+        if (leaseId === undefined || grant.leaseId === leaseId) {
+          store[kind].delete(key);
+          removed++;
+        }
+      }
+    }
+    return removed;
   }
 
   return {
@@ -242,13 +325,14 @@ export function createNetworkBoundary(configSource = {}) {
     isTcpAuthorized,
     grantHttp,
     grantTcp,
-    async http(value, signal) {
+    revoke,
+    async http(value, signal, scope) {
       const url = value instanceof URL ? webUrl(value.href) : webUrl(value);
-      if (!isHttpAuthorized(url)) throw new Error('此 HTTP(S) 来源尚未在 networkOrigins 中授权。');
+      if (!isHttpAuthorized(url, scope)) throw new ToolError('permission', '此 HTTP(S) 来源尚未在 networkOrigins 中授权。');
       return pinAddress(url.hostname, { signal });
     },
-    async tcp(host, port, signal) {
-      if (!isTcpAuthorized(host, port)) throw new Error('此 TCP 目标尚未在 tcpTargets 中授权。');
+    async tcp(host, port, signal, scope) {
+      if (!isTcpAuthorized(host, port, scope)) throw new ToolError('permission', '此 TCP 目标尚未在 tcpTargets 中授权。');
       return pinAddress(host, { signal });
     },
   };

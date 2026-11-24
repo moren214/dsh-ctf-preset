@@ -17,6 +17,7 @@ const DEFAULT_MAX_BYTES_PER_FLOW = 65536;
 const MIN_BYTES_PER_FLOW = 1024;
 const MAX_BYTES_PER_FLOW_LIMIT = 1024 * 1024;
 const MAX_PENDING_SEGMENTS = 64;
+const MAX_PENDING_BYTES = 16 * 1024 * 1024;
 const MAX_PAYLOAD_TEXT = 4096;
 const MAX_HEADERS = 32;
 const MAX_HEADER_NAME = 128;
@@ -308,13 +309,17 @@ function createCollector(maxFlows, maxBytes, includeHex, filter) {
   let tcpPackets = 0;
   let udpPackets = 0;
   let filteredPackets = 0;
+  let pendingBytes = 0;
 
+  const startMs = filter?.start_utc !== undefined ? Date.parse(filter.start_utc) : undefined;
+  const endMs = filter?.end_utc !== undefined ? Date.parse(filter.end_utc) : undefined;
   function timeMatches(packet) {
-    if (filter?.start_utc === undefined && filter?.end_utc === undefined) return true;
-    const timestamp = Date.parse(packet.timestamp_utc ?? '');
+    if (startMs === undefined && endMs === undefined) return true;
+    const utc = packet.timestamp_utc ?? formatTimestamp(packet.ticks, packet.clock)?.timestamp_utc;
+    const timestamp = Date.parse(utc ?? '');
     if (!Number.isFinite(timestamp)) return false;
-    return (filter.start_utc === undefined || timestamp >= Date.parse(filter.start_utc))
-      && (filter.end_utc === undefined || timestamp <= Date.parse(filter.end_utc));
+    return (startMs === undefined || timestamp >= startMs)
+      && (endMs === undefined || timestamp <= endMs);
   }
 
   function addressMatches(ip, packet) {
@@ -335,13 +340,22 @@ function createCollector(maxFlows, maxBytes, includeHex, filter) {
     return `${info.src}:${info.srcPort}->${info.dst}:${info.dstPort}`;
   }
 
+  function clearPending(direction) {
+    pendingBytes -= direction.pendingBytes;
+    direction.pendingBytes = 0;
+    direction.pending.length = 0;
+  }
+
   function addPending(direction, seq, bytes) {
     if (direction.truncated || bytes.length === 0) return;
-    if (direction.pending.length >= MAX_PENDING_SEGMENTS) {
+    if (direction.pending.length >= MAX_PENDING_SEGMENTS || bytes.length > MAX_PENDING_BYTES - pendingBytes) {
       direction.pendingDropped = true;
       return;
     }
-    direction.pending.push({ seq, bytes });
+    const copy = Buffer.from(bytes);
+    direction.pending.push({ seq, bytes: copy });
+    direction.pendingBytes += copy.length;
+    pendingBytes += copy.length;
   }
 
   function appendPayload(direction, bytes) {
@@ -349,15 +363,15 @@ function createCollector(maxFlows, maxBytes, includeHex, filter) {
     const remaining = maxBytes - direction.payloadBytes;
     if (remaining <= 0) {
       direction.truncated = true;
-      direction.pending.length = 0;
+      clearPending(direction);
       return;
     }
     const take = Math.min(remaining, bytes.length);
-    direction.chunks.push(take === bytes.length ? bytes : bytes.subarray(0, take));
+    direction.chunks.push(Buffer.from(bytes.subarray(0, take)));
     direction.payloadBytes += take;
     if (take < bytes.length) {
       direction.truncated = true;
-      direction.pending.length = 0;
+      clearPending(direction);
     }
   }
 
@@ -365,10 +379,10 @@ function createCollector(maxFlows, maxBytes, includeHex, filter) {
     if (bytes.length === 0 || direction.truncated) return;
     if (direction.payloadBytes + bytes.length > maxBytes) {
       direction.truncated = true;
-      direction.pending.length = 0;
+      clearPending(direction);
       return;
     }
-    direction.chunks.unshift(bytes);
+    direction.chunks.unshift(Buffer.from(bytes));
     direction.payloadBytes += bytes.length;
     direction.startSeq = seq;
   }
@@ -380,12 +394,16 @@ function createCollector(maxFlows, maxBytes, includeHex, filter) {
       for (let index = 0; index < direction.pending.length; index += 1) {
         const segment = direction.pending[index];
         if (!mergeSegment(direction, segment.seq, segment.bytes)) continue;
-        direction.pending.splice(index, 1);
+        const removed = direction.pending.splice(index, 1)[0];
+        if (removed) {
+          direction.pendingBytes -= removed.bytes.length;
+          pendingBytes -= removed.bytes.length;
+        }
         progressed = true;
         break;
       }
     }
-    if (direction.truncated) direction.pending.length = 0;
+    if (direction.truncated) clearPending(direction);
   }
 
   function mergeSegment(direction, payloadSeq, payload) {
@@ -509,6 +527,7 @@ function createCollector(maxFlows, maxBytes, includeHex, filter) {
         chunks: [],
         startSeq: undefined,
         pending: [],
+        pendingBytes: 0,
         pendingDropped: false,
         firstPacket: packet,
       };
@@ -870,8 +889,9 @@ async function streamLargeCapture(filePath, size, collector, signal) {
           if (!sectionReady || littleEndian === undefined) throw new Error('PCAPNG 文件必须以节头块开始。');
           blockSize = createReader(first, littleEndian).u32(4);
         }
-        if (blockSize < 12 || blockSize % 4 !== 0 || blockSize > MAX_PCAPNG_BLOCK) {
-          throw new Error(`PCAPNG 块在偏移 ${recordOffset} 处的长度无效或超过解析上限。`);
+      if (blockSize < (rawType === SECTION_HEADER ? 28 : 12) || blockSize % 4 !== 0 || blockSize > MAX_PCAPNG_BLOCK) {
+          const label = rawType === SECTION_HEADER ? 'Section Header Block' : '块';
+          throw new Error(`PCAPNG ${label} 在偏移 ${recordOffset} 处的长度无效或超过解析上限。`);
         }
         if (blockSize > size - recordOffset) { partial = true; issue = 'truncated_block'; break; }
         const tail = await exact(blockSize - leading.length);

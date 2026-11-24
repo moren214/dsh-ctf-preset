@@ -13,32 +13,45 @@
 # 构建完成后无需修改配置，ctf_sandbox 默认 profile="auto" 会自动发现并按需启用（亦可通过 sandboxHeavyImage 自定义重型镜像名）。
 ARG BASE_IMAGE=dsh-ctf-sandbox:latest
 FROM ${BASE_IMAGE}
+USER root
 
 ARG WITH_GHIDRA=1
 ARG WITH_ANGR=1
 ARG WITH_APK=1
 ARG WITH_SAGE=0
 ARG PIP_INDEX_URL=""
+ARG APT_MIRROR=""
+ARG GITHUB_BASE_URL=https://github.com
 
 ARG GHIDRA_VERSION=11.3.1
 ARG GHIDRA_DATE=20250219
 ARG JADX_VERSION=1.5.1
 ARG APKTOOL_VERSION=2.11.1
+# 下载物校验和：GHIDRA 取自官方 release notes 公布的 SHA-256，jadx/apktool 由发行包实测。
+ARG GHIDRA_SHA256=bcda0a9de8993444766cc255964c65c042b291ddaf6c50d654e316e442b441fa
+ARG JADX_SHA256=12fd966431903b8e15c36e5007f19343475be7d8f2a55f082e7a929eeabc937e
+ARG APKTOOL_SHA256=56d59c524fc764263ba8d345754d8daf55b1887818b15cd3b594f555d249e2db
 
 ENV DEBIAN_FRONTEND=noninteractive \
     GHIDRA_HOME=/opt/ghidra
 
-# 1. Java 运行时（Ghidra / jadx / apktool 共享同一份 OpenJDK 21 JRE）
+RUN if [ -n "$APT_MIRROR" ]; then \
+        case "$APT_MIRROR" in http://*|https://*) ;; *) echo "APT_MIRROR must be an http(s) URL" >&2; exit 2;; esac; \
+        sed -i "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}|g; s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}|g; s|http://ports.ubuntu.com/ubuntu-ports|${APT_MIRROR}|g" /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
+
+# 1. Java 运行时（Ghidra 11.x Headless 强制需要 JDK 而非仅 JRE；jadx / apktool 共享同一份 OpenJDK 21）
 RUN if [ "$WITH_GHIDRA" = "1" ] || [ "$WITH_APK" = "1" ]; then \
         apt-get update \
-        && apt-get install -y --no-install-recommends openjdk-21-jre-headless \
+        && apt-get install -y --no-install-recommends openjdk-21-jdk-headless \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
 # 2. Ghidra Headless（ctf_sandbox action=decompile 会自动探测 GHIDRA_HOME / analyzeHeadless）
 RUN if [ "$WITH_GHIDRA" = "1" ]; then \
         GHIDRA_ZIP="ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip" \
-        && curl -fsSL "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/${GHIDRA_ZIP}" -o /tmp/ghidra.zip \
+        && curl -fsSL "${GITHUB_BASE_URL}/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/${GHIDRA_ZIP}" -o /tmp/ghidra.zip \
+        && echo "${GHIDRA_SHA256}  /tmp/ghidra.zip" | sha256sum -c - \
         && unzip -q /tmp/ghidra.zip -d /opt \
         && mv "/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" /opt/ghidra \
         && ln -sf /opt/ghidra/support/analyzeHeadless /usr/local/bin/analyzeHeadless \
@@ -47,14 +60,16 @@ RUN if [ "$WITH_GHIDRA" = "1" ]; then \
 
 # 3. Android APK 逆向（jadx + apktool）
 RUN if [ "$WITH_APK" = "1" ]; then \
-        curl -fsSL "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" -o /tmp/jadx.zip \
+        curl -fsSL "${GITHUB_BASE_URL}/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" -o /tmp/jadx.zip \
+        && echo "${JADX_SHA256}  /tmp/jadx.zip" | sha256sum -c - \
         && mkdir -p /opt/jadx \
         && unzip -q /tmp/jadx.zip -d /opt/jadx \
         && chmod +x /opt/jadx/bin/jadx /opt/jadx/bin/jadx-gui \
         && ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx \
         && rm -f /tmp/jadx.zip \
         && mkdir -p /opt/apktool \
-        && curl -fsSL "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" -o /opt/apktool/apktool.jar \
+        && curl -fsSL "${GITHUB_BASE_URL}/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" -o /opt/apktool/apktool.jar \
+        && echo "${APKTOOL_SHA256}  /opt/apktool/apktool.jar" | sha256sum -c - \
         && printf '#!/bin/sh\nexec java -jar /opt/apktool/apktool.jar "$@"\n' > /usr/local/bin/apktool \
         && chmod +x /usr/local/bin/apktool; \
     fi
@@ -74,4 +89,5 @@ RUN if [ "$WITH_SAGE" = "1" ]; then \
     fi
 
 WORKDIR /work
+USER 10001:10001
 CMD ["bash"]

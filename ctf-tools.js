@@ -114,6 +114,7 @@ const SUBMIT_PROPERTIES = {
   instance: { type: 'string', maxLength: 200, description: '实例名。' },
   refreshed_at: { type: 'string', maxLength: 40, description: '实例刷新 ISO 时间。' },
   record: { type: 'boolean', description: 'check_flag 传 true 才写预检回执。' },
+  retry_unknown: { type: 'boolean', description: '上次提交为 unknown/pending（如 429/超时）时允许重提。' },
 };
 const SUBMIT_FLAG_PROPERTIES = {
   ...SUBMIT_PROPERTIES,
@@ -243,6 +244,12 @@ async function workspaceLocation(ctx, execution) {
   const current = await ctx.fs.resolve(cwd, { signal });
   if (!ctx.fs.contains(root, current)) throw new Error('当前目录超出了本会话的题目工作区。');
   return { cwd, root, directoryKey: current.targetKey, signal };
+}
+
+function networkScopeFor(execution, location, leaseId) {
+  const session = execution.agent?.session;
+  if (!session || typeof session !== 'object' || typeof location?.directoryKey !== 'string') return undefined;
+  return { session, workspaceKey: location.directoryKey, ...(leaseId ? { leaseId } : {}) };
 }
 
 async function openWorkspaceFile(ctx, parts, { cwd, root, signal }) {
@@ -640,7 +647,7 @@ async function persistResult(ctx, location, execution, id, result) {
 async function runProgress(ctx, args, execution, results, inspectRanges) {
   const policy = ctx.sandboxPolicy.resolve({ session: execution.agent?.session });
   if (['save', 'writeup', 'repair'].includes(args.action) && policy?.mode === 'read-only') {
-    throw new Error('当前会话为只读权限，可读取续接记录并在对话中报告。');
+    throw new ToolError('permission', '当前会话为只读权限，可读取续接记录并在对话中报告。');
   }
   const location = await workspaceLocation(ctx, execution);
   const recorded = await recordedResults(ctx, location);
@@ -687,7 +694,7 @@ async function runProgress(ctx, args, execution, results, inspectRanges) {
 function statusLine(value, field, maxLength = 400) {
   if (value === undefined) return undefined;
   if (typeof value !== 'string' || value.length > maxLength || /[\r\n]/u.test(value)) {
-    throw new Error(field + ' 须为单行文本（最多 ' + maxLength + ' 字符）。');
+    throw new ToolError('unsupported', field + ' 须为单行文本（最多 ' + maxLength + ' 字符）。');
   }
   return value.trim();
 }
@@ -705,7 +712,8 @@ function graphFiles(ctx, location, execution) {
       const intent = document.version === undefined
         ? { kind: 'createIfAbsent' }
         : { kind: 'replaceIfVersion', version: document.version };
-      await ctx.fs.writeText(document.target, body, intent, location.signal, activePolicy);
+      const outcome = await ctx.fs.writeText(document.target, body, intent, location.signal, activePolicy);
+      ctx.emit?.('fs/observed', document.target, { kind: 'present', version: outcome?.version }, execution);
     },
   };
 }
@@ -737,6 +745,7 @@ async function runSandboxTool(ctx, args, execution, config) {
 
 async function runArenaTool(ctx, args, execution, config, network) {
   const location = await workspaceLocation(ctx, execution);
+  const networkScope = networkScopeFor(execution, location);
   const policy = ctx.sandboxPolicy.resolve({ session: execution.agent?.session });
   const writable = Boolean(policy && policy.mode !== 'read-only');
   const gFiles = graphFiles(ctx, location, execution);
@@ -747,9 +756,17 @@ async function runArenaTool(ctx, args, execution, config, network) {
     signal: execution.signal,
     writable,
     network,
-    authorizeResponse: res => authorizeInstanceTargets(res, network),
+    networkScope,
+    authorizeResponse: (res, leaseId) => authorizeInstanceTargets(res, network,
+      leaseId ? { ...networkScope, leaseId } : networkScope),
+    revokeTargets: leaseId => network?.revoke(networkScope, leaseId),
+    recordInstance: (id, state) => recordInstance(ctx, location, execution, platformBase(config), id, state),
+    lookupInstance: async id => {
+      const { entries } = await instanceRecords(ctx, location);
+      return entries.findLast(entry => entry.platform === platformBase(config) && entry.id === id);
+    },
     syncGraphFact: factArgs => manageGraph(factArgs, gFiles, { defaultOwner: owner }),
-    fetchFile: url => runFetchAttachment(ctx, { url }, execution, config, network),
+    fetchFile: (url, platformConfig) => runFetchAttachment(ctx, { url }, execution, platformConfig ?? config, network),
     submissionFiles: submissionFiles(ctx, location, execution),
   });
 }
@@ -765,7 +782,8 @@ function statusFiles(ctx, location, execution, config) {
       const intent = document.version === undefined
         ? { kind: 'createIfAbsent' }
         : { kind: 'replaceIfVersion', version: document.version };
-      await ctx.fs.writeText(document.target, body, intent, location.signal, policy);
+      const outcome = await ctx.fs.writeText(document.target, body, intent, location.signal, policy);
+      ctx.emit?.('fs/observed', document.target, { kind: 'present', version: outcome?.version }, execution);
     },
   };
 }
@@ -809,7 +827,9 @@ async function runStatus(ctx, args, execution, config) {
       warnings, warning_messages: warningMessages(warnings) };
   }
   if (args.action === 'board') {
-    writablePolicy(ctx, execution);
+    const policy = ctx.sandboxPolicy.resolve({ session: execution.agent?.session });
+    if (!policy) throw new ToolError('permission', '当前会话没有可用的文件权限策略。');
+    const readOnly = policy.mode === 'read-only';
     const boardPath = config?.platformLeaderboardPath ?? '/scoreboard';
     const response = await platformRequest(config, execution.signal, 'GET', boardPath);
     let board;
@@ -819,6 +839,8 @@ async function runStatus(ctx, args, execution, config) {
     }
     if (!board) return { status: 'board_unavailable', file: STATUS_FILE, records: entries.length, platform_status: response?.status ?? null,
       reason: '平台响应没有可辨认的本队名次、分数或解题数。' };
+    if (readOnly) return { status: 'board', file: STATUS_FILE, records: entries.length, platform_status: response?.status ?? null,
+      board, recorded: false, note: '只读会话未写入本地状态记录。' };
     await checkedOutput(ctx, location, '.ctf', true);
     const saved = await appendStatus(files, { phase: 'scoreboard', board });
     return { status: 'board', file: STATUS_FILE, records: saved.entries.length, platform_status: response?.status ?? null, board,
@@ -828,7 +850,7 @@ async function runStatus(ctx, args, execution, config) {
   const stuck = statusLine(args.stuck, 'stuck', 400);
   const nextStep = statusLine(args.next_step, 'next_step', 400);
   const need = statusLine(args.need, 'need', 200);
-  if (!phase && !stuck && !nextStep) throw new Error('状态记录至少给出 phase、stuck 或 next_step 之一。');
+  if (!phase && !stuck && !nextStep) throw new ToolError('unsupported', '状态记录至少给出 phase、stuck 或 next_step 之一。');
   const ruledOut = args.ruled_out === undefined ? [] : args.ruled_out.map(item => statusLine(item, 'ruled_out', 200)).filter(Boolean);
   await checkedOutput(ctx, location, '.ctf', true);
   const saved = await appendStatus(files, { phase, stuck, ruled_out: ruledOut, next_step: nextStep, need });
@@ -858,20 +880,33 @@ function submissionFiles(ctx, location, execution) {
   return {
     async read() {
       const document = await progressDocument(ctx, SUBMISSION_LOG, location);
-      const receipts = document.text.split('\n').filter(Boolean).map(line => JSON.parse(line));
-      if (receipts.some(entry => entry === null || typeof entry !== 'object' || Array.isArray(entry))) {
-        throw new Error('提交回执格式无效，请先核对记录。');
+      const receipts = [];
+      let corruptedLines = 0;
+      for (const rawLine of document.text.split('\n')) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        try {
+          const entry = JSON.parse(line);
+          if (entry !== null && typeof entry === 'object' && !Array.isArray(entry)) {
+            receipts.push(entry);
+          } else {
+            corruptedLines += 1;
+          }
+        } catch {
+          corruptedLines += 1;
+        }
       }
-      return { document, receipts };
+      return { document, receipts, corruptedLines };
     },
     async write(document, receipts) {
       const policy = ctx.sandboxPolicy.resolve({ session: execution.agent?.session });
       if (policy?.mode === 'read-only') throw new ToolError('permission', '当前会话为只读权限，无法记录正式提交。');
       const body = receipts.map(entry => JSON.stringify(receiptForStorage(entry))).join('\n') + '\n';
-      if (Buffer.byteLength(body) > MAX_ATTACHMENT_BYTES) throw new Error('提交回执超过文件大小上限。');
+      if (Buffer.byteLength(body) > MAX_ATTACHMENT_BYTES) throw new ToolError('size', '提交回执超过文件大小上限。');
       const intent = document.version === undefined ? { kind: 'createIfAbsent' }
         : { kind: 'replaceIfVersion', version: document.version };
-      await ctx.fs.writeText(document.target, body, intent, location.signal, policy);
+      const outcome = await ctx.fs.writeText(document.target, body, intent, location.signal, policy);
+      ctx.emit?.('fs/observed', document.target, { kind: 'present', version: outcome?.version }, execution);
     },
   };
 }
@@ -1105,11 +1140,15 @@ async function runSubmitFlag(ctx, args, execution, config) {
   const location = await workspaceLocation(ctx, execution);
   const base = platformBase(config);
   let validated = args;
-  if (args.dynamic && base && typeof args.instance === 'string') {
+  if (args.dynamic && base) {
     const instances = await instanceRecords(ctx, location);
-    const record = instances.entries.findLast(entry => entry.platform === base && entry.id === args.instance);
-    if (record?.state === 'deleted') return { status: 'rejected', verdict: 'rejected_local', reason: '该平台实例已删除。' };
-    if (record?.observed_at) validated = { ...args, refreshed_at: record.observed_at };
+    const instanceId = typeof args.instance === 'string' ? args.instance.trim() : '';
+    const record = instanceId ? instances.entries.findLast(entry => entry.platform === base && entry.id === instanceId) : undefined;
+    const age = record?.state === 'created' ? Date.now() - Date.parse(record.observed_at ?? '') : Infinity;
+    if (!Number.isFinite(age) || age < -5 * 60000 || age > 30 * 60000) {
+      return { status: 'rejected', verdict: 'rejected_local', reason: '动态 flag 需要 30 分钟内由 ctf_instance、ctf_arena 容器操作写入的实例记录；调用方提供的 refreshed_at 不作为可信刷新时间。' };
+    }
+    validated = { ...args, refreshed_at: record.observed_at };
   }
   return handleSubmission(validated, submissionFiles(ctx, location, execution),
     body => platformRequest(config, execution.signal, 'POST', config?.platformSubmitPath ?? '/submissions', body), base || undefined, location.signal);
@@ -1118,9 +1157,15 @@ async function runSubmitFlag(ctx, args, execution, config) {
 async function instanceRecords(ctx, location) {
   const document = await progressDocument(ctx, INSTANCE_STATE_FILE, location);
   if (!document.text) return { document, entries: [] };
-  const entries = JSON.parse(document.text);
-  if (!Array.isArray(entries)) throw new Error('实例记录格式无效。');
-  return { document, entries };
+  let parsed;
+  try {
+    parsed = JSON.parse(document.text);
+  } catch {
+    // 实例账本由本插件独占写入；单行损坏不应连带让 ctf_instance/ctf_arena/submit_flag 一起瘫痪。
+    return { document, entries: [] };
+  }
+  if (!Array.isArray(parsed)) return { document, entries: [] };
+  return { document, entries: parsed.filter(entry => entry !== null && typeof entry === 'object' && !Array.isArray(entry)) };
 }
 
 function createdInstance(response) {
@@ -1233,16 +1278,17 @@ export function extractInstanceTargets(response) {
   return { http: httpTargets, tcp: tcpTargets };
 }
 
-function authorizeInstanceTargets(response, network) {
-  if (!network) return undefined;
+function authorizeInstanceTargets(response, network, scope) {
+  if (!network || !scope) return undefined;
   const extracted = extractInstanceTargets(response);
-  const http = [...new Set(extracted.http.map(url => network.grantHttp(url)).filter(Boolean))];
-  const tcp = [...new Set(extracted.tcp.map(({ host, port }) => network.grantTcp(host, port)).filter(Boolean))];
+  const http = [...new Set(extracted.http.map(url => network.grantHttp(url, scope)).filter(Boolean))];
+  const tcp = [...new Set(extracted.tcp.map(({ host, port }) => network.grantTcp(host, port, scope)).filter(Boolean))];
   return http.length || tcp.length ? { http, tcp } : undefined;
 }
 
 async function runInstance(ctx, args, execution, config, network) {
   const location = await workspaceLocation(ctx, execution);
+  const networkScope = networkScopeFor(execution, location);
   const base = platformBase(config);
   const { tokenEnv, token } = platformCredential(config);
   const path = config?.platformInstancesPath ?? '/instances';
@@ -1254,7 +1300,7 @@ async function runInstance(ctx, args, execution, config, network) {
   if (args.action === 'list') {
     const request = await call('GET', path);
     const ok = platformOperationSucceeded(request);
-    const authorized = ok ? authorizeInstanceTargets(request, network) : undefined;
+    const authorized = ok ? authorizeInstanceTargets(request, network, networkScope) : undefined;
     return { status: ok ? 'instances' : 'failed', request, ...(authorized ? { authorized_targets: authorized } : {}) };
   }
   writablePolicy(ctx, execution);
@@ -1262,7 +1308,7 @@ async function runInstance(ctx, args, execution, config, network) {
     const request = await call('POST', path, args.body ?? {});
     if (!platformOperationSucceeded(request)) return { status: 'failed', request };
     const id = createdInstance(request);
-    const authorized = authorizeInstanceTargets(request, network);
+    const authorized = id ? authorizeInstanceTargets(request, network, { ...networkScope, leaseId: `instance:${id}` }) : undefined;
     return { status: 'created', request, id, instance_recorded: await recordInstance(ctx, location, execution, base, id, 'created'),
       ...(authorized ? { authorized_targets: authorized } : {}) };
   }
@@ -1290,7 +1336,7 @@ async function runInstance(ctx, args, execution, config, network) {
       if (!newId || newId === id) {
         return { status: 'unconfirmed', step: 'create', id, old_preserved: true, created, reason: '平台未返回一个可确认的新实例标识。' };
       }
-      const authorized = authorizeInstanceTargets(created, network);
+      const authorized = authorizeInstanceTargets(created, network, { ...networkScope, leaseId: `instance:${newId}` });
       const recorded = await recordInstance(ctx, location, execution, base, newId, 'created');
       replacement = { new_id: newId, created, instance_recorded: recorded, ...(authorized ? { authorized_targets: authorized } : {}) };
       if (!recorded) return { status: 'partial', step: 'record', id, old_preserved: true, ...replacement };
@@ -1306,6 +1352,7 @@ async function runInstance(ctx, args, execution, config, network) {
       return { status: replacement ? 'partial' : 'failed', step: 'delete', id, request: deleted, ...replacement };
     }
     const previousRecorded = await recordInstance(ctx, location, execution, base, id, 'deleted');
+    network?.revoke(networkScope, `instance:${id}`);
     return replacement ? { status: 'rotated', id, deleted, previous_recorded: previousRecorded, ...replacement }
       : { status: 'deleted', id, request: deleted, instance_recorded: previousRecorded };
   } finally {
@@ -1336,6 +1383,7 @@ function detectAttachmentType(name, bytes) {
 async function runFetchAttachment(ctx, args, execution, config, network) {
   const url = webUrl(args.url);
   const location = await workspaceLocation(ctx, execution);
+  const networkScope = networkScopeFor(execution, location);
   let fallback = url.pathname.split('/').filter(Boolean).at(-1) ?? 'attachment';
   try { fallback = decodeURIComponent(fallback); } catch { /* keep literal path segment */ }
   const wanted = typeof args.name === 'string' && args.name.trim() !== '' ? args.name.trim() : fallback;
@@ -1349,7 +1397,7 @@ async function runFetchAttachment(ctx, args, execution, config, network) {
   }
   const authorizeHop = (hopUrl, signal) => {
     const trusted = (platformOrigin !== undefined && hopUrl.origin === platformOrigin)
-      || Boolean(network?.isHttpAuthorized(hopUrl));
+      || Boolean(network?.isHttpAuthorized(hopUrl, networkScope));
     return pinAddress(hopUrl.hostname, { publicOnly: !trusted, signal });
   };
   const headersFor = hopUrl => {
@@ -1859,7 +1907,8 @@ export function apply(ctx, config) {
         if (idle) { idle.dispose(); managers.delete(idle); }
         else throw new Error('TCP 会话工作区数量已达上限。');
       }
-      manager = createNetSessionManager({ authorize: network.tcp });
+      const scope = networkScopeFor(execution, location);
+      manager = createNetSessionManager({ authorize: (host, port, signal) => network.tcp(host, port, signal, scope) });
       inSession.set(location.directoryKey, manager);
       managers.add(manager);
     }
@@ -2067,7 +2116,7 @@ export function apply(ctx, config) {
       const jar = cookieJarFor(execution, location.directoryKey, args.cookie_jar);
       const response = await httpRequest(args, {
         signal: execution.signal,
-        authorize: network.http,
+        authorize: (target, signal) => network.http(target, signal, networkScopeFor(execution, location)),
         ...(jar ? { cookieJar: jar } : {}),
         readFile: async (filePath, limit) => (await readWorkspaceFile(ctx, pathParts(filePath), location, limit)).bytes,
       });
@@ -2084,7 +2133,7 @@ export function apply(ctx, config) {
     'Linux 安全工具沙箱（Docker 优先，自动回退 WSL2）：status 探测兵器库；exec 运行命令/脚本；decompile 列出函数或反编译；pwn_triage 采集 checksec/libc/gadget/seccomp。',
     SANDBOX_PROPERTIES,
     (args, execution) => runSandboxTool(ctx, args, execution, currentConfig()),
-    ['action']);
+    ['action'], sessionResults);
   if (extendedAudit) {
     registerTool(ctx, 'verify_elf',
       '从原文件复核 ELF 入口、main、动态符号偏移标注或 SHA-256。',
@@ -2288,7 +2337,8 @@ export function apply(ctx, config) {
     read: (location, path, limit) => readWorkspaceFile(ctx, pathParts(path), location, limit),
     output: (location, path, directory) => checkedOutput(ctx, location, path, directory),
     python: signal => workbench.resolvePython(signal),
-    authorize: network.http,
+    authorize: (url, signal, execution, location) => network.http(url, signal,
+      networkScopeFor(execution, location ?? { directoryKey: undefined })),
     platformToken: () => platformCredential(currentConfig()).token,
     async observe(tool, args, execution, report, artifactBytes) {
       if (tool === 'cloud_metadata' || (tool === 'archive_crack' && args.action !== 'info')

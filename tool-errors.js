@@ -16,7 +16,8 @@ const HINTS = {
 const CODE_KINDS = new Map(Object.entries({
   ENOENT: 'missing', ENOTDIR: 'path', ELOOP: 'path', EACCES: 'permission', EPERM: 'permission', EEXIST: 'conflict',
   FS_NOT_FOUND: 'missing', FS_PERMISSION_DENIED: 'permission', FS_ABORTED: 'abort',
-  FS_CONFLICT: 'conflict', FS_VERSION_MISMATCH: 'conflict', FS_TOO_LARGE: 'size',
+  FS_CONFLICT: 'conflict', FS_VERSION_MISMATCH: 'conflict', FS_STALE_VERSION: 'conflict',
+  FS_NOT_OBSERVED: 'conflict', EBUSY: 'conflict', FS_TOO_LARGE: 'size',
   ABORT_ERR: 'abort', ERR_BUFFER_TOO_LARGE: 'size', ETIMEDOUT: 'timeout',
   ENOTFOUND: 'network', EAI_AGAIN: 'network', ECONNREFUSED: 'network', ECONNRESET: 'network',
   EPIPE: 'network', EHOSTUNREACH: 'network', ENETUNREACH: 'network',

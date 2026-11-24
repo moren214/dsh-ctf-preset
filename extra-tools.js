@@ -14,7 +14,7 @@ import { CRYPTO_SOLVE_OPERATIONS, runCryptoSolve } from './crypto-toolbox.js';
 
 const MAX_INPUT_BYTES = 256 * 1024 * 1024;
 const MAX_TEXT_OUTPUT = 64 * 1024;
-const GDB_ATOM = '(?:\\$[A-Za-z][A-Za-z0-9_]*|0x[0-9a-f]{1,16}|[0-9]{1,16}|[A-Za-z_][A-Za-z0-9_.@$]*)';
+const GDB_ATOM = '(?:\\$[A-Za-z][A-Za-z0-9_]*|0x[0-9a-f]{1,16}|[0-9]{1,16}|&?[A-Za-z_][A-Za-z0-9_.@$]*)';
 const GDB_EXPR = `${GDB_ATOM}(?:\\s*[+-]\\s*${GDB_ATOM}){0,3}`;
 const GDB_CAST = '(?:\\((?:void|char|int|long|unsigned\\s+long|uint64_t|uint32_t|int64_t|int32_t)\\s*\\*{1,2}\\))';
 const GDB_VALUE = `(?:\\*(?:${GDB_CAST})?\\s*)?(?:${GDB_EXPR}|\\(${GDB_EXPR}\\))`;
@@ -23,12 +23,15 @@ const GDB_COMMAND_PATTERNS = [
   /^(?:run|start|starti|continue|c|step|s|stepi|si|next|n|nexti|ni|finish|fin|kill)$/iu,
   /^(?:bt|backtrace)(?:\s+[0-9]{1,3})?$/iu,
   /^(?:info|i)\s+(?:registers|reg|r)(?:\s+[A-Za-z0-9_]+){0,8}$/iu,
-  /^(?:info|i)\s+(?:all-registers|frame|files|proc\s+mappings|args|locals|functions|variables|breakpoints|b)$/iu,
+  /^(?:info|i)\s+(?:all-registers|frame|files|proc\s+mappings|sharedlibrary|args|locals|functions|variables|breakpoints|b)$/iu,
   new RegExp(`^(?:info|i)\\s+symbol\\s+${GDB_EXPR}$`, 'iu'),
   /^frame(?:\s+[0-9]{1,4})?$/iu,
   new RegExp(`^x\\/(?:[1-9][0-9]{0,2})?(?:[bghw][xduoctafis]?|[xduoctafis][bghw]?)?\\s+${GDB_VALUE}$`, 'iu'),
   new RegExp(`^(?:disassemble|disas)(?:\\s+${GDB_EXPR}(?:\\s*,\\s*${GDB_EXPR})?)?$`, 'iu'),
   new RegExp(`^(?:p|print)(?:\\/[xduoctafs]|\\s+\\/[xduoctafs])?\\s+${GDB_VALUE}$`, 'iu'),
+  /^set\s+follow-fork-mode\s+(?:child|parent)$/iu,
+  /^set\s+disassembly-flavor\s+(?:intel|att)$/iu,
+  /^handle\s+SIG(?:ALRM|PIPE|USR1|USR2)(?:\s+(?:nostop|stop|noprint|print|pass|nopass)){1,3}$/iu,
 ];
 
 function registerTool(ctx, toolName, description, properties, run, required = ['file_path'], observe, getConfig) {
@@ -183,6 +186,10 @@ function validatedGdbArgs(value) {
 
 function quoteGdbPath(value) {
   return '"' + value.replaceAll('\\', '/').replaceAll('"', '\\"') + '"';
+}
+
+export function quoteGdbInputPath(value, posix = process.platform !== 'win32') {
+  return posix ? "'" + value.replaceAll("'", "'\\''") + "'" : quoteGdbPath(value);
 }
 
 function quoteGdbArg(value, posix) {
@@ -1104,7 +1111,7 @@ export function registerExtraTools(ctx, configSource, access) {
   const browsers = new WeakMap();
   const activeBrowsers = new Set();
   ctx.effect(() => () => Promise.allSettled([...activeBrowsers].map(browser => browser.close())), 'CTF browser sessions');
-  function getBrowser(session, key) {
+  function getBrowser(session, key, execution, location) {
     let byWorkspace = browsers.get(session);
     if (byWorkspace === undefined) {
       byWorkspace = new Map();
@@ -1114,8 +1121,9 @@ export function registerExtraTools(ctx, configSource, access) {
     if (browser === undefined) {
       browser = createBrowserSession({
         resolveBinary: () => detectBrowser(getConfig()),
-        authorize: access.authorize,
+        authorize: (url, signal) => access.authorize(url, signal, execution, location),
         environment: childEnvironment,
+        allowInsecureTls: () => getConfig()?.allowInsecureBrowserTls === true,
         onStart() {
           if (activeBrowsers.size >= 8) throw new ToolError('dependency', '浏览器会话数量已达上限，请关闭不用的会话。');
           activeBrowsers.add(browser);
@@ -1218,7 +1226,7 @@ export function registerExtraTools(ctx, configSource, access) {
       if (args.request_id !== undefined && (typeof args.request_id !== 'string' || args.request_id.length === 0 || args.request_id.length > 256)) {
         throw new ToolError('unsupported', 'request_id 须为非空字符串。');
       }
-      const browser = getBrowser(execution.agent.session, location.directoryKey);
+      const browser = getBrowser(execution.agent.session, location.directoryKey, execution, location);
       if (action === 'close') {
         const closed = await browser.close();
         return { status: closed.process_exited && closed.profile_removed ? 'closed' : 'partial', ...closed };
@@ -1231,12 +1239,12 @@ export function registerExtraTools(ctx, configSource, access) {
         if (action === 'status') return { status: await browser.status(signal) };
         if (action === 'open') {
           if (typeof args.url !== 'string') throw new ToolError('unsupported', 'open 需要 url。');
-          if (args.url !== 'about:blank') await access.authorize(args.url, signal);
+          if (args.url !== 'about:blank') await access.authorize(args.url, signal, execution, location);
           const target = await browser.ensure(signal);
           return { status: 'opened', ...await browser.navigate(target, args.url, signal) };
         }
         if (action === 'screenshot') requireWritable(ctx, execution);
-        if (action === 'cookies' && args.url !== undefined) await access.authorize(args.url, signal);
+        if (action === 'cookies' && args.url !== undefined) await access.authorize(args.url, signal, execution, location);
         const target = await browser.ensure(signal);
         const evaluate = expression => browser.evaluate(target, expression, signal);
         if (action === 'dom') {
@@ -1307,7 +1315,7 @@ export function registerExtraTools(ctx, configSource, access) {
           return { ...(await browser.evaluateUser(target, args.expression, signal)) };
         }
         if (action === 'set_cookie') {
-          await access.authorize(args.url, signal);
+          await access.authorize(args.url, signal, execution, location);
           const cookie = {
             name: args.name.trim(),
             value: args.value,
@@ -1372,8 +1380,8 @@ export function registerExtraTools(ctx, configSource, access) {
       const sandboxRel = abs => './' + path.relative(location.cwd, abs).replaceAll('\\', '/');
       const targetBinary = sandboxActive ? sandboxRel(binary) : binary;
       const runGdb = (commandArgs, { ptrace = false, killTree = false } = {}) => sandboxActive
-        ? runSandboxCommand(['gdb', ...commandArgs], {
-          cwd: location.cwd, config, signal: execution.signal, timeoutMs, ptrace, detected: useSandbox,
+        ? runSandboxCommand(['bash', '-c', 'GDB_BIN="$(command -v gdb-multiarch || command -v gdb || true)"; [ -n "$GDB_BIN" ] || exit 127; exec "$GDB_BIN" "$@"', '_', ...commandArgs], {
+          cwd: location.cwd, config, signal: execution.signal, timeoutMs, ptrace, requiresIsolation: true, detected: useSandbox,
         })
         : spawnCapture(gdb, commandArgs, {
           cwd: location.cwd, timeoutMs, maxBytes: MAX_TEXT_OUTPUT / 2, signal: execution.signal, killTree,
@@ -1401,9 +1409,9 @@ export function registerExtraTools(ctx, configSource, access) {
         stdinFile = sandboxActive ? sandboxRel(resolvedStdin) : resolvedStdin;
       }
       const effectiveCommands = commands.map(command => command.toLowerCase() === 'run' && stdinFile
-        ? 'run < ' + quoteGdbPath(stdinFile) : command);
+        ? 'run < ' + quoteGdbInputPath(stdinFile, sandboxActive || process.platform !== 'win32') : command);
       const commandArgs = ['-q', '-batch', '-nx', '-nh', '-iex', 'set auto-load off',
-        '-iex', 'set debuginfod enabled off', '-e', targetBinary, '-ex', 'set confirm off'];
+        '-iex', 'set debuginfod enabled off', '--se=' + targetBinary, '-ex', 'set confirm off'];
       if (progArgs.length > 0) {
         const posix = sandboxActive || process.platform !== 'win32';
         commandArgs.push('-ex', 'set args ' + progArgs.map(item => quoteGdbArg(item, posix)).join(' '));
@@ -1633,11 +1641,13 @@ export function registerExtraTools(ctx, configSource, access) {
           const plan = resolveExecutionPlan(detected, { preferDocker: true, preferHeavy: true, heavyReasons: ['apk_workload'] }, 'auto');
           const relApk = path.relative(cwd, file).replaceAll('\\', '/');
           const relOut = path.relative(cwd, output).replaceAll('\\', '/');
-          const script = 'if command -v jadx >/dev/null 2>&1; then echo "__TOOL=jadx"; exec jadx -d "$2" --no-res "$1"; '
+          const script = 'export HOME=/tmp/apk_home XDG_CONFIG_HOME=/tmp/apk_home/.config XDG_CACHE_HOME=/tmp/apk_home/.cache JAVA_TOOL_OPTIONS="-Duser.home=/tmp/apk_home"; '
+            + 'mkdir -p "$HOME/.config" "$HOME/.cache"; '
+            + 'if command -v jadx >/dev/null 2>&1; then echo "__TOOL=jadx"; exec jadx -d "$2" --no-res "$1"; '
             + 'elif command -v apktool >/dev/null 2>&1; then echo "__TOOL=apktool"; exec apktool d -f -o "$2" "$1"; '
             + 'else exit 127; fi';
           const result = await runSandboxCommand(['bash', '-c', script, '_', relApk, relOut], {
-            cwd, config, signal: execution.signal, timeoutMs, detected, image: plan.image, profile: plan.profile,
+            cwd, config, signal: execution.signal, timeoutMs, requiresIsolation: true, detected, image: plan.image, profile: plan.profile,
           });
           if (result.code === 127) {
             throw new ToolError('dependency', `沙箱（${result.backend}:${result.target}）内未安装 jadx 或 apktool。`, '请构建重型镜像：docker build -f docker/Dockerfile.heavy -t dsh-ctf-sandbox:heavy docker/。');

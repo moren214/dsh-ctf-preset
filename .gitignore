@@ -8,3 +8,8 @@ Thumbs.db
 .ctf-attachments/
 .ctf-cache/
 .ctf-imports/
+.ctf-graph/
+.ctf-submissions.jsonl
+.ctf-instances.json
+.ctf-status.json
+work/

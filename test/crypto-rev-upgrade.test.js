@@ -209,6 +209,22 @@ test('crypto-toolbox: lcg_recover 从未知模数与已知模数反推参数并�
   assert.deepEqual(knownM.predictions, seq.slice(3, 6).map(v => v.toString()));
 });
 
+test('lcg_recover 通过线性同余合并处理 gcd 大于 64 的 128 位状态并精确预测', async () => {
+  const modulus = 1n << 128n;
+  const increment = 1n << 80n;
+  const states = [1n];
+  for (let index = 0; index < 6; index += 1) states.push((states.at(-1) + increment) % modulus);
+  const report = await runCryptoSolve({
+    operation: 'lcg_recover', modulus: modulus.toString(), outputs: states.slice(0, 5).map(String), predict_count: 2,
+  });
+  assert.equal(report.status, 'ok');
+  assert.equal(report.multiplier, '1');
+  assert.equal(report.increment, increment.toString());
+  assert.equal(report.parameters_unique, false);
+  assert.equal(report.parameter_candidates, increment.toString());
+  assert.deepEqual(report.predictions, states.slice(5, 7).map(String));
+});
+
 test('crypto-toolbox: mt19937_recover 与 Python random.Random 逐比特一致', async () => {
   assert.equal(temperMt19937(untemperMt19937(0xdeadbeef)), 0xdeadbeef);
   assert.equal(temperMt19937(untemperMt19937(0x12345678)), 0x12345678);

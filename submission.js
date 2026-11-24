@@ -9,6 +9,9 @@ const MAX_PATTERN_WORKERS = 4;
 export function classifyVerdict(response) {
   if (response?.truncated || response?.body_error) return 'unknown';
   const status = Number(response?.status ?? 0);
+  // Authentication, throttling, and server failures say nothing about whether
+  // the flag was right. Preserve the pending receipt as unknown in those cases.
+  if (status === 401 || status === 403 || status === 408 || status === 425 || status === 429 || status >= 500) return 'unknown';
   let body = response?.body;
   if (typeof body !== 'string' || body.trim() === '') return 'unknown';
   try {
@@ -82,15 +85,18 @@ async function checkFormat(pattern, flag, signal) {
 }
 
 function checksFor(args, flag, sha256, receipts, scope, format) {
+  const retryUnknown = args.retry_unknown === true;
   const duplicate = receipts.filter(receipt => receipt.flag_sha256 === sha256 && isSubmission(receipt)
-    && receipt.verdict !== 'rejected' && matchesScope(receipt, scope)).length;
+    && receipt.verdict !== 'rejected'
+    && (!retryUnknown || (receipt.verdict !== 'unknown' && receipt.verdict !== 'pending'))
+    && matchesScope(receipt, scope)).length;
   const checks = [
     { name: 'single_token', ok: flag.length > 0 && !/\s/u.test(flag), detail: 'flag 不能包含空白或换行。' },
     { name: 'length', ok: flag.length >= 6 && flag.length <= 512, detail: 'flag 长度应在 6 到 512 字符之间。' },
     { name: 'format', ...format },
     { name: 'source', ok: typeof args.source === 'string' && args.source.trim().length > 0, detail: '提交前记录结果来源。' },
     { name: 'not_duplicate', ok: duplicate === 0, detail: duplicate === 0 ? '无已完成或待确认的同项提交。'
-      : '已有同项正式提交或待确认记录。请先从平台核对。' },
+      : '已有同项正式提交或待确认记录。若上次因 429/网络异常为 unknown，核对平台后可传 retry_unknown: true 重提。' },
   ];
   if (args.dynamic === true) {
     const age = Date.now() - Date.parse(args.refreshed_at ?? '');
@@ -109,17 +115,17 @@ export async function handleSubmission(args, files, submit, platform, signal) {
   const format = await checkFormat(args.pattern, flag, signal);
   const preflight = receipts => checksFor(args, flag, sha256, receipts, scope, format);
   if (submit === undefined) {
-    const { receipts, document } = await files.read();
+    const { receipts, document, corruptedLines } = await files.read();
     const check = preflight(receipts);
     if (args.record === true) {
       await files.write(document, [...receipts, { ...base, at: new Date().toISOString(), kind: 'check', verdict: 'checked', ready: check.ready }]);
     }
-    return { status: 'checked', ...check, receipts: receipts.length, flag_sha256: sha256 };
+    return { status: 'checked', ...check, receipts: receipts.length, flag_sha256: sha256, corrupted_receipts: corruptedLines };
   }
 
-  const { receipts, document } = await files.read();
+  const { receipts, document, corruptedLines } = await files.read();
   const check = preflight(receipts);
-  if (!check.ready) return { status: 'rejected', verdict: 'rejected_local', ...check, receipts: receipts.length, flag_sha256: sha256 };
+  if (!check.ready) return { status: 'rejected', verdict: 'rejected_local', ...check, receipts: receipts.length, flag_sha256: sha256, corrupted_receipts: corruptedLines };
   if (platform === undefined) throw new Error('未配置竞赛平台地址。');
 
   const id = randomUUID();
@@ -150,5 +156,5 @@ export async function handleSubmission(args, files, submit, platform, signal) {
   }
   return { status: verdict === 'unknown' ? 'unconfirmed' : 'submitted', verdict, ready: verdict === 'accepted',
     platform_status: outcome.platform_status, checks: check.checks, receipts: receipts.length + 1,
-    flag_sha256: sha256, receipt_id: id, receipt_recorded: recorded };
+    flag_sha256: sha256, receipt_id: id, receipt_recorded: recorded, corrupted_receipts: corruptedLines };
 }

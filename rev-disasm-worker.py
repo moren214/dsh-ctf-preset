@@ -1109,11 +1109,12 @@ class PeFile:
 
 
 def _scan_strings(data, ranges, minimum, section_arg, addr_fn, sec_fn):
-    pattern = re.compile(b"[\x20-\x7e]{%d,}" % minimum)
+    ascii_pattern = re.compile(b"[\x20-\x7e]{%d,}" % minimum)
+    utf16_pattern = re.compile(b"(?:[\x20-\x7e]\x00){%d,}" % minimum)
     results = []
     truncated = False
 
-    def add(offset, text, section_name):
+    def add(offset, text, section_name, encoding="ascii"):
         nonlocal truncated
         if len(results) >= MAX_STRINGS:
             truncated = True
@@ -1121,25 +1122,37 @@ def _scan_strings(data, ranges, minimum, section_arg, addr_fn, sec_fn):
         address = addr_fn(offset)
         if len(text) > MAX_STRING_TEXT:
             text = text[:MAX_STRING_TEXT] + "..."
-        results.append({
+        item = {
             "address": hex(address) if address is not None else None,
             "file_offset": offset,
             "section": section_name or None,
             "text": text,
-        })
+        }
+        if encoding != "ascii":
+            item["encoding"] = encoding
+        results.append(item)
+        return True
+
+    def scan_chunk(chunk, base_offset, fixed_section=None):
+        for match in ascii_pattern.finditer(chunk):
+            off = base_offset + match.start()
+            sec = fixed_section if fixed_section is not None else sec_fn(off)
+            if not add(off, match.group().decode("ascii"), sec, "ascii"):
+                return False
+        for match in utf16_pattern.finditer(chunk):
+            off = base_offset + match.start()
+            sec = fixed_section if fixed_section is not None else sec_fn(off)
+            if not add(off, match.group().decode("utf-16le"), sec, "utf-16le"):
+                return False
         return True
 
     if ranges is None:
-        for match in pattern.finditer(data):
-            if not add(match.start(), match.group().decode("ascii"), sec_fn(match.start())):
-                break
+        scan_chunk(data, 0)
     else:
         for section in ranges:
             chunk = data[section["offset"]:section["offset"] + section["size"]]
-            for match in pattern.finditer(chunk):
-                if not add(section["offset"] + match.start(),
-                           match.group().decode("ascii"), section["name"]):
-                    break
+            if not scan_chunk(chunk, section["offset"], section["name"]):
+                break
             if truncated:
                 break
 

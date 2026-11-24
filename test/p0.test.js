@@ -45,6 +45,11 @@ test('本地校验不计为平台提交，明确失败与未知响应不会算�
   assert.equal(classifyVerdict({ status: 200, body: '{"correct":false}' }), 'rejected');
   assert.equal(classifyVerdict({ status: 200, body: '{"success":true}' }), 'unknown');
   assert.equal(classifyVerdict({ status: 200, body: '{"accepted":true}', truncated: true }), 'unknown');
+  for (const status of [401, 403, 408, 425, 429, 500, 503]) {
+    assert.equal(classifyVerdict({ status, body: '{"success":false,"message":"wrong flag"}' }), 'unknown',
+      `HTTP ${status} must not be recorded as a wrong flag`);
+  }
+  assert.equal(classifyVerdict({ status: 400, body: '{"success":false,"message":"wrong flag"}' }), 'rejected');
 });
 
 test('下载逐跳检查 DNS，拒绝越权跳转并支持已有取消信号', async () => {
@@ -286,6 +291,35 @@ test('Linux SLL、坏帧、IPv4 乱序分片、相同四元组两次连接', asy
     assert.equal(report.ip_fragments.reassembled, 1);
     assert.deepEqual(report.flows.map(flow => flow.payload_text), ['alpha', 'beta']);
     assert.notEqual(report.flows[0].connection_id, report.flows[1].connection_id);
+  } finally {
+    await unlink(file).catch(() => {});
+    await rmdir(cwd);
+  }
+});
+
+test('真实 PCAP 多流乱序载荷受全局待重组字节预算约束', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'dsh-ctf-pcap-pending-budget-'));
+  const file = join(cwd, 'pending.pcap');
+  const frames = [];
+  const payload = Buffer.alloc(60000, 0x41);
+  for (let flow = 0; flow < 16; flow += 1) {
+    const port = 50200 + flow;
+    const base = 1000 + flow * 1000000;
+    const syn = segment(base, 0x02, 'x');
+    syn.writeUInt16BE(port, 0);
+    frames.push(cooked(syn));
+    for (let index = 0; index < 18; index += 1) {
+      const packet = segment(base + 3 + index * payload.length, 0x18, payload);
+      packet.writeUInt16BE(port, 0);
+      frames.push(cooked(packet));
+    }
+  }
+  try {
+    await writeFile(file, pcap(frames));
+    const report = await pcapStream({ file_path: 'pending.pcap', max_flows: 16, max_bytes_per_flow: 1024 }, { cwd });
+    assert.equal(report.flows.length, 16);
+    assert.ok(report.flows.some(flow => flow.pending_segments_dropped), 'the global byte budget should drop a late out-of-order segment');
+    assert.ok(report.flows.every(flow => flow.sequence_gap && flow.reassembly_incomplete));
   } finally {
     await unlink(file).catch(() => {});
     await rmdir(cwd);

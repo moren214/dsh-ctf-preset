@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { generatePrimeSync } from 'node:crypto';
 import { test } from 'node:test';
 import { experimentRequestHash } from '../experiment-input.js';
 import { calculateSteps } from '../offline-calculation.js';
@@ -76,6 +77,21 @@ test('模逆不存在时给出公因数，同余核对返回非负余数', () =>
   assert.throws(() => calculateSteps([
     { operation: 'modular_inverse', inputs: [source, '17'] },
   ]), /须使用前序结果/u);
+});
+
+test('4096 位 RSA 因数攻击超出结果预算时仍保留精确明文', () => {
+  const q = generatePrimeSync(4095, { bigint: true });
+  const n = 2n * q;
+  const e = [3n, 5n, 7n, 11n, 13n, 17n].find(candidate => (q - 1n) % candidate !== 0n);
+  const ciphertext = n - 1n;
+  const report = calculateSteps([{
+    operation: 'rsa_attack', rsa_mode: 'factor', max_iterations: 1,
+    inputs: [n.toString(), e.toString(), ciphertext.toString()],
+  }]);
+  assert.equal(report.steps[0].status, 'computed');
+  const result = JSON.parse(report.steps[0].result);
+  assert.equal(result.plaintext, ciphertext.toString());
+  assert.ok(!('plaintext_truncated' in result));
 });
 
 test('超时后仅从下一步续算，并核对会话、参数和完整附件内容', async t => {

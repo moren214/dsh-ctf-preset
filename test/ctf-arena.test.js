@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { apply } from '../ctf-tools.js';
+import { resolveAdapter } from '../ctf-arena.js';
+import { platformRequest } from '../platform-request.js';
 
 function createRealWorkspaceContext(cwd, config = {}, writable = true) {
   const tools = new Map();
@@ -68,6 +70,26 @@ function createRealWorkspaceContext(cwd, config = {}, writable = true) {
   return { tools, execution };
 }
 
+test('platformRequest 真实 HTTP 请求只在有 JSON body 时发送 Content-Type', async t => {
+  const received = [];
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received.push({ method: req.method, contentType: req.headers['content-type'], body: Buffer.concat(chunks).toString('utf8') });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const config = { platformUrl: `http://127.0.0.1:${server.address().port}`, allowInsecurePlatformHttp: true };
+  await platformRequest(config, undefined, 'GET', '/status');
+  await platformRequest(config, undefined, 'POST', '/submissions', { challenge: '7', flag: 'flag{ok}' });
+  assert.equal(received[0].contentType, undefined);
+  assert.equal(received[0].body, '');
+  assert.equal(received[1].contentType, 'application/json');
+  assert.deepEqual(JSON.parse(received[1].body), { challenge: '7', flag: 'flag{ok}' });
+});
+
 async function startServer(handler) {
   const server = http.createServer(handler);
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -77,6 +99,101 @@ async function startServer(handler) {
     close: () => new Promise(resolve => server.close(resolve)),
   };
 }
+
+test('platformRequest 跟随同源 API 跳转并在授权前阻断跨来源跳转', async t => {
+  let externalHits = 0;
+  const external = await startServer((req, res) => {
+    externalHits += 1;
+    res.writeHead(200);
+    res.end('should not be requested');
+  });
+  t.after(() => external.close());
+
+  const tokenEnv = 'CTF_TEST_REDIRECT_TOKEN';
+  const previousToken = process.env[tokenEnv];
+  process.env[tokenEnv] = 'redirect_secret';
+  t.after(() => {
+    if (previousToken === undefined) delete process.env[tokenEnv];
+    else process.env[tokenEnv] = previousToken;
+  });
+  const platform = await startServer((req, res) => {
+    if (req.url === '/same-redirect') {
+      res.writeHead(302, { Location: '/target' });
+      res.end('redirecting');
+      return;
+    }
+    if (req.url === '/cross-redirect') {
+      res.writeHead(302, { Location: `${external.baseUrl}/secret` });
+      res.end('redirecting');
+      return;
+    }
+    if (req.url === '/target') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('same-origin target');
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  t.after(() => platform.close());
+
+  const config = {
+    platformUrl: platform.baseUrl,
+    platformTokenEnv: tokenEnv,
+    allowInsecurePlatformHttp: true,
+  };
+  const sameOrigin = await platformRequest(config, undefined, 'GET', '/same-redirect');
+  assert.equal(sameOrigin.status, 200);
+  assert.equal(sameOrigin.body, 'same-origin target');
+  assert.equal(sameOrigin.redirects.length, 1);
+
+  const crossOrigin = await platformRequest(config, undefined, 'GET', '/cross-redirect');
+  assert.equal(crossOrigin.status, 302);
+  assert.equal(crossOrigin.redirect_blocked, 'cross_origin_or_credentials');
+  assert.equal(externalHits, 0);
+});
+
+test('平台自动探测真实 HTTP 认证拒绝时不静默降级为 generic', async t => {
+  const server = await startServer((_req, res) => {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end('{"message":"login required"}');
+  });
+  t.after(() => server.close());
+  const config = { platformUrl: server.baseUrl, allowInsecurePlatformHttp: true };
+  await assert.rejects(resolveAdapter(config, 'auto'),
+    error => error.kind === 'permission' && /认证拒绝/u.test(error.message));
+  const controller = new AbortController();
+  controller.abort(Object.assign(new Error('request cancelled'), { name: 'AbortError' }));
+  await assert.rejects(resolveAdapter(config, 'auto', undefined, controller.signal),
+    error => error.name === 'AbortError' || error.kind === 'abort');
+});
+
+test('ctf_status 只读会话可查看实时看板但不写入状态文件', async t => {
+  const server = await startServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ me: { rank: 3, score: 240, solved: 4 } }));
+  });
+  t.after(() => server.close());
+  const cwd = await mkdtemp(join(tmpdir(), 'ctf-status-readonly-'));
+  try {
+    const { tools, execution } = createRealWorkspaceContext(cwd, {
+      platformUrl: server.baseUrl,
+      allowInsecurePlatformHttp: true,
+    }, false);
+    const board = JSON.parse(await tools.get('ctf_status').execute({ action: 'board' }, execution));
+    assert.equal(board.status, 'board');
+    assert.deepEqual(board.board, { rank: 3, score: 240, solved: 4 });
+    assert.equal(board.recorded, false);
+    const progress = JSON.parse(await tools.get('ctf_progress').execute({
+      action: 'save', revision: 'absent', progress: { confirmed: [], ruled_out: [], pending: [] },
+    }, execution));
+    assert.equal(progress.ok, false);
+    assert.equal(progress.error.kind, 'permission');
+    await assert.rejects(fsStat(join(cwd, '.ctf-status.json')));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
 
 test('ctf_arena 端到端适配 CTFd：自动探测、Token 认证、拉题、同步图谱幂等、下附件与提交 flag', async () => {
   const envKey = 'CTF_TEST_CTFD_TOKEN';
@@ -104,15 +221,20 @@ test('ctf_arena 端到端适配 CTFd：自动探测、Token 认证、拉题、�
         success: true,
         data: {
           id: 101, name: 'Baby Web', category: 'Web', value: 100, solved_by_me: false,
-          description: 'Visit http://10.20.30.40:8080/login or nc 10.20.30.40 31337',
-          connection_info: 'http://10.20.30.40:8080',
-          files: ['/files/chall.zip'],
+          description: `Visit ${server.baseUrl}/untrusted-description-link`,
+          connection_info: 'http://10.20.30.40:8080\nnc 10.20.30.40 31337',
+          files: Array.from({ length: 9 }, (_value, index) => `/files/chall${index + 1}.zip`),
           hints: [{ content: 'Check JWT header' }],
         },
       }));
       return;
     }
-    if (req.method === 'GET' && req.url === '/files/chall.zip') {
+    if (req.method === 'GET' && /^\/files\/chall\d+\.zip$/u.test(req.url)) {
+      if (req.headers.authorization !== 'Token ctfd_secret_abc123') {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'CTFd token required' }));
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
       res.end(fileBytes);
       return;
@@ -158,9 +280,13 @@ test('ctf_arena 端到端适配 CTFd：自动探测、Token 认证、拉题、�
 
     const detail = JSON.parse(await tools.get('ctf_arena').execute({ action: 'detail', challenge_id: '101' }, execution));
     assert.equal(detail.status, 'ok');
-    assert.equal(detail.files[0], `${server.baseUrl}/files/chall.zip`);
+    assert.equal(detail.files[0], `${server.baseUrl}/files/chall1.zip`);
     assert.ok(detail.authorized_targets.http.includes('http://10.20.30.40:8080'));
     assert.ok(detail.authorized_targets.tcp.includes('10.20.30.40:31337'));
+    const descriptionTarget = JSON.parse(await tools.get('http_request').execute({
+      url: `${server.baseUrl}/untrusted-description-link`,
+    }, execution));
+    assert.equal(descriptionTarget.ok, false, 'description 中的 URL 不应成为网络授权');
 
     // sync_graph 导入并验证二次同步严格幂等
     const sync1 = JSON.parse(await tools.get('ctf_arena').execute({ action: 'sync_graph', unsolved_only: true }, execution));
@@ -178,9 +304,12 @@ test('ctf_arena 端到端适配 CTFd：自动探测、Token 认证、拉题、�
 
     // fetch_files 下载附件并校验 SHA-256
     const fetched = JSON.parse(await tools.get('ctf_arena').execute({ action: 'fetch_files', challenge_id: '101' }, execution));
-    assert.equal(fetched.status, 'ok');
-    assert.equal(fetched.downloaded.length, 1);
+    assert.equal(fetched.status, 'partial');
+    assert.equal(fetched.total_files, 9);
+    assert.equal(fetched.omitted_file_count, 1);
+    assert.equal(fetched.downloaded.length, 8);
     assert.equal(fetched.downloaded[0].sha256, createHash('sha256').update(fileBytes).digest('hex'));
+    assert.ok(seenAuth.some(entry => /^\/files\/chall\d+\.zip$/u.test(entry.url) && entry.auth === 'Token ctfd_secret_abc123'));
 
     // submit 提交 flag
     const submitted = JSON.parse(await tools.get('ctf_arena').execute({
@@ -196,6 +325,7 @@ test('ctf_arena 端到端适配 CTFd：自动探测、Token 认证、拉题、�
 });
 
 test('ctf_arena 端到端适配 GZCTF：games、分组题单、容器启删自动授权、GZCTF 判题归一化与只读拦截', async () => {
+  let submissionRequests = 0;
   const server = await startServer((req, res) => {
     if (req.method === 'GET' && req.url === '/api/game') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -223,12 +353,13 @@ test('ctf_arena 端到端适配 GZCTF：games、分组题单、容器启删自�
       return;
     }
     if (req.method === 'POST' && req.url === '/api/game/7/challenges/12') {
+      submissionRequests += 1;
       let body = '';
       req.on('data', chunk => { body += chunk; });
       req.on('end', () => {
         const parsed = JSON.parse(body);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(parsed.flag === 'flag{gz_win}' ? 'Accepted' : 'WrongAnswer'));
+        res.end(JSON.stringify(['flag{gz_win}', 'flag{gz_dynamic_win}'].includes(parsed.flag) ? 'Accepted' : 'WrongAnswer'));
       });
       return;
     }
@@ -258,12 +389,35 @@ test('ctf_arena 端到端适配 GZCTF：games、分组题单、容器启删自�
       action: 'container', challenge_id: '12', container_action: 'create',
     }, execution));
     assert.equal(created.status, 'created');
+    assert.equal(created.instance_id, 'container:12');
+    assert.equal(created.instance_recorded, true);
     assert.ok(created.authorized_targets.tcp.includes('10.99.0.5:23456'));
+
+    const untrackedDynamic = JSON.parse(await tools.get('ctf_arena').execute({
+      action: 'submit', challenge_id: '12', flag: 'flag{gz_win}', source: 'test', dynamic: true,
+      instance: 'not-recorded', refreshed_at: new Date().toISOString(),
+    }, execution));
+    assert.equal(untrackedDynamic.verdict, 'rejected_local');
+    assert.equal(submissionRequests, 0, '未登记实例不能把调用方时间戳当作新鲜度证明');
+
+    const trackedDynamic = JSON.parse(await tools.get('ctf_arena').execute({
+      action: 'submit', challenge_id: '12', flag: 'flag{gz_dynamic_win}', source: 'test', dynamic: true,
+      instance: 'container:12', refreshed_at: '2020-01-01T00:00:00.000Z',
+    }, execution));
+    assert.equal(trackedDynamic.verdict, 'accepted', JSON.stringify(trackedDynamic));
+    assert.equal(submissionRequests, 1, '账本中的刷新时间应覆盖伪造的旧时间戳');
 
     const deleted = JSON.parse(await tools.get('ctf_arena').execute({
       action: 'container', challenge_id: '12', container_action: 'delete',
     }, execution));
     assert.equal(deleted.status, 'deleted');
+
+    const deletedDynamic = JSON.parse(await tools.get('ctf_arena').execute({
+      action: 'submit', challenge_id: '12', flag: 'flag{gz_win}', source: 'test', dynamic: true,
+      instance: 'container:12', refreshed_at: new Date().toISOString(),
+    }, execution));
+    assert.equal(deletedDynamic.verdict, 'rejected_local');
+    assert.equal(submissionRequests, 1, '已删除实例不能提交，即使调用方传入当前时间');
 
     const bad = JSON.parse(await tools.get('ctf_arena').execute({
       action: 'submit', challenge_id: '12', flag: 'flag{wrong_try}', source: 'test',
@@ -360,5 +514,62 @@ test('ctf_arena: GZCTF 自动 Cookie 鉴权、容器 extend 续期与同分按�
     await rm(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
     if (prev === undefined) delete process.env[envKey];
     else process.env[envKey] = prev;
+  }
+});
+
+test('submit_flag 动态 flag 只信任新鲜实例账本，不接受调用方伪造 refreshed_at', async () => {
+  let submitRequests = 0;
+  const server = await startServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/instances') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ data: { id: 'instance-42' } }));
+      return;
+    }
+    if (req.method === 'DELETE' && req.url === '/instances/instance-42') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/submissions') {
+      submitRequests += 1;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ correct: true }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  const cwd = await mkdtemp(join(tmpdir(), 'ctf-dynamic-submit-'));
+  try {
+    const config = { platformUrl: server.baseUrl, platformType: 'generic', allowInsecurePlatformHttp: true };
+    const { tools, execution } = createRealWorkspaceContext(cwd, config, true);
+    const forgedUntracked = JSON.parse(await tools.get('submit_flag').execute({
+      challenge: 'web-1', flag: 'flag{dynamic_win}', source: 'test', dynamic: true,
+      instance: 'instance-42', refreshed_at: new Date().toISOString(),
+    }, execution));
+    assert.equal(forgedUntracked.verdict, 'rejected_local');
+    assert.equal(submitRequests, 0);
+
+    const created = JSON.parse(await tools.get('ctf_instance').execute({ action: 'create' }, execution));
+    assert.equal(created.id, 'instance-42');
+    assert.equal(created.instance_recorded, true);
+    const trusted = JSON.parse(await tools.get('submit_flag').execute({
+      challenge: 'web-1', flag: 'flag{dynamic_win}', source: 'test', dynamic: true,
+      instance: 'instance-42', refreshed_at: '2020-01-01T00:00:00.000Z',
+    }, execution));
+    assert.equal(trusted.verdict, 'accepted', JSON.stringify(trusted));
+    assert.equal(submitRequests, 1);
+
+    const deleted = JSON.parse(await tools.get('ctf_instance').execute({ action: 'delete', id: 'instance-42' }, execution));
+    assert.equal(deleted.status, 'deleted');
+    const afterDelete = JSON.parse(await tools.get('submit_flag').execute({
+      challenge: 'web-1', flag: 'flag{different_dynamic}', source: 'test', dynamic: true,
+      instance: 'instance-42', refreshed_at: new Date().toISOString(),
+    }, execution));
+    assert.equal(afterDelete.verdict, 'rejected_local');
+    assert.equal(submitRequests, 1);
+  } finally {
+    await server.close();
+    await rm(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
   }
 });

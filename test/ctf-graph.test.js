@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { apply } from '../ctf-tools.js';
 import { GRAPH_BACKUP, GRAPH_BOARD, GRAPH_FILE, manageGraph } from '../ctf-graph.js';
@@ -28,6 +32,127 @@ function createCasMemoryFiles({ canWrite = true } = {}) {
     },
   };
 }
+
+function createDiskCasFiles(root) {
+  const targetPath = name => join(root, ...name.split('/'));
+  const versionOf = text => createHash('sha256').update(text).digest('hex');
+  return {
+    canWrite: true,
+    async read(name) {
+      try {
+        const text = await readFile(targetPath(name), 'utf8');
+        return { name, target: targetPath(name), text, version: versionOf(text) };
+      } catch (error) {
+        if (error.code === 'ENOENT') return { name, target: targetPath(name), text: '', version: undefined };
+        throw error;
+      }
+    },
+    async write(document, body) {
+      const destination = targetPath(document.name);
+      await mkdir(dirname(destination), { recursive: true });
+      const lockPath = destination + '.lock';
+      let locked = false;
+      for (let attempt = 0; attempt < 1000; attempt += 1) {
+        try {
+          await mkdir(lockPath);
+          locked = true;
+          break;
+        } catch (error) {
+          if (error.code !== 'EEXIST') throw error;
+          await new Promise(resolve => setTimeout(resolve, 2 + Math.random() * 4));
+        }
+      }
+      if (!locked) throw new Error('test filesystem lock timed out');
+      try {
+        const current = await this.read(document.name);
+        if (current.version !== document.version) {
+          const error = new Error('real disk CAS conflict');
+          error.code = 'CONFLICT';
+          throw error;
+        }
+        const temporary = destination + '.' + randomUUID() + '.tmp';
+        await writeFile(temporary, body, 'utf8');
+        await rename(temporary, destination);
+      } finally {
+        await rm(lockPath, { recursive: true, force: true });
+      }
+    },
+  };
+}
+
+test('ctf_graph 在真实磁盘上承受 5 路并发 CAS 写入且不丢 Fact', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'ctf-graph-disk-cas-'));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 40 }));
+  const writers = Array.from({ length: 5 }, (_, worker) => (async () => {
+    const files = createDiskCasFiles(root);
+    for (let index = 0; index < 40; index += 1) {
+      const added = await manageGraph({
+        action: 'add_fact', challenge: `worker-${worker}`, kind: 'note',
+        title: `disk fact ${worker}-${index}`, dedupe_key: `disk:${worker}:${index}`,
+        spawn_intents: [{ title: `disk intent ${worker}-${index}` }],
+      }, files);
+      const claim = await manageGraph({
+        action: 'claim_intent', intent_id: added.spawned_intents[0].id, owner: `disk-worker-${worker}`,
+      }, files);
+      assert.equal(claim.status, 'claimed');
+    }
+  })());
+  await Promise.all(writers);
+  const board = await manageGraph({ action: 'board' }, createDiskCasFiles(root));
+  assert.equal(board.counts.facts, 200);
+  assert.equal(board.counts.claimed, 200);
+});
+
+test('ctf_graph 真实磁盘写入超过旧 500 Fact 上限并可分页读取', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'ctf-graph-limit-'));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 40 }));
+  const created = new Date().toISOString();
+  const facts = Array.from({ length: 500 }, (_, index) => ({
+    id: `F-${index + 1}`, challenge: 'large-board', kind: 'note', title: `seed ${index + 1}`, created_at: created,
+  }));
+  await mkdir(join(root, '.ctf-graph'), { recursive: true });
+  await writeFile(join(root, GRAPH_FILE), JSON.stringify({ schema_version: 1, revision: 500, updated_at: created, facts, intents: [] }));
+  const files = createDiskCasFiles(root);
+  const added = await manageGraph({ action: 'add_fact', challenge: 'large-board', title: 'fact 501' }, files);
+  assert.equal(added.status, 'ok');
+  assert.equal(added.fact.id, 'F-501');
+  const board = await manageGraph({ action: 'board', challenge: 'large-board', limit: 10, offset: 500 }, files);
+  assert.equal(board.counts.facts, 501);
+  assert.equal(board.facts[0].id, 'F-501');
+});
+
+test('ctf_graph 真实磁盘拒绝未认领结案并按 offset 分页返回 ruled_out', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'ctf-graph-lease-page-'));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 40 }));
+  const files = createDiskCasFiles(root);
+  for (let index = 1; index <= 3; index += 1) {
+    await manageGraph({ action: 'add_intent', challenge: 'paging', title: `route ${index}` }, files);
+  }
+
+  const before = await manageGraph({ action: 'board', challenge: 'paging' }, files);
+  const unclaimed = await manageGraph({
+    action: 'finish_intent', intent_id: 'I-1', status: 'dead', outcome: 'must claim first',
+  }, files);
+  assert.equal(unclaimed.status, 'conflict');
+  assert.equal(unclaimed.intent_status, 'open');
+  assert.equal(unclaimed.revision, before.revision);
+
+  for (let index = 1; index <= 3; index += 1) {
+    const claim = await manageGraph({ action: 'claim_intent', intent_id: `I-${index}`, owner: 'disk-worker' }, files);
+    assert.equal(claim.status, 'claimed');
+    await manageGraph({
+      action: 'finish_intent', intent_id: `I-${index}`, owner: 'disk-worker', lease_id: claim.lease_id,
+      status: 'dead', outcome: `excluded route ${index}`,
+    }, files);
+  }
+
+  const page = await manageGraph({ action: 'board', challenge: 'paging', limit: 1, offset: 1 }, files);
+  assert.deepEqual(page.ruled_out.map(item => item.id), ['I-2']);
+  assert.equal(page.ruled_out[0].outcome, 'excluded route 2');
+  assert.equal(page.paging.total_ruled_out, 3);
+  assert.equal(page.paging.has_more_ruled_out, true);
+  assert.equal(page.paging.next_offset, 2);
+});
 
 test('ctf_graph: add_fact 派生任务、dedupe_key 去重、board 轻量索引与 expand 按需展开', async () => {
   const files = createCasMemoryFiles();
@@ -78,8 +203,10 @@ test('ctf_graph: add_fact 派生任务、dedupe_key 去重、board 轻量索引�
   assert.equal(board.facts[0].has_evidence, true);
 
   // 标记一条 dead（已排除路径），确认 board.ruled_out 与 BOARD.md 分区渲染正确
+  const exclusionClaim = await manageGraph({ action: 'claim_intent', intent_id: 'I-2', owner: 'worker-exclusion' }, files);
   await manageGraph({
-    action: 'finish_intent', intent_id: 'I-2', status: 'dead', outcome: '账号无 FILE 权限，排除读文件路线',
+    action: 'finish_intent', intent_id: 'I-2', owner: 'worker-exclusion', lease_id: exclusionClaim.lease_id,
+    status: 'dead', outcome: '账号无 FILE 权限，排除读文件路线',
   }, files);
   const boardWithDead = await manageGraph({ action: 'board' }, files);
   assert.equal(boardWithDead.counts.dead, 1);
@@ -152,7 +279,8 @@ test('ctf_graph: 超时 overdue 检测、steal_overdue 接管、finish_intent �
   await manageGraph({
     action: 'add_intent', challenge: 'rev-01', title: '逆向主校验函数', priority: 4, budget_minutes: 10,
   }, files, { now });
-  await manageGraph({ action: 'claim_intent', intent_id: 'I-1', owner: 'worker-1' }, files, { now });
+  const firstClaim = await manageGraph({ action: 'claim_intent', intent_id: 'I-1', owner: 'worker-1' }, files, { now });
+  assert.match(firstClaim.lease_id, /^[0-9a-f-]{36}$/u);
 
   // 5 分钟后未超时，无法接管
   clock += 5 * 60000;
@@ -174,12 +302,14 @@ test('ctf_graph: 超时 overdue 检测、steal_overdue 接管、finish_intent �
   assert.equal(stolen.status, 'stolen');
   assert.equal(stolen.previous_owner, 'worker-1');
   assert.equal(stolen.intent.owner, 'worker-2');
+  assert.notEqual(stolen.lease_id, firstClaim.lease_id);
 
   // 滞后的旧持有者 worker-1 不能越权结案，且不递增 revision
   const staleFinish = await manageGraph({
     action: 'finish_intent',
     intent_id: 'I-1',
     owner: 'worker-1',
+    lease_id: firstClaim.lease_id,
     status: 'dead',
     outcome: '滞后超时结果不应覆盖 worker-2',
   }, files, { now });
@@ -188,11 +318,18 @@ test('ctf_graph: 超时 overdue 检测、steal_overdue 接管、finish_intent �
   assert.equal(staleFinish.attempted_owner, 'worker-1');
   assert.equal(staleFinish.revision, stolen.revision);
 
+  const sameOwnerStaleFinish = await manageGraph({
+    action: 'finish_intent', intent_id: 'I-1', owner: 'worker-2', lease_id: firstClaim.lease_id,
+    status: 'dead', outcome: '同名工作槽的旧租约不得结案',
+  }, files, { now });
+  assert.equal(sameOwnerStaleFinish.status, 'conflict');
+
   // finish_intent 原子产出新 Fact 与后续 Intent
   const finished = await manageGraph({
     action: 'finish_intent',
     intent_id: 'I-1',
     owner: 'worker-2',
+    lease_id: stolen.lease_id,
     status: 'done',
     outcome: '已定位 RC4 变形与固定密钥',
     facts: [{ kind: 'crypto', title: '密钥为 s3cr3t_rc4', evidence: '0x402010' }],
@@ -342,6 +479,8 @@ test('ctf_graph: dispatch_plan 按优先级分派不同题目、避开进行中�
     action: 'dispatch_plan', max_workers: 3, allow_same_challenge: true,
   }, files, { now });
   assert.deepEqual(sameAllowed.assignments.map(a => a.intent_id), ['I-2', 'I-4']);
+  const issuedSlots = [...plan.assignments, ...sameAllowed.assignments].map(item => item.worker_slot);
+  assert.equal(new Set(issuedSlots).size, issuedSlots.length, '不同分派结果不能复用 worker 槽位');
 });
 
 test('ctf_graph: board 分页/状态过滤/summary_only 与 export_writeup 导出', async () => {
@@ -363,9 +502,9 @@ test('ctf_graph: board 分页/状态过滤/summary_only 与 export_writeup 导�
   }, files, { now });
 
   // 认领并完成 I-1，让 I-2 超时，I-3 保持 open
-  await manageGraph({ action: 'claim_intent', intent_id: 'I-1', owner: 'w1' }, files, { now });
+  const claim = await manageGraph({ action: 'claim_intent', intent_id: 'I-1', owner: 'w1' }, files, { now });
   await manageGraph({
-    action: 'finish_intent', intent_id: 'I-1', owner: 'w1', status: 'done',
+    action: 'finish_intent', intent_id: 'I-1', owner: 'w1', lease_id: claim.lease_id, status: 'done',
     outcome: '成功读取 /flag 得到 flag{graph_export_ok}',
     facts: [{ kind: 'flag', title: 'flag{graph_export_ok}', evidence: 'http_request:R-2' }],
   }, files, { now });
