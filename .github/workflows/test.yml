@@ -23,19 +23,18 @@ jobs:
         run: npm run check
       - name: Unit tests with coverage floor
         shell: bash
+        id: suite
+        continue-on-error: true
         run: |
           set -o pipefail
           npm run test:coverage 2>&1 | tee test-output.txt
-      - name: Turn failing tests into annotations
-        if: failure()
+      - name: Turn failures into annotations
+        if: steps.suite.outcome == 'failure'
         shell: bash
-        run: |
-          if [ -f test-output.txt ]; then
-            grep -E '^✖ ' test-output.txt | sed 's/^✖ //' | sort -u | head -30 | while IFS= read -r name; do
-              printf '::error title=failing test::%s\n' "$name"
-            done
-          fi
-          exit 0
+        run: node scripts/ci-annotate.mjs test-output.txt
+      - name: Propagate the suite result
+        if: steps.suite.outcome == 'failure'
+        run: exit 1
 
   python-workers:
     runs-on: ubuntu-latest
