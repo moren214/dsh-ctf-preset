@@ -161,7 +161,7 @@ test('workbench-config 支持配置文件热重载，动态修改白名单立即
   }
 });
 
-test('workbench-config 热重载 pythonPath 后重新探测真实 Python 可执行文件', async () => {
+test('workbench-config 热重载 pythonPath 后重新探测真实 Python 可执行文件', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'ctf-python-hot-reload-'));
   const file = join(dir, 'ctf-workbench.json');
   const venv = join(dir, 'venv');
@@ -170,7 +170,14 @@ test('workbench-config 热重载 pythonPath 后重新探测真实 Python 可执�
       process.platform === 'win32'
         ? ['-3', '-I', '-c', 'import sys; print(sys.executable)']
         : ['-I', '-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).trim();
-    execFileSync(python, ['-I', '-m', 'venv', venv], { stdio: 'pipe' });
+    try {
+      execFileSync(python, ['-I', '-m', 'venv', venv], { stdio: 'pipe' });
+    } catch (error) {
+      // Debian/Ubuntu 上 python3 默认不带 venv 模块（要装 python3-venv）；这是环境缺陷，
+      // 不是被测行为，直接跳过并说明如何补齐。
+      t.skip(`当前 Python 无法创建 venv（${error.message.split('\n')[0]}），请安装 python3-venv 后重跑。`);
+      return;
+    }
     const venvPython = join(venv, process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
     await writeFile(file, JSON.stringify({ pythonPath: python }));
     const env = createWorkbenchEnvironment({}, file);

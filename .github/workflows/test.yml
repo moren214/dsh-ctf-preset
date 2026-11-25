@@ -16,10 +16,26 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Install venv support（Ubuntu 的 python3 默认不带 venv 模块）
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-venv
       - name: Check every module and local import
         run: npm run check
       - name: Unit tests with coverage floor
-        run: npm run test:coverage
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run test:coverage 2>&1 | tee test-output.txt
+      - name: Turn failing tests into annotations
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f test-output.txt ]; then
+            grep -E '^✖ ' test-output.txt | sed 's/^✖ //' | sort -u | head -30 | while IFS= read -r name; do
+              printf '::error title=failing test::%s\n' "$name"
+            done
+          fi
+          exit 0
 
   python-workers:
     runs-on: ubuntu-latest

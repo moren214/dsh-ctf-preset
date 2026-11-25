@@ -664,20 +664,29 @@ test('browser-gateway 本地 HTTP 代理与 CONNECT 隧道授权放行/拒绝', 
 });
 
 test('browser-session 单次操作超时后保留会话，不触发全局清理', async () => {
-  let stopped = 0;
-  const session = createBrowserSession({
-    resolveBinary: async () => undefined,
-    authorize: async () => undefined,
-    environment: () => process.env,
-    onStart() {},
-    onStop() { stopped++; },
-  });
-  await assert.rejects(session.run(20, undefined, signal => new Promise((_, reject) => {
-    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-  })), /浏览器操作超时/u);
-  assert.equal(stopped, 0);
-  await session.close();
-  assert.equal(stopped, 1);
+  // browser-session.js 用 AbortSignal.timeout() 做操作超时，而它的计时器是 unref 的。
+  // 这里没有真实浏览器子进程，若事件循环里没有别的句柄，进程会在超时触发前就排空，
+  // Node 22+ 会把用例报成 "Promise resolution is still pending"（CI 上偶发）。
+  // 用一个 interval 保住事件循环，被测语义不变。
+  const keepAlive = setInterval(() => {}, 25);
+  try {
+    let stopped = 0;
+    const session = createBrowserSession({
+      resolveBinary: async () => undefined,
+      authorize: async () => undefined,
+      environment: () => process.env,
+      onStart() {},
+      onStop() { stopped++; },
+    });
+    await assert.rejects(session.run(20, undefined, signal => new Promise((_, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    })), /浏览器操作超时/u);
+    assert.equal(stopped, 0);
+    await session.close();
+    assert.equal(stopped, 1);
+  } finally {
+    clearInterval(keepAlive);
+  }
 });
 
 test('net-session 长连接 TCP 全流程（connect/list/read_until/send/recv/二进制 hexdump/close/权限拦截）', async () => {

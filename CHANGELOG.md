@@ -1,5 +1,12 @@
 # 变更记录
 
+## 0.51.2
+
+- **CI 失败原因可见**：`test` job 用 `tee` 保留完整输出，并在失败时把每个 `✖` 用例名转成 GitHub 注解——此前注解只有 `Process completed with exit code 1`，公开仓库上无法定位是哪条用例挂了。
+- **测试不再依赖事件循环"恰好还有句柄"**：`browser-session` 的操作超时用 `AbortSignal.timeout()`，其计时器是 unref 的；该用例没有真实浏览器子进程，在容器/CI 上事件循环先排空，Node 22 报 `Promise resolution is still pending`，随后同文件 5 条用例被级联取消（`cancelledByParent`）。现用 interval 保住事件循环，被测语义不变。
+- **`python3 -m venv` 缺失时优雅跳过**：热重载用例原先直接 `execFileSync`，在没装 `python3-venv` 的 Debian/Ubuntu 上整条用例失败并拖垮同文件；现捕获后 `t.skip()` 并提示安装方式，CI 的 Ubuntu 侧则预装 `python3-venv` 保证真实执行。
+- 回归测试仍 180 项。
+
 ## 0.51.1
 
 - **基础镜像恢复 r2/r2ghidra**：`WITH_R2=1`（默认值）此前从未真正构建成功，三个独立缺陷叠加：缺 `patch`（radare2 的 `configure` 直接 `error: This program is required.`）、`sys/install.sh` 默认 `symstall` 在清理构建目录后让 `/usr/local/bin/r2` 与 `r_core.pc` 全部悬空、r2ghidra 取 master 与 r2 5.9.8 的 ABI 冲突（`RFlagItem` 无 `addr` 成员）。现改为 6a/6b 两层：radare2 走 `./configure --prefix=/usr/local && make -j && make install` + `ldconfig`，r2ghidra 按同号 tag `R2GHIDRA_VERSION=5.9.8` 克隆后 `./configure && make -j && make install`。
