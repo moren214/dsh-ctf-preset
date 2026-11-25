@@ -610,18 +610,6 @@ test('DECOMPILE_SCRIPT：r2 单次进程分析回退 pdc，Ghidra 按二进制 S
     assert.equal(first.cached_project, false, JSON.stringify(first));
     assert.equal(first.program_name, undefined);
 
-    // Windows runner 的 ANSI 代码页是 cp1252，脚本里的中文会让默认编码的 write() 抛
-    // UnicodeEncodeError，上层当成 Ghidra 失败后静默回退 objdump。Linux 上把本地化
-    // 降到 C 就能复现同一条路径，用来锁住「必须显式 UTF-8 写脚本」这个修复。
-    if (process.platform !== 'win32') {
-      const asciiLocale = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
-        cwd: workDir,
-        encoding: 'utf8',
-        env: { ...ghEnv, PYTHONUTF8: '0', LC_ALL: 'C', LANG: 'C' },
-      }).trim());
-      assert.equal(asciiLocale.engine, 'ghidra', JSON.stringify(asciiLocale));
-    }
-
     const emptyGhidra = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
       cwd: workDir, encoding: 'utf8', env: { ...ghEnv, FAKE_GHIDRA_EMPTY: '1' },
     }).trim());
@@ -688,6 +676,28 @@ test('DECOMPILE_SCRIPT：r2 单次进程分析回退 pdc，Ghidra 按二进制 S
     assert.ok(ghCalls[7].includes('-process'));
     assert.ok(ghCalls[3].includes('-noanalysis'));
     assert.ok(ghCalls[3].includes('-readOnly'));
+
+    // Windows runner 的 ANSI 代码页是 cp1252，脚本里的中文会让默认编码的 write() 抛
+    // UnicodeEncodeError，上层当成 Ghidra 失败后静默回退 objdump。Linux 上把本地化
+    // 降到 C 就能复现同一条路径，用来锁住「必须显式 UTF-8 写脚本」这个修复。
+    if (process.platform !== 'win32') {
+      // 脚本里有中文；直接把脚本经 `-c` 传给 C locale 的 python 会在 argv 解码阶段就失败，
+      // 所以落成文件再执行，才能让「默认编码的 open()」成为唯一的失败点。
+      const asciiScript = join(workDir, 'decompile_ascii.py');
+      await writeFile(asciiScript, DECOMPILE_SCRIPT, 'utf8');
+      let asciiText;
+      try {
+        asciiText = execFileSync(python, [asciiScript, 'sample.bin', 'check', 'ghidra'], {
+          cwd: workDir,
+          encoding: 'utf8',
+          env: { ...ghEnv, PYTHONUTF8: '0', LC_ALL: 'C', LANG: 'C' },
+        });
+      } catch (error) {
+        assert.fail(`ASCII locale 运行失败：${String(error.stderr ?? error.message).slice(-1200)}`);
+      }
+      const asciiLocale = JSON.parse(asciiText.trim());
+      assert.equal(asciiLocale.engine, 'ghidra', JSON.stringify(asciiLocale));
+    }
   } finally {
     await rm(workDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 120 });
   }
