@@ -31,6 +31,20 @@ const failing = [...new Set(lines.map(failureName).filter(Boolean))];
 
 if (failing.length > 0) {
   for (const name of failing.slice(0, 20)) emit('failing test', name);
+  // 失败用例的诊断通常在其后若干行，单独抓一段，免得只知道名字不知道原因。
+  const details = [];
+  lines.forEach((line, index) => {
+    if (!failureName(line)) return;
+    const block = [];
+    for (let cursor = index + 1; cursor < lines.length && block.length < 30; cursor += 1) {
+      const next = lines[cursor];
+      if (/^(?:ok|not ok)\s+\d+/u.test(next)) break;
+      block.push(next);
+    }
+    const joined = block.join(' / ').trim();
+    if (joined) details.push(`${failureName(line)} => ${joined}`);
+  });
+  if (details.length > 0) emit('failing detail', details.join(' /// ').slice(-3500));
 } else {
   emit('failure without a ✖ line', '测试输出里没有失败用例行，可能是覆盖率门槛或运行期错误。');
 }
