@@ -32,6 +32,19 @@ def vint(data, offset, end):
     raise ValueError("Incomplete RAR5 header integer")
 
 
+SEVEN_Z_SIGNATURE = b"7z\xbc\xaf\x27\x1c"
+
+
+def seven_zip_volume(data):
+    """Reject anything that is not a 7z container before libarchive sees it.
+
+    libarchive 3.7 (Ubuntu 24.04) segfaults inside its 7z reader when the
+    buffer has no 7z signature, so the signature and the minimum header
+    length must be checked in this process instead of probing the library.
+    """
+    return len(data) >= 32 and data[:6] == SEVEN_Z_SIGNATURE
+
+
 def rar_volume(data, variant):
     if variant == "RAR4":
         if len(data) < 14 or data[9] != 0x73:
@@ -114,6 +127,8 @@ def load_libarchive(path):
 def read_directory(data, variant, offset, limit, member_index=None, library_path=None):
     if rar_volume(data, variant):
         return {"status": "unsupported", "volume": True, "reason": "当前目录检查覆盖单卷 RAR。"}
+    if variant == "7z" and not seven_zip_volume(data):
+        return {"status": "invalid", "reason": "归档目录不完整或结构无效。", "detail": "缺少 7z 文件签名。"}
 
     try:
         lib = load_libarchive(library_path)

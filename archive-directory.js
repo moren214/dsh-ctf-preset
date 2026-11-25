@@ -7,6 +7,7 @@ import { WorkbenchDependencyError } from './workbench-config.js';
 
 const SCRIPT = readFileSync(new URL('./archive-directory-worker.py', import.meta.url), 'utf8');
 const RESPONSE_LIMIT = 256 * 1024;
+const STDERR_EXCERPT = 2048;
 const TIMEOUT_MS = 15000;
 const SIGNATURES = [
   { format: '7z', variant: '7z', signature: Buffer.from('377abcaf271c', 'hex') },
@@ -34,7 +35,7 @@ async function readArchive(bytes, [variant, offset, limit, memberIndex], signal,
   const responseLimit = memberIndex === undefined ? RESPONSE_LIMIT
     : Math.max(RESPONSE_LIMIT, 4 * Math.ceil(Math.min(limit, MAX_ARCHIVE_MEMBER_BYTES) / 3) + 8192);
   const python = spawn(interpreter, ['-I', '-S', '-B', '-c', SCRIPT, ...args],
-    { cwd: dirname(interpreter), shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+    { cwd: dirname(interpreter), shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
   return new Promise((resolve, reject) => {
     const chunks = [];
     let length = 0;
@@ -56,6 +57,14 @@ async function readArchive(bytes, [variant, offset, limit, memberIndex], signal,
     const timer = setTimeout(() => finish(new Error('归档目录检查响应超时。')), TIMEOUT_MS);
     signal?.addEventListener('abort', abort, { once: true });
     python.once('error', () => finish(new Error('无法启动本机归档读取器。')));
+    // 解析器崩溃时真正的线索在 stderr（Python traceback 或动态库报错），
+    // 丢掉它就只能回一句「异常退出」，线上无法定位。
+    let stderr = '';
+    python.stderr.setEncoding('utf8');
+    python.stderr.on('data', chunk => {
+      if (stderr.length < STDERR_EXCERPT) stderr += chunk.slice(0, STDERR_EXCERPT - stderr.length);
+    });
+    python.stderr.on('error', () => {});
     python.stdin.on('error', error => {
       if (error.code !== 'EPIPE') finish(new Error('无法将原件内容送入归档读取器。'));
     });
@@ -65,9 +74,13 @@ async function readArchive(bytes, [variant, offset, limit, memberIndex], signal,
       if (length > responseLimit) finish(new Error('本机归档读取器的响应过长。'));
       else chunks.push(chunk);
     });
-    python.once('close', code => {
+    python.once('close', (code, signal) => {
       if (finished) return;
-      if (code !== 0) return finish(new Error('本机归档读取器异常退出。'));
+      if (code !== 0) {
+        const how = signal ? `被信号 ${signal} 终止` : `退出码 ${code}`;
+        const excerpt = stderr.trim().replace(/\s+/gu, ' ').slice(0, 320);
+        return finish(new Error(`本机归档读取器异常退出（${how}）${excerpt ? `：${excerpt}` : ''}`));
+      }
       try {
         finish(undefined, JSON.parse(Buffer.concat(chunks, length).toString('utf8')));
       } catch {

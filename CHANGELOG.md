@@ -1,5 +1,11 @@
 # 变更记录
 
+## 0.51.3
+
+- **非 7z 字节不再喂给 libarchive**：Ubuntu 24.04 的 libarchive 3.7 在 7z 读取器上收到无签名短缓冲区会 SIGSEGV（实测 `printf "not a 7z archive" | python3 archive-directory-worker.py 7z 0 4 ""` → exit 139），worker 被信号杀掉后 JS 只能报「本机归档读取器异常退出」，CI 上这条用例必然失败。现在签名与最短头部长度在 Python 侧先校验，直接返回 `status: "invalid"` 与 `detail: "缺少 7z 文件签名。"`。
+- **归档读取器崩溃时能看到原因**：`archive-directory.js` 的 stderr 由 `ignore` 改为收集（上限 2 KiB），异常退出时错误信息带上退出码或信号，以及 traceback 摘要，不再只有一句「异常退出」。
+- 回归测试增至 181 项（新增「非 7z 字节必须在进入 libarchive 之前被拒绝」）。
+
 ## 0.51.2
 
 - **CI 失败原因可见**：`test` job 用 `tee` 保留完整输出，并在失败时把每个 `✖` 用例名转成 GitHub 注解——此前注解只有 `Process completed with exit code 1`，公开仓库上无法定位是哪条用例挂了。
@@ -216,7 +222,7 @@
 
 | 插件版本 | DSH 版本 | 说明 |
 |---|---|---|
-| 0.51.x | `>=0.2.2-rc.5 <0.3.0` | 当前版本。补审计回归用例、CI 容器冒烟与镜像 digest/SHA-256 锁定，提交账本坏行可见；基础镜像恢复 r2/r2ghidra 并修好 r2 反编译调用。 |
+| 0.51.x | `>=0.2.2-rc.5 <0.3.0` | 当前版本。补审计回归用例、CI 容器冒烟与镜像 digest/SHA-256 锁定，提交账本坏行可见；基础镜像恢复 r2/r2ghidra 并修好 r2 反编译调用；7z 容器先验签，避免 Ubuntu 24.04 的 libarchive 段错误。 |
 | 0.50.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。保持 Core Tier（27 核心 / 45 全量）；精简 `ctf_progress` schema、新增 `ctf_graph` 分页/`export_writeup`、`ctf_arena` GZCTF Cookie/续期/solves 排优、`browser_session` Web 进阶、Docker 加固与 `bkcrack`/`ffuf`/`sqlmap` 等兵器、`mobile_apk` 沙箱桥接、`inspect_media(kind: "model")` 及 3 个密码学脚手架。 |
 | 0.49.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。默认 Core Tier（27 工具，`enableExtendedAudit: true` 恢复全部 45 工具）；新增 `ctf_sandbox`（双层镜像自动路由/WSL2 兜底）、`ctf_graph`、`ctf_arena` 与 `crypto_solver solve`。 |
 | 0.48.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。函数级 Rev 控制流分析，以及 ZIP 候选检查、文件片段复读和压缩附件链路需要对应工具及宿主能力。 |

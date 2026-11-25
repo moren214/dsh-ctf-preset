@@ -204,6 +204,24 @@ test('ctf_sandbox 的返回必须带 result_id（零拷贝链路）', async t =>
   assert.match(report.result_id ?? '', RESULT_HASH, '沙箱状态输出必须带 result_id');
 });
 
+test('非 7z 字节必须在进入 libarchive 之前被拒绝（Ubuntu 24.04 会段错误）', async t => {
+  if (!pythonAvailable()) return t.skip('需要本机 Python 解释器。');
+  const { inspectNativeArchive } = await import('../archive-directory.js');
+  const workbench = { async resolvePython() { return PYTHON; }, library() { return ''; } };
+  const paging = { offset: 0, limit: 4 };
+  // 实测：Ubuntu 24.04 的 libarchive 3.7 在 7z 读取器上收到无签名短缓冲区会 SIGSEGV，
+  // 整个 worker 被信号杀掉，JS 侧只能报「异常退出」——必须在 Python 侧先验签。
+  const garbage = await inspectNativeArchive(Buffer.from('not a 7z archive'),
+    { format: '7z', variant: '7z' }, paging, undefined, workbench);
+  assert.equal(garbage.status, 'invalid');
+  assert.match(String(garbage.detail ?? ''), /7z 文件签名/u, '必须是签名预检拒绝，而不是库崩溃');
+  // 带正确签名但正文损坏时仍应交给 libarchive 判定，预检不能把合法容器挡掉。
+  const signed = Buffer.concat([Buffer.from('377abcaf271c', 'hex'), Buffer.alloc(26)]);
+  const truncated = await inspectNativeArchive(signed, { format: '7z', variant: '7z' }, paging, undefined, workbench);
+  assert.ok(['invalid', 'dependency_missing'].includes(truncated.status), JSON.stringify(truncated));
+  if (truncated.status === 'invalid') assert.doesNotMatch(String(truncated.detail ?? ''), /7z 文件签名/u);
+});
+
 test('提交账本出现坏行时不再让工具整体失败', async t => {
   const cwd = await mkdtemp(join(tmpdir(), 'ctf-audit-ledger-'));
   t.after(() => rm(cwd, { recursive: true, force: true, maxRetries: 8, retryDelay: 40 }));
