@@ -606,8 +606,8 @@ test('DECOMPILE_SCRIPT：r2 单次进程分析回退 pdc，Ghidra 按二进制 S
     const first = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
       cwd: workDir, encoding: 'utf8', env: ghEnv,
     }).trim());
-    assert.equal(first.engine, 'ghidra');
-    assert.equal(first.cached_project, false);
+    assert.equal(first.engine, 'ghidra', JSON.stringify(first));
+    assert.equal(first.cached_project, false, JSON.stringify(first));
     assert.equal(first.program_name, undefined);
 
     const emptyGhidra = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
@@ -622,8 +622,8 @@ test('DECOMPILE_SCRIPT：r2 单次进程分析回退 pdc，Ghidra 按二进制 S
     const second = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
       cwd: workDir, encoding: 'utf8', env: ghEnv,
     }).trim());
-    assert.equal(second.engine, 'ghidra');
-    assert.equal(second.cached_project, true);
+    assert.equal(second.engine, 'ghidra', JSON.stringify(second));
+    assert.equal(second.cached_project, true, JSON.stringify(second));
 
     await writeFile(samplePath, Buffer.from('FAKE_ELF_V2_MODIFIED'));
     const third = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
