@@ -1,5 +1,12 @@
 # 变更记录
 
+## 0.51.4
+
+- **Windows 原生 Ghidra 不再静默降级**：官方发行的是 `analyzeHeadless.bat`，`subprocess` 不能直接执行批处理，此前 `shutil.which` 找到了也会在 `CreateProcess` 处失败、静默回退到 objdump（CI 上表现为 `expected: ghidra / actual: objdump`）。现在按扩展名改走 `cmd.exe /c`，Windows 宿主机上的 Ghidra 反编译真正可用。
+- **CI 容器断言与运行时加固对齐**：`docker-smoke` 原先只加 `--read-only --network none`，漏了 `--tmpfs /tmp`，`/tmp` 随只读 rootfs 一起只读，`touch /tmp/ci-ok` 必然失败（看起来像镜像坏了，实际是断言写错）。现补齐 `--tmpfs /tmp:rw,nosuid,size=512m`、`--cap-drop=ALL`、`--security-opt=no-new-privileges:true`、pids/内存上限，并新增 `NoNewPrivs` 断言。
+- **回归测试**：新增「CI 的容器隔离断言与 `buildDockerArgs` 使用同一组加固参数」，防止 workflow 与运行时再次脱节；「GDB stdin 路径」用例在 Windows 上优先用 Git Bash、其次找装了发行版的 WSL，都没有则跳过（runner 的 WSL 没有发行版）。
+- 回归测试增至 182 项。
+
 ## 0.51.3
 
 - **非 7z 字节不再喂给 libarchive**：Ubuntu 24.04 的 libarchive 3.7 在 7z 读取器上收到无签名短缓冲区会 SIGSEGV（实测 `printf "not a 7z archive" | python3 archive-directory-worker.py 7z 0 4 ""` → exit 139），worker 被信号杀掉后 JS 只能报「本机归档读取器异常退出」，CI 上这条用例必然失败。现在签名与最短头部长度在 Python 侧先校验，直接返回 `status: "invalid"` 与 `detail: "缺少 7z 文件签名。"`。

@@ -491,6 +491,12 @@ def clean_r2_pseudo(text):
 
 def decompile_ghidra(ghidra_bin, bin_path, func_target):
     global ghidra_diagnostic
+    # Windows 上官方发行的是 analyzeHeadless.bat，subprocess 不能直接执行批处理，
+    # 必须先经过 cmd.exe；否则 shutil.which 找到了也会静默回退到 objdump。
+    if os.name == "nt" and ghidra_bin.lower().endswith((".cmd", ".bat")):
+        command_prefix = ["cmd.exe", "/c", ghidra_bin]
+    else:
+        command_prefix = [ghidra_bin]
     script_dir = tempfile.mkdtemp(prefix="dsh_ghidra_script_")
     script_path = os.path.join(script_dir, "DshDecomp.py")
     out_path = os.path.join(script_dir, "out.json")
@@ -550,7 +556,7 @@ def decompile_ghidra(ghidra_bin, bin_path, func_target):
             except OSError:
                 pass
         proc = subprocess.run(
-            [ghidra_bin, *args],
+            [*command_prefix, *args],
             capture_output=True, text=True, errors="replace", timeout=headless_timeout, env=env,
         )
         if proc.returncode != 0:

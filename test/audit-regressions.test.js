@@ -9,6 +9,7 @@ import test from 'node:test';
 import { apply } from '../ctf-tools.js';
 import { inspectMedia } from '../media-reader.js';
 import { pcapStream } from '../pcap-stream.js';
+import { buildDockerArgs } from '../sandbox-runner.js';
 
 const PYTHON = process.platform === 'win32' ? 'python' : 'python3';
 const RESULT_HASH = /^[a-f0-9]{64}$/u;
@@ -234,4 +235,16 @@ test('提交账本出现坏行时不再让工具整体失败', async t => {
   }, execution));
   assert.notEqual(report.status, 'failed');
   assert.equal(report.corrupted_receipts, 2, '坏行必须被计数并回报，而不是静默丢弃');
+});
+
+test('CI 的容器隔离断言与 buildDockerArgs 使用同一组加固参数', async () => {
+  const workflowUrl = new URL('../.github/workflows/test.yml', import.meta.url);
+  const workflow = await readFile(workflowUrl, 'utf8');
+  const args = buildDockerArgs(['id'], { cwd: '.', containerName: 'ci', targetImage: 'dsh-ctf-sandbox:ci' });
+  // 少了 --tmpfs，/tmp 会跟着 --read-only 的 rootfs 一起只读，断言就会以「镜像坏了」的样子失败。
+  for (const flag of ['--read-only', '--tmpfs', '/tmp:rw,nosuid,size=512m', '--cap-drop=ALL', '--security-opt=no-new-privileges:true']) {
+    assert.ok(args.includes(flag), `buildDockerArgs 少了 ${flag}`);
+    assert.ok(workflow.includes(flag), `workflow 的隔离断言少了 ${flag}，会和运行时加固脱节`);
+  }
+  assert.match(workflow, /--network none/u);
 });

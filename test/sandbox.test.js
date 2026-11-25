@@ -355,14 +355,41 @@ test('auto 不会把要求隔离的命令静默交给 WSL2', async t => {
   }
 });
 
-test('GDB stdin 路径在真实 POSIX shell 中不会执行 $(...) 文件名载荷', async () => {
+/**
+ * 找到一个真正能跑的 POSIX shell。Windows 上优先 Git Bash（GitHub runner 自带），
+ * 其次才是装了发行版的 WSL；两者都没有时返回 null，由调用方 skip —— 直接调
+ * `wsl.exe --exec sh` 在没有发行版的机器上会报错，那是环境缺失而不是被测逻辑出错。
+ */
+function findPosixShell() {
+  if (process.platform !== 'win32') return { binary: '/bin/sh', prefix: [] };
+  try {
+    execFileSync('where', ['bash'], { stdio: 'ignore' });
+    return { binary: 'bash', prefix: [] };
+  } catch {
+    // 没有 Git Bash，继续尝试 WSL。
+  }
+  try {
+    const listed = execFileSync('wsl.exe', ['-l', '-q'], {
+      encoding: 'buffer',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const distros = listed.toString('utf16le').replace(/\0/gu, '').trim();
+    if (distros) return { binary: 'wsl.exe', prefix: ['--exec', 'sh'] };
+  } catch {
+    // 没有 WSL 或没有可用发行版。
+  }
+  return null;
+}
+
+test('GDB stdin 路径在真实 POSIX shell 中不会执行 $(...) 文件名载荷', async t => {
   const target = quoteGdbInputPath('./input$(touch pwned)', true);
   const command = `set -eu; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; cd "$tmp"; printf fixture > ${target}; cat < ${target} >/dev/null; test ! -e pwned`;
-  if (process.platform === 'win32') {
-    execFileSync('wsl.exe', ['--exec', 'sh', '-c', command], { stdio: 'pipe' });
-  } else {
-    execFileSync('/bin/sh', ['-c', command], { stdio: 'pipe' });
+  const shell = findPosixShell();
+  if (!shell) {
+    t.skip('当前宿主没有可用的 POSIX shell（Windows 需要 Git Bash 或已安装发行版的 WSL）');
+    return;
   }
+  execFileSync(shell.binary, [...shell.prefix, '-c', command], { stdio: 'pipe' });
 });
 
 test('WSL2/Linux 沙箱集成测试：status、中文路径 exec、decompile、pwn_triage 与 gdb_driver 自动桥接 Linux ELF', async t => {
