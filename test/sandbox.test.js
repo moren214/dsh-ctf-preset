@@ -610,6 +610,18 @@ test('DECOMPILE_SCRIPT：r2 单次进程分析回退 pdc，Ghidra 按二进制 S
     assert.equal(first.cached_project, false, JSON.stringify(first));
     assert.equal(first.program_name, undefined);
 
+    // Windows runner 的 ANSI 代码页是 cp1252，脚本里的中文会让默认编码的 write() 抛
+    // UnicodeEncodeError，上层当成 Ghidra 失败后静默回退 objdump。Linux 上把本地化
+    // 降到 C 就能复现同一条路径，用来锁住「必须显式 UTF-8 写脚本」这个修复。
+    if (process.platform !== 'win32') {
+      const asciiLocale = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
+        cwd: workDir,
+        encoding: 'utf8',
+        env: { ...ghEnv, PYTHONUTF8: '0', LC_ALL: 'C', LANG: 'C' },
+      }).trim());
+      assert.equal(asciiLocale.engine, 'ghidra', JSON.stringify(asciiLocale));
+    }
+
     const emptyGhidra = JSON.parse(execFileSync(python, ['-c', DECOMPILE_SCRIPT, 'sample.bin', 'check', 'ghidra'], {
       cwd: workDir, encoding: 'utf8', env: { ...ghEnv, FAKE_GHIDRA_EMPTY: '1' },
     }).trim());

@@ -564,7 +564,7 @@ def decompile_ghidra(ghidra_bin, bin_path, func_target):
             raise RuntimeError(f"analyzeHeadless 退出码 {proc.returncode}。{detail}")
         if not os.path.isfile(out_path):
             raise RuntimeError("analyzeHeadless 成功退出但没有生成结果 JSON。")
-        with open(out_path) as fh:
+        with open(out_path, encoding="utf-8") as fh:
             result = json.loads(fh.read())
         if not isinstance(result, dict):
             raise RuntimeError("Ghidra 结果不是 JSON 对象。")
@@ -573,7 +573,8 @@ def decompile_ghidra(ghidra_bin, bin_path, func_target):
             raise RuntimeError("Ghidra 结果没有伪代码或反汇编。")
         return result
     try:
-        with open(script_path, "w") as fh:
+        # Ghidra 脚本里有中文提示，Windows 的 ANSI 代码页编码不了，必须显式 UTF-8。
+        with open(script_path, "w", encoding="utf-8") as fh:
             fh.write(py_script)
         env = dict(os.environ)
         env["DSH_TARGET"] = func_target or ""
@@ -602,7 +603,7 @@ def decompile_ghidra(ghidra_bin, bin_path, func_target):
             meta_ok = False
             if os.path.isfile(meta_path):
                 try:
-                    with open(meta_path) as mf:
+                    with open(meta_path, encoding="utf-8") as mf:
                         meta = json.loads(mf.read())
                     if meta.get("sha256") == bin_sha and meta.get("program"):
                         prog_name = meta["program"]
@@ -631,7 +632,7 @@ def decompile_ghidra(ghidra_bin, bin_path, func_target):
                     prog_name = res.pop("program_name", os.path.basename(bin_path))
                     if os.path.isfile(os.path.join(stage_dir, "proj.gpr")):
                         try:
-                            with open(os.path.join(stage_dir, "meta.json"), "w") as mf:
+                            with open(os.path.join(stage_dir, "meta.json"), "w", encoding="utf-8") as mf:
                                 mf.write(json.dumps({"sha256": bin_sha, "program": prog_name}))
                             os.replace(stage_dir, cache_dir)
                             stage_dir = None

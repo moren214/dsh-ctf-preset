@@ -263,10 +263,11 @@ preset 已声明平台 shell（Windows 为 `pwsh`，其他平台为 `bash`），
 
 ## 变更记录
 
-完整变更与兼容矩阵见 `CHANGELOG.md`（当前 `0.51.4`）。近期摘要：
+完整变更与兼容矩阵见 `CHANGELOG.md`（当前 `0.51.5`）。近期摘要：
 
 - Unreleased：图谱租约拒绝未认领任务直接结案并分页 `ruled_out`；Python 热重载、CRLF Bash 脚本、反编译失败诊断、平台认证探测、只读看板与续接错误分类得到加固；平台附件复用适配器认证，模型扫描截断显示不完整状态。
 
+- 0.51.5 `DECOMPILE_SCRIPT` 的脚本、结果与缓存元数据显式 UTF-8 读写，修掉 Windows 上因 ANSI 代码页编码失败而静默回退 objdump（`.bat` 走 `cmd.exe /c` 的修复见 0.51.4）。
 - 0.51.4 Windows 原生 Ghidra 改走 `cmd.exe /c` 执行 `.bat`，不再静默回退 objdump；CI 容器隔离断言补齐 `--tmpfs /tmp`、摘帽与 `NoNewPrivs`，并与 `buildDockerArgs` 用同一组参数。
 - 0.51.3 7z 容器先验签再交给 libarchive（Ubuntu 24.04 的 libarchive 3.7 在无签名短缓冲区上会段错误）；归档读取器崩溃时错误信息带信号与 stderr 摘要。
 - 0.51.2 CI 失败用例转为 GitHub 注解便于公开定位；修掉 `browser-session` 超时用例依赖事件循环残留句柄导致的级联取消；`python3 -m venv` 缺失的环境改为跳过而非失败，CI Ubuntu 侧预装 `python3-venv`。

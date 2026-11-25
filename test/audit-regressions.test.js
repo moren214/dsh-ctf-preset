@@ -9,7 +9,7 @@ import test from 'node:test';
 import { apply } from '../ctf-tools.js';
 import { inspectMedia } from '../media-reader.js';
 import { pcapStream } from '../pcap-stream.js';
-import { buildDockerArgs } from '../sandbox-runner.js';
+import { buildDockerArgs, DECOMPILE_SCRIPT } from '../sandbox-runner.js';
 
 const PYTHON = process.platform === 'win32' ? 'python' : 'python3';
 const RESULT_HASH = /^[a-f0-9]{64}$/u;
@@ -247,4 +247,12 @@ test('CI 的容器隔离断言与 buildDockerArgs 使用同一组加固参数', 
     assert.ok(workflow.includes(flag), `workflow 的隔离断言少了 ${flag}，会和运行时加固脱节`);
   }
   assert.match(workflow, /--network none/u);
+});
+
+test('DECOMPILE_SCRIPT 写 Ghidra 脚本必须显式 UTF-8', async () => {
+  // Windows 的 open() 默认用 ANSI 代码页，脚本里的中文提示会让 write() 抛
+  // UnicodeEncodeError，被上层当成 Ghidra 失败后静默回退 objdump（CI 上就是这样）。
+  assert.match(DECOMPILE_SCRIPT, /with open\(script_path, "w", encoding="utf-8"\) as fh:/u);
+  assert.match(DECOMPILE_SCRIPT, /with open\(out_path, encoding="utf-8"\) as fh:/u);
+  assert.match(DECOMPILE_SCRIPT, /meta_path, encoding="utf-8"/u);
 });

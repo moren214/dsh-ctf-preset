@@ -1,5 +1,11 @@
 # 变更记录
 
+## 0.51.5
+
+- **Windows 上 Ghidra 不再因为编码问题静默回退 objdump**：`DECOMPILE_SCRIPT` 生成 Ghidra postScript 时用的是默认编码，而 Windows runner 的 ANSI 代码页是 cp1252，脚本里的中文提示让 `write()` 抛 `UnicodeEncodeError`，上层把它当成「Ghidra 失败」后回退到 objdump（CI 注解里就是 `expected: ghidra / actual: objdump`）。现在脚本、结果 JSON 与缓存 `meta.json` 的读写都显式 `encoding="utf-8"`。
+- 回归测试：Linux 侧把本地化降到 `LC_ALL=C` 复现同一条编码路径，断言仍返回 `ghidra`；另有静态断言锁住两处 `encoding="utf-8"`，避免以后被改回去。
+- 回归测试增至 183 项。
+
 ## 0.51.4
 
 - **Windows 原生 Ghidra 不再静默降级**：官方发行的是 `analyzeHeadless.bat`，`subprocess` 不能直接执行批处理，此前 `shutil.which` 找到了也会在 `CreateProcess` 处失败、静默回退到 objdump（CI 上表现为 `expected: ghidra / actual: objdump`）。现在按扩展名改走 `cmd.exe /c`，Windows 宿主机上的 Ghidra 反编译真正可用。
