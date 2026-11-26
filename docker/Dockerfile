@@ -180,6 +180,12 @@ RUN if [ "$RUBYGEMS_SOURCE_URL" = "https://rubygems.org" ]; then \
         gem install --no-document --source "$RUBYGEMS_SOURCE_URL" seccomp-tools:1.7.1 one_gadget:1.10.0 zsteg:0.2.14; \
     fi
 
+COPY ctf-sandbox-bridge-entrypoint /usr/local/bin/dsh-ctf-bridge-entrypoint
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iptables util-linux \
+    && chmod 0755 /usr/local/bin/dsh-ctf-bridge-entrypoint \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --gid 10001 ctf \
     && useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash ctf \
     && mkdir -p /work \

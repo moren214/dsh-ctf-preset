@@ -112,19 +112,23 @@ export function apply(ctx, config = {}) {
         source: { type: 'string', maxLength: 512 },
         evidence_ids: { type: 'array', maxItems: 32, items: { type: 'string', maxLength: 64 } },
         require_submission: { type: 'boolean' },
-        submit_verdict: { type: 'string', enum: ['accepted', 'duplicate', 'rejected', 'unknown', 'rejected_local'] },
       },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
-    async execute(args) {
+    async execute(args, execution) {
       try {
+        const evidenceIds = Array.isArray(args.evidence_ids) ? args.evidence_ids : [];
+        const location = evidenceIds.length > 0 ? await workspaceLocation(ctx, execution) : undefined;
+        const session = execution?.agent?.session;
         const res = await verifyExitCondition({
           flag: args.flag,
           pattern: args.pattern,
           source: args.source,
-          evidenceIds: args.evidence_ids,
+          evidenceIds,
+          ...(location ? {
+            resolveEvidence: id => state.runtime.results.get(session, location.directoryKey, id),
+          } : {}),
           requireSubmission: args.require_submission === true,
-          ...(args.submit_verdict ? { submitResult: { verdict: args.submit_verdict } } : {}),
         });
         return JSON.stringify(res);
       } catch (error) {

@@ -31,7 +31,7 @@ function readJsonBody(req) {
 /**
  * Lightweight HTTP API wrapper around runAutonomousSolver for competition containers.
  */
-export function startRunnerHttpServer({ host = '127.0.0.1', port = 0, maxConcurrent = 4 } = {}) {
+export function startRunnerHttpServer({ host = '127.0.0.1', port = 0, maxConcurrent = 4, verifyFlag } = {}) {
   const jobs = new Map();
   let activeJobs = 0;
 
@@ -77,6 +77,7 @@ export function startRunnerHttpServer({ host = '127.0.0.1', port = 0, maxConcurr
           maxSteps: payload.max_steps,
           timeoutMs: payload.timeout_ms,
           mockPlan: payload.mock_plan,
+          verifyFlag,
         });
         jobs.set(jobId, { job_id: jobId, ...result });
         return send(result.exit_code === 0 ? 200 : 422, { job_id: jobId, ...result });

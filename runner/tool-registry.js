@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path, { resolve } from 'node:path';
@@ -30,7 +31,7 @@ function resolveInside(rootDir, relPath) {
 /**
  * Cordis-free headless tool registry powering the Autonomous Competition Runner.
  */
-export function createHeadlessToolRegistry({ challengeDir, config = {} } = {}) {
+export function createHeadlessToolRegistry({ challengeDir, config = {}, verifyFlag } = {}) {
   if (!challengeDir || !existsSync(challengeDir)) {
     throw new ToolError('missing', `题目工作目录不存在：${challengeDir}`);
   }
@@ -44,6 +45,7 @@ export function createHeadlessToolRegistry({ challengeDir, config = {} } = {}) {
   const router = createDomainRouter({ initialDomain: config.toolDomain ?? 'triage' });
   const activeTools = new Map();
   const deferredTools = new Map();
+  const evidenceLedger = new Map();
 
   function register(name, description, parameters, handler) {
     const def = { name, description, parameters, handler };
@@ -210,13 +212,17 @@ export function createHeadlessToolRegistry({ challengeDir, config = {} } = {}) {
       flag: { type: 'string' },
       pattern: { type: 'string' },
       source: { type: 'string' },
-      evidence_ids: { type: 'array', items: { type: 'string' } },
+      evidence_ids: { type: 'array', items: { type: 'string', pattern: '^[a-f0-9]{64}$' } },
     },
-  }, async args => verifyExitCondition({
+  }, async (args, execCtx) => verifyExitCondition({
     flag: args.flag,
     pattern: args.pattern,
     source: args.source,
     evidenceIds: args.evidence_ids,
+    resolveEvidence: id => evidenceLedger.get(id),
+    ...(typeof verifyFlag === 'function' ? {
+      localVerifyFn: flag => verifyFlag(flag, { challengeDir: absDir, signal: execCtx?.signal }),
+    } : {}),
   }));
 
   async function executeTool(name, args = {}, { signal } = {}) {
@@ -228,7 +234,15 @@ export function createHeadlessToolRegistry({ challengeDir, config = {} } = {}) {
       };
     }
     try {
-      return await tool.handler(args ?? {}, { signal });
+      const result = await tool.handler(args ?? {}, { signal });
+      if (name === 'ctf_verify_exit') return result;
+      const serialized = JSON.stringify(result);
+      const resultId = createHash('sha256').update(name).update('\0').update(serialized ?? 'undefined').digest('hex');
+      evidenceLedger.set(resultId, { tool: name, report: result });
+      while (evidenceLedger.size > 128) evidenceLedger.delete(evidenceLedger.keys().next().value);
+      return result !== null && typeof result === 'object' && !Array.isArray(result)
+        ? { ...result, result_id: resultId }
+        : { result_id: resultId, result };
     } catch (error) {
       return { ok: false, error: describeToolError(error) };
     }
@@ -244,6 +258,7 @@ export function createHeadlessToolRegistry({ challengeDir, config = {} } = {}) {
       function: { name: t.name, description: t.description, parameters: t.parameters },
     })),
     executeTool,
+    resolveEvidence: id => evidenceLedger.get(id),
     dispose: () => runtime.dispose(),
   };
 }

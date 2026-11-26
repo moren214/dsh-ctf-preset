@@ -415,7 +415,11 @@ export async function detectSandbox(config = {}, signal, { fresh = false, cache 
   return value;
 }
 
-export function buildDockerArgs(argv, { cwd, containerName, targetImage, isHeavy = false, network = 'none', ptrace = false, readOnlyWork = false, extraArgs = [] }) {
+export function buildDockerArgs(argv, { cwd, containerName, targetImage, isHeavy = false, network = 'none', ptrace = false, readOnlyWork = false, egressProxyPort, extraArgs = [] }) {
+  const bridgeNetwork = network === 'bridge';
+  if (bridgeNetwork && (!Number.isInteger(egressProxyPort) || egressProxyPort < 1 || egressProxyPort > 65535)) {
+    throw new ToolError('permission', 'Docker bridge 必须经过受控出网代理；缺少有效代理端口时拒绝启动。');
+  }
   return [
     'run', '--rm', '--init', '--name', containerName,
     '--read-only',
@@ -426,13 +430,24 @@ export function buildDockerArgs(argv, { cwd, containerName, targetImage, isHeavy
     `--memory=${isHeavy ? '4g' : '2g'}`,
     `--memory-swap=${isHeavy ? '4g' : '2g'}`,
     '--cpus=2',
-    '--network', network === 'bridge' ? 'bridge' : 'none',
-    ...(ptrace ? ['--cap-add=SYS_PTRACE'] : []),
+    '--network', bridgeNetwork ? 'bridge' : 'none',
+    ...(bridgeNetwork ? [
+      '--user=0:0',
+      '--cap-add=NET_ADMIN',
+      '--cap-add=SETUID',
+      '--cap-add=SETGID',
+      '--cap-add=SETPCAP',
+      ...(ptrace ? ['--cap-add=SYS_PTRACE'] : []),
+    ] : (ptrace ? ['--cap-add=SYS_PTRACE'] : [])),
     ...extraArgs,
+    ...(bridgeNetwork ? [
+      '-e', 'CTF_EGRESS_PROXY_PORT=' + egressProxyPort,
+      '-e', 'CTF_SANDBOX_PTRACE=' + (ptrace ? '1' : '0'),
+    ] : []),
     '-v', `${cwd}:/work${readOnlyWork ? ':ro' : ''}`,
     '-w', '/work',
     targetImage,
-    ...argv,
+    ...(bridgeNetwork ? ['/usr/local/bin/dsh-ctf-bridge-entrypoint', ...argv] : argv),
   ];
 }
 
@@ -461,6 +476,9 @@ export async function runSandboxCommand(argv, {
     throw new ToolError('dependency',
       'Docker 不可用，auto 后端只能使用共享宿主网络和权限的 WSL2，无法满足此任务的隔离要求。请启动 Docker 并构建沙箱镜像；如仍要在 WSL2 中运行，请显式设置 backend: "wsl"。');
   }
+  if (network === 'bridge' && env.backend !== 'docker') {
+    throw new ToolError('permission', '受控 network: "bridge" 仅支持 Docker；local/WSL 后端无法强制代理出网策略。');
+  }
   const started = Date.now();
   if (env.backend === 'local') {
     const result = await runProcess(argv[0], argv.slice(1), { cwd, timeoutMs, signal });
@@ -471,10 +489,10 @@ export async function runSandboxCommand(argv, {
     const isHeavy = profile === 'heavy' || /:heavy$/iu.test(targetImage ?? '');
     let egressProxy;
     const extraArgs = [];
-    if (network === 'bridge' && config?.allowUnrestrictedSandboxBridge !== true) {
+    if (network === 'bridge') {
       if (!networkBoundary || !networkBoundary.hasAnyAuthorization(networkScope)) {
         throw new ToolError('permission',
-          '沙箱 network: "bridge" 默认拦截未授权公网出站。请先通过 networkOrigins / tcpTargets / ctf_arena 授权目标，或在配置中显式设置 allowUnrestrictedSandboxBridge: true。');
+          '沙箱 network: "bridge" 只允许通过受控代理访问已授权目标；请先通过 networkOrigins / tcpTargets / ctf_arena 授权目标。');
       }
       egressProxy = await createSandboxEgressProxy({ networkBoundary, scope: networkScope, listenHost: '0.0.0.0' });
       const proxyUrl = egressProxy.proxyUrlForContainer('host.docker.internal');
@@ -511,7 +529,11 @@ export async function runSandboxCommand(argv, {
       }
 
       const containerName = 'dsh-ctf-' + randomUUID().slice(0, 12);
-      const dockerArgs = buildDockerArgs(argv, { cwd, containerName, targetImage, isHeavy, network, ptrace, readOnlyWork, extraArgs });
+      const dockerArgs = buildDockerArgs(argv, {
+        cwd, containerName, targetImage, isHeavy, network, ptrace, readOnlyWork,
+        egressProxyPort: egressProxy?.port,
+        extraArgs,
+      });
       const result = await runProcess('docker', dockerArgs, {
         timeoutMs,
         signal,

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -157,12 +158,43 @@ test('CTF Autonomous preset: starts in triage, supports hot ctf_domain expansion
     assert.equal(badExit.done, false);
     assert.equal(badExit.exit_code, 2);
 
-    const goodExit = JSON.parse(await tools.get('ctf_verify_exit').execute({
+    const sourceOnlyExit = JSON.parse(await tools.get('ctf_verify_exit').execute({
       flag: 'flag{verified_autonomous_2026}',
       source: 'exploit.py',
+      submit_verdict: 'accepted',
     }, execution));
-    assert.equal(goodExit.done, true);
-    assert.equal(goodExit.exit_code, 0);
+    assert.equal(sourceOnlyExit.done, false, '自由文本来源和调用方自报 verdict 不能证明 Flag 正确');
+    assert.equal(sourceOnlyExit.exit_code, 2);
+
+    const verifiedByOracle = await verifyExitCondition({
+      flag: 'flag{verified_autonomous_2026}',
+      localVerifyFn: flag => flag === 'flag{verified_autonomous_2026}',
+    });
+    assert.equal(verifiedByOracle.done, true, '可信宿主验证器通过时可产生机器终态');
+    assert.ok(verifiedByOracle.checks.every(check => check.ok), 'done=true 时所有必需检查应为通过');
+
+    const flagHash = createHash('sha256').update('flag{verified_autonomous_2026}').digest('hex');
+    const platformReceipt = await verifyExitCondition({
+      flag: 'flag{verified_autonomous_2026}',
+      evidenceIds: ['a'.repeat(64)],
+      requireSubmission: true,
+      resolveEvidence: async () => ({
+        tool: 'submit_flag',
+        report: { status: 'submitted', verdict: 'accepted', flag_sha256: flagHash },
+      }),
+    });
+    assert.equal(platformReceipt.done, true, '真实提交工具回执匹配候选 Flag 后可通过');
+    assert.ok(platformReceipt.checks.every(check => check.ok), '平台回执通过后不能残留失败的可选检查');
+    const fakeArenaReceipt = await verifyExitCondition({
+      flag: 'flag{verified_autonomous_2026}',
+      evidenceIds: ['b'.repeat(64)],
+      requireSubmission: true,
+      resolveEvidence: async () => ({
+        tool: 'ctf_arena',
+        report: { action: 'detail', status: 'accepted', flag: 'flag{verified_autonomous_2026}', flag_sha256: flagHash },
+      }),
+    });
+    assert.equal(fakeArenaReceipt.done, false, 'ctf_arena detail 结果不能冒充提交回执');
   } finally {
     await state?.runtime?.dispose?.();
     await rm(cwd, { recursive: true, force: true });

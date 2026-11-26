@@ -375,6 +375,78 @@ int main() { puts(check_flag(0x5175) ? "WIN" : "NO"); return 0; }
     err => err instanceof ToolError && err.kind === 'permission',
   );
 
+  await assert.rejects(
+    runSandbox({ action: 'exec', backend: 'docker', network: 'bridge', command: 'echo net' }, {
+      cwd,
+      config: { allowUnrestrictedSandboxBridge: true },
+      writable: true,
+      networkBoundary: createNetworkBoundary({}),
+      networkScope: { session: { id: 'live-deny-bypass' }, workspaceKey: cwd },
+    }),
+    err => err instanceof ToolError && err.kind === 'permission',
+    'legacy allowUnrestrictedSandboxBridge must not bypass the proxy',
+  );
+
+  // Authorized bridge traffic must install the namespace firewall before the user command runs.
+  const isolationNet = createNetworkBoundary({ networkOrigins: ['https://example.com'] });
+  await writeFile(join(cwd, 'bridge-egress-probe.py'), [
+    'import os, socket, urllib.request, urllib.error',
+    'from urllib.parse import urlsplit',
+    "sock = socket.socket(); sock.settimeout(2)",
+    "raw = sock.connect_ex(('1.1.1.1', 443))",
+    "print('RAW_TCP', raw)",
+    "print('UID', os.getuid())",
+    "print('CAPS', next(line.strip() for line in open('/proc/self/status') if line.startswith('CapEff:')))",
+    "proxy = urlsplit(os.environ.get('HTTPS_PROXY', ''))",
+    "probe = socket.socket(); probe.settimeout(2); print('PROXY_TCP', probe.connect_ex((proxy.hostname, proxy.port)))",
+    "print('PROXY_ENV', proxy.scheme, proxy.hostname, proxy.port, bool(proxy.username), bool(proxy.password))",
+    'try:',
+    "    response = urllib.request.urlopen('https://1.1.1.1', timeout=4)",
+    "    print('PROXY_HTTP', response.status)",
+    'except urllib.error.HTTPError as error:',
+    "    print('PROXY_HTTP', error.code)",
+    'except Exception as error:',
+    "    print('PROXY_ERROR', repr(error))",
+  ].join('\n'), 'utf8');
+  const bridgeProbe = await runSandbox({
+    action: 'exec',
+    backend: 'docker',
+    network: 'bridge',
+    command: 'python3 bridge-egress-probe.py',
+    timeout_ms: 15000,
+  }, {
+    cwd,
+    config: {},
+    writable: true,
+    networkBoundary: isolationNet,
+    networkScope: { session: { id: 'live-proxy-firewall' }, workspaceKey: cwd },
+  });
+  assert.equal(bridgeProbe.status, 'ok', JSON.stringify(bridgeProbe));
+  assert.match(bridgeProbe.stdout, /RAW_TCP\s+(?!0\b)[0-9]+/u, bridgeProbe.stdout);
+  assert.match(bridgeProbe.stdout, /UID\s+10001/u, bridgeProbe.stdout);
+  assert.match(bridgeProbe.stdout, /CapEff:\s+0000000000000000/u, bridgeProbe.stdout);
+  assert.match(bridgeProbe.stdout, /PROXY_ERROR .*403/u, bridgeProbe.stdout);
+  assert.match(bridgeProbe.stdout, /PROXY_TCP\s+0/u, bridgeProbe.stdout);
+
+  const heavyBridgeProbe = await runSandbox({
+    action: 'exec',
+    backend: 'docker',
+    profile: 'heavy',
+    network: 'bridge',
+    command: 'python3 bridge-egress-probe.py',
+    timeout_ms: 15000,
+  }, {
+    cwd,
+    config: {},
+    writable: true,
+    networkBoundary: isolationNet,
+    networkScope: { session: { id: 'live-heavy-proxy-firewall' }, workspaceKey: cwd },
+  });
+  assert.equal(heavyBridgeProbe.status, 'ok', JSON.stringify(heavyBridgeProbe));
+  assert.match(heavyBridgeProbe.stdout, /RAW_TCP\s+(?!0\b)[0-9]+/u, heavyBridgeProbe.stdout);
+  assert.match(heavyBridgeProbe.stdout, /UID\s+10001/u, heavyBridgeProbe.stdout);
+  assert.match(heavyBridgeProbe.stdout, /PROXY_ERROR .*403/u, heavyBridgeProbe.stdout);
+
   // 4) Persistent gdb_driver session (session_start -> session_cmd -> session_close) inside latest container
   const tools = new Map();
   const base = cwd.replaceAll('\\', '/').replace(/\/$/u, '');

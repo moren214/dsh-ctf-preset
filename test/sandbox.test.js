@@ -754,13 +754,24 @@ test('buildDockerArgs 容器加固（cap-drop/no-new-privileges/只读挂载）�
     network: 'bridge',
     ptrace: true,
     isHeavy: true,
+    egressProxyPort: 12345,
   });
   assert.ok(heavyPwnArgs.includes('--cap-drop=ALL'));
   assert.ok(heavyPwnArgs.includes('--cap-add=SYS_PTRACE'));
+  assert.ok(heavyPwnArgs.includes('--cap-add=NET_ADMIN'));
+  assert.ok(heavyPwnArgs.includes('--user=0:0'));
   assert.equal(heavyPwnArgs[heavyPwnArgs.indexOf('--network') + 1], 'bridge');
+  assert.equal(heavyPwnArgs[heavyPwnArgs.indexOf('dsh-ctf-sandbox:heavy') + 1], '/usr/local/bin/dsh-ctf-bridge-entrypoint');
+  assert.ok(heavyPwnArgs.includes('CTF_EGRESS_PROXY_PORT=12345'));
   assert.ok(heavyPwnArgs.includes('/tmp/ws:/work'));
   assert.ok(heavyPwnArgs.includes('--memory=4g'));
   assert.ok(heavyPwnArgs.includes('--memory-swap=4g'));
+  assert.throws(
+    () => buildDockerArgs(['id'], {
+      cwd: '/tmp/ws', containerName: 'dsh-test-unfiltered', targetImage: 'dsh-ctf-sandbox:latest', network: 'bridge',
+    }),
+    error => error.kind === 'permission',
+  );
 
   // 新增高频 CLI 识别
   for (const cmd of ['bkcrack -C a.zip -c f.txt -p plain', 'ffuf -u http://x/FUZZ', 'sqlmap -u http://x', 'john hash.txt', 'tesseract img.png stdout', 'pyinstxtractor-ng app.exe', 'pwninit']) {

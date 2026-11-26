@@ -48,13 +48,15 @@ export async function runAutonomousSolver({
   outputPath,
   signal,
   config = {},
+  verifyFlag,
 } = {}) {
   const startedAt = Date.now();
   const timeoutCtrl = new AbortController();
   const timer = setTimeout(() => timeoutCtrl.abort(new ToolError('timeout', `Runner 超时（${timeoutMs}ms）。`)), timeoutMs);
   const runSignal = signal ? AbortSignal.any([signal, timeoutCtrl.signal]) : timeoutCtrl.signal;
 
-  const registry = createHeadlessToolRegistry({ challengeDir, config });
+  const registry = createHeadlessToolRegistry({ challengeDir, config, verifyFlag });
+  const observedEvidenceIds = [];
   let steps = 0;
 
   const finalize = async result => {
@@ -85,6 +87,7 @@ export async function runAutonomousSolver({
           steps += 1;
           const out = await registry.executeTool(action.tool, action.args ?? {}, { signal: runSignal });
           await traceEvent(tracePath, { step: steps, tool: action.tool, args: action.args, out });
+          if (typeof out?.result_id === 'string') observedEvidenceIds.push(out.result_id);
           if (action.tool === 'ctf_verify_exit' && out?.done === true) {
             return await finalize({
               status: 'solved',
@@ -105,7 +108,11 @@ export async function runAutonomousSolver({
             flag: action.finish.flag ?? lastFlagCandidate,
             pattern: action.finish.pattern,
             source: action.finish.source ?? lastSource,
-            evidenceIds: action.finish.evidence_ids,
+            evidenceIds: action.finish.evidence_ids ?? observedEvidenceIds,
+            resolveEvidence: id => registry.resolveEvidence?.(id),
+            ...(typeof verifyFlag === 'function' ? {
+              localVerifyFn: flag => verifyFlag(flag, { challengeDir, signal: runSignal }),
+            } : {}),
           });
           await traceEvent(tracePath, { step: steps, finish: check });
           return await finalize({
@@ -159,7 +166,15 @@ export async function runAutonomousSolver({
       const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
       if (toolCalls.length === 0) {
         const candidateMatch = /[A-Za-z0-9_]{1,24}\{[^{}\r\n]{4,256}\}/u.exec(msg.content ?? '');
-        const check = await verifyExitCondition({ flag: candidateMatch?.[0], source: 'llm_final_message' });
+        const check = await verifyExitCondition({
+          flag: candidateMatch?.[0],
+          source: 'llm_final_message',
+          evidenceIds: observedEvidenceIds,
+          resolveEvidence: id => registry.resolveEvidence?.(id),
+          ...(typeof verifyFlag === 'function' ? {
+            localVerifyFn: flag => verifyFlag(flag, { challengeDir, signal: runSignal }),
+          } : {}),
+        });
         await traceEvent(tracePath, { step: steps, final_check: check });
         if (check.done) {
           return await finalize({
@@ -188,6 +203,7 @@ export async function runAutonomousSolver({
         let parsedArgs = {};
         try { parsedArgs = JSON.parse(tc.function?.arguments || '{}'); } catch { /* ignore */ }
         const out = await registry.executeTool(tc.function?.name, parsedArgs, { signal: runSignal });
+        if (typeof out?.result_id === 'string') observedEvidenceIds.push(out.result_id);
         await traceEvent(tracePath, { step: steps, tool: tc.function?.name, args: parsedArgs, out });
         messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(out) });
         if (tc.function?.name === 'ctf_verify_exit' && out?.done === true) {

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { startRunnerHttpServer } from '../runner/http-server.js';
+import { runAutonomousSolver } from '../runner/solver-loop.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const CLI_PATH = join(ROOT, 'runner', 'cli.js');
@@ -26,7 +27,7 @@ function runCli(args) {
   });
 }
 
-test('Stage 6 headless runner CLI solves offline challenge via --mock-plan and writes trace + output', async () => {
+test('Stage 6 headless runner requires trusted flag verification and writes trace + output', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'ctf-runner-cli-'));
   try {
     await writeFile(join(cwd, 'notes.txt'), 'secret=flag{runner_cli_solved_2026}\n', 'utf8');
@@ -46,17 +47,25 @@ test('Stage 6 headless runner CLI solves offline challenge via --mock-plan and w
       '--trace', tracePath,
       '--output', outPath,
     ]);
-    assert.equal(res.code, 0, res.stderr || res.stdout);
+    assert.equal(res.code, 2, res.stderr || res.stdout);
     const parsed = JSON.parse(res.stdout.trim());
-    assert.equal(parsed.status, 'solved');
-    assert.equal(parsed.flag, 'flag{runner_cli_solved_2026}');
-    assert.equal(parsed.verified, true);
+    assert.equal(parsed.status, 'unverified');
+    assert.equal(parsed.flag, undefined);
+    assert.equal(parsed.verified, false);
     assert.ok(parsed.active_domains.includes('crypto'));
 
     const savedOut = JSON.parse(await readFile(outPath, 'utf8'));
-    assert.equal(savedOut.flag, 'flag{runner_cli_solved_2026}');
+    assert.equal(savedOut.status, 'unverified');
     const traceLines = (await readFile(tracePath, 'utf8')).trim().split('\n');
     assert.equal(traceLines.length, 4);
+
+    const verified = await runAutonomousSolver({
+      challengeDir: cwd,
+      mockPlan: [{ finish: { flag: 'flag{runner_cli_solved_2026}', source: 'invented.txt' } }],
+      verifyFlag: flag => flag === 'flag{runner_cli_solved_2026}',
+    });
+    assert.equal(verified.status, 'solved');
+    assert.equal(verified.verified, true);
 
     // Unverified flag exits with non-zero code (2)
     const badPlanPath = join(cwd, 'bad-plan.json');
@@ -73,6 +82,11 @@ test('Stage 6 headless runner CLI solves offline challenge via --mock-plan and w
 test('Stage 6 runner HTTP API exposes GET /health, POST /solve, and GET /status/:id', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'ctf-runner-http-'));
   const srv = await startRunnerHttpServer({ host: '127.0.0.1', port: 0 });
+  const trustedSrv = await startRunnerHttpServer({
+    host: '127.0.0.1',
+    port: 0,
+    verifyFlag: flag => flag === 'flag{http_runner_ok_2026}',
+  });
   try {
     const h = await fetch(`${srv.url}/health`);
     assert.equal(h.status, 200);
@@ -84,22 +98,38 @@ test('Stage 6 runner HTTP API exposes GET /health, POST /solve, and GET /status/
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         challenge_dir: cwd,
+        verify_flag: 'always_true',
         mock_plan: [
           { tool: 'ctf_verify_exit', args: { flag: 'flag{http_runner_ok_2026}', source: 'solver.py' } },
         ],
       }),
     });
-    assert.equal(s.status, 200);
+    assert.equal(s.status, 422);
     const solved = await s.json();
-    assert.equal(solved.status, 'solved');
+    assert.equal(solved.status, 'unverified');
     assert.ok(solved.job_id);
 
     const st = await fetch(`${srv.url}/status/${solved.job_id}`);
     assert.equal(st.status, 200);
     const statusBody = await st.json();
-    assert.equal(statusBody.status, 'solved');
+    assert.equal(statusBody.status, 'unverified');
+
+    const trustedResponse = await fetch(new URL('/solve', trustedSrv.url), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        challenge_dir: cwd,
+        mock_plan: [
+          { tool: 'ctf_verify_exit', args: { flag: 'flag{http_runner_ok_2026}', source: 'solver.py' } },
+        ],
+      }),
+    });
+    assert.equal(trustedResponse.status, 200);
+    const trustedResult = await trustedResponse.json();
+    assert.equal(trustedResult.status, 'solved');
+    assert.equal(trustedResult.verified, true);
   } finally {
-    await srv.close();
+    await Promise.all([srv.close(), trustedSrv.close()]);
     await rm(cwd, { recursive: true, force: true });
   }
 });
@@ -114,8 +144,10 @@ test('Stage 6 Docker supply chain lockfiles and Dockerfile.agent hardenings are 
 
   assert.match(baseDf, /ARG FFUF_SHA256_ARM64=/u);
   assert.match(baseDf, /COPY requirements-base\.txt/u);
+  assert.match(baseDf, /COPY ctf-sandbox-bridge-entrypoint/u);
   assert.match(baseDf, /seccomp-tools:1\.7\.1\s+one_gadget:1\.10\.0\s+zsteg:0\.2\.14/u);
   assert.match(heavyDf, /COPY requirements-heavy\.txt/u);
+  assert.match(heavyDf, /COPY ctf-sandbox-bridge-entrypoint/u);
   assert.match(agentDf, /NODE_SHA256_AMD64=/u);
   assert.match(agentDf, /NODE_SHA256_ARM64=/u);
   assert.match(agentDf, /CTF_SANDBOX_BACKEND=local/u);

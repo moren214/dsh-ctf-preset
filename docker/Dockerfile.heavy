@@ -90,6 +90,14 @@ RUN if [ "$WITH_SAGE" = "1" ]; then \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
+COPY ctf-sandbox-bridge-entrypoint /usr/local/bin/dsh-ctf-bridge-entrypoint
+RUN if ! command -v iptables >/dev/null 2>&1 || ! command -v ip6tables >/dev/null 2>&1 || ! command -v setpriv >/dev/null 2>&1; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends iptables util-linux \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi \
+    && chmod 0755 /usr/local/bin/dsh-ctf-bridge-entrypoint
+
 WORKDIR /work
 USER 10001:10001
 CMD ["bash"]

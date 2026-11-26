@@ -1,0 +1,47 @@
+#!/bin/sh
+set -eu
+
+fail() {
+  printf 'dsh-ctf bridge isolation failed: %s\n' "$1" >&2
+  exit 125
+}
+
+proxy_port=$CTF_EGRESS_PROXY_PORT
+case "$proxy_port" in
+  ''|*[!0-9]*) fail 'invalid egress proxy port' ;;
+esac
+[ "$proxy_port" -ge 1 ] && [ "$proxy_port" -le 65535 ] || fail 'egress proxy port out of range'
+
+gateway=$(awk '$2 == "host.docker.internal" && $1 !~ /:/ { print $1; exit }' /etc/hosts)
+[ -n "$gateway" ] || fail 'host.docker.internal IPv4 gateway is missing'
+case "$gateway" in
+  *[!0-9.]*|'') fail 'invalid host gateway address' ;;
+esac
+
+command -v iptables >/dev/null 2>&1 || fail 'iptables is unavailable'
+command -v ip6tables >/dev/null 2>&1 || fail 'ip6tables is unavailable'
+command -v setpriv >/dev/null 2>&1 || fail 'setpriv is unavailable'
+
+# Apply DROP before flushing so a partial bootstrap never opens an egress window.
+iptables -w -P OUTPUT DROP || fail 'cannot set IPv4 OUTPUT policy'
+iptables -w -F OUTPUT || fail 'cannot reset IPv4 OUTPUT rules'
+iptables -w -A OUTPUT -o lo -j ACCEPT || fail 'cannot permit IPv4 loopback'
+iptables -w -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || fail 'cannot permit IPv4 established traffic'
+iptables -w -A OUTPUT -d "$gateway/32" -p tcp --dport "$proxy_port" -j ACCEPT || fail 'cannot permit the egress proxy'
+
+ip6tables -w -P OUTPUT DROP || fail 'cannot set IPv6 OUTPUT policy'
+ip6tables -w -F OUTPUT || fail 'cannot reset IPv6 OUTPUT rules'
+ip6tables -w -A OUTPUT -o lo -j ACCEPT || fail 'cannot permit IPv6 loopback'
+ip6tables -w -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || fail 'cannot permit IPv6 established traffic'
+
+if [ "$CTF_SANDBOX_PTRACE" = 1 ]; then
+  exec setpriv \
+    --reuid=10001 --regid=10001 --clear-groups \
+    --bounding-set=-all,+sys_ptrace \
+    --inh-caps=+sys_ptrace --ambient-caps=+sys_ptrace \
+    --no-new-privs -- "$@"
+fi
+
+exec setpriv \
+  --reuid=10001 --regid=10001 --clear-groups \
+  --bounding-set=-all --no-new-privs -- "$@"
