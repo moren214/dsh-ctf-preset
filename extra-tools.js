@@ -1106,8 +1106,10 @@ const TEMPLATES = {
 
 export function registerExtraTools(ctx, configSource, access) {
   const getConfig = typeof configSource === 'function' ? configSource : () => configSource ?? {};
-  const register = (name, description, properties, run, required) =>
-    registerTool(ctx, name, description, properties, run, required, access.observe, getConfig);
+  const register = (name, description, properties, run, required) => {
+    if (access.shouldRegister && !access.shouldRegister(name)) return;
+    return registerTool(ctx, name, description, properties, run, required, access.observe, getConfig);
+  };
   const browsers = new WeakMap();
   const activeBrowsers = new Set();
   ctx.effect(() => () => Promise.allSettled([...activeBrowsers].map(browser => browser.close())), 'CTF browser sessions');
@@ -1576,7 +1578,7 @@ export function registerExtraTools(ctx, configSource, access) {
     ['file_path', 'action'],
   );
 
-  if (access.extendedAudit !== false) {
+  if (access.extendedAudit !== false || access.domainSelection?.allowedTools?.has('mobile_apk')) {
     register('mobile_apk',
       '检查 APK 结构（manifest、dex、ABI、签名块），或在安装 apktool/jadx 时反编译，在安装 apksigner/jarsigner 时校验签名。',
       {

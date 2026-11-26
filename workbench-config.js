@@ -13,7 +13,7 @@ export const CONFIG_PATH_FIELDS = ['pythonPath', 'gdbPath', 'browserPath', 'base
 export const CONFIG_TEXT_FIELDS = ['base100Sha256', 'platformUrl', 'platformType', 'platformGameId',
   'platformChallengesPath', 'platformTokenEnv', 'platformAuthHeader', 'platformAuthScheme',
   'platformInstancesPath', 'platformSubmitPath', 'platformLeaderboardPath', 'platformTeamId',
-  'sandboxBackend', 'sandboxImage', 'sandboxHeavyImage', 'sandboxWslDistro'];
+  'sandboxBackend', 'sandboxImage', 'sandboxHeavyImage', 'sandboxWslDistro', 'toolDomain'];
 export const CONFIG_LIST_FIELDS = ['networkOrigins', 'tcpTargets', 'attachmentImportRoots'];
 export const CONFIG_BOOLEAN_FIELDS = [
   'compact', 'allowInsecurePlatformHttp', 'allowInsecurePlatformTls',

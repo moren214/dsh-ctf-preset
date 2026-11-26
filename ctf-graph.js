@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { classifyChallengeDomain } from './ctf-router.js';
 import { ToolError } from './tool-errors.js';
 
 export const GRAPH_DIR = '.ctf-graph';
@@ -626,6 +627,11 @@ function buildDispatchPlan(graph, { challengeFilter, maxWorkers, allowSameChalle
       .filter(Boolean)
       .map(f => ({ id: f.id, kind: f.kind, title: f.title }));
     const slot = `worker-${assignments.length + 1}-${randomUUID()}`;
+    const route = classifyChallengeDomain({
+      challenge: intent.challenge,
+      title: `${intent.title} ${parentFacts.map(f => f.title).join(' ')}`,
+      description: intent.hypothesis ?? '',
+    });
     assignments.push({
       worker_slot: slot,
       intent_id: intent.id,
@@ -633,6 +639,8 @@ function buildDispatchPlan(graph, { challengeFilter, maxWorkers, allowSameChalle
       title: intent.title,
       priority: intent.priority,
       budget_minutes: intent.budget_minutes,
+      recommended_domain: route.primary,
+      recommended_domains: route.domains,
       ...(intent.hypothesis ? { hypothesis: intent.hypothesis } : {}),
       parent_facts: parentFacts,
       recommended_prompt: `你是 ${slot}。先执行 ctf_graph(action: "claim_intent", intent_id: "${intent.id}", owner: "${slot}") 认领任务（若返回 conflict 立即停止），保存返回的 lease_id；用 ctf_graph(action: "expand", intent_ids: ["${intent.id}"]${parentFacts.length ? `, fact_ids: ${JSON.stringify(parentFacts.map(f => f.id))}` : ''}) 读完整上下文；在 ${intent.budget_minutes} 分钟预算内完成「${intent.challenge} — ${intent.title}」，结束后用 ctf_graph(action: "finish_intent", intent_id: "${intent.id}", lease_id: "<claim 返回值>", status: "done"|"dead", outcome: "...", facts: [...], spawn_intents: [...]) 原子写回结论与证据。`,

@@ -91,6 +91,7 @@
     "crypto-toolbox.js",
     "ctf-graph.js",
     "ctf-arena.js",
+    "ctf-router.js",
     "docker/Dockerfile",
     "docker/Dockerfile.heavy"
   ],

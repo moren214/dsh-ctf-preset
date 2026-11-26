@@ -1,4 +1,5 @@
 import { provenanceUrl } from './attachment-transfer.js';
+import { classifyChallengeDomain } from './ctf-router.js';
 import { webUrl } from './network-boundary.js';
 import { platformBase, platformCredential, platformRequest } from './platform-request.js';
 import { handleSubmission } from './submission.js';
@@ -405,10 +406,20 @@ export async function runArena(args, {
     const id = safeId(args.challenge_id, 'challenge_id');
     const fetched = await fetchChallengeDetail(id);
     if (!fetched.ok) return { action: 'detail', adapter, status: 'failed', request: fetched.request };
+    const route = classifyChallengeDomain({
+      category: fetched.detail.category,
+      title: fetched.detail.name,
+      description: fetched.detail.description,
+      connection_info: fetched.detail.connection_info,
+      files: fetched.detail.files,
+    });
     return {
       action: 'detail',
       status: 'ok',
       ...fetched.detail,
+      recommended_domain: route.primary,
+      recommended_domains: route.domains,
+      recommended_tools: route.recommended_tools,
       ...(fetched.authorized_targets ? { authorized_targets: fetched.authorized_targets } : {}),
     };
   }

@@ -54,6 +54,7 @@ import { appendEvidenceIndex, decodeEvidenceIndex, encodeEvidenceEntry } from '.
 import { detectSandbox, runSandbox, SANDBOX_PROPERTIES } from './sandbox-runner.js';
 import { GRAPH_DIR, GRAPH_FILE, GRAPH_PROPERTIES, manageGraph } from './ctf-graph.js';
 import { ARENA_PROPERTIES, runArena } from './ctf-arena.js';
+import { resolveToolDomainSelection, shouldRegisterTool } from './ctf-router.js';
 
 export const name = 'ctf-attachment-tools';
 export const inject = ['tools', 'fs', 'workingDirectory', 'sandboxPolicy'];
@@ -92,6 +93,7 @@ export const Config = {
 
 const AUTO_FILE_HASH_LIMIT = 128 * 1024 * 1024;
 const OUTPUT_CONFIGS = new WeakMap();
+const DOMAIN_SELECTIONS = new WeakMap();
 
 const IMPORT_DIR = '.ctf-attachments';
 const STATUS_FILE = '.ctf-status.json';
@@ -1022,6 +1024,17 @@ async function runDoctor(ctx, execution, config, workbench, registeredToolTier) 
   add('tool_tier_sync', tierSynced, tierSynced
     ? `已同步（${activeToolTier}，${activeToolTier === 'full' ? 45 : 27} 个工具）`
     : `配置 enableExtendedAudit 为 ${configuredToolTier}，但当前进程已注册为 ${activeToolTier}；重启或重载 DSH 后生效。`, false);
+  const activeDomain = DOMAIN_SELECTIONS.get(ctx)?.label ?? 'all';
+  let configuredDomain = 'all';
+  let domainConfigError;
+  try { configuredDomain = resolveToolDomainSelection(config).label; }
+  catch (error) { domainConfigError = error.message; }
+  const domainSynced = domainConfigError === undefined && activeDomain === configuredDomain;
+  add('tool_domain_sync', domainSynced, domainConfigError
+    ? domainConfigError
+    : domainSynced
+      ? `已同步（toolDomain: ${activeDomain}）`
+      : `配置 toolDomain 为 ${configuredDomain}，但当前进程已注册为 ${activeDomain}；重启或重载 DSH 后生效。`, false);
   const skillState = await checkSkillSync(location.cwd);
   add('skill_sync', skillState.ok, skillState.detail, false);
   const deadline = AbortSignal.timeout(8500);
@@ -1808,6 +1821,7 @@ function compactJson(value, configSource) {
 }
 
 function registerTool(ctx, toolName, description, properties, run, required = ['file_path'], capture, parametersOverride) {
+  if (!shouldRegisterTool(toolName, DOMAIN_SELECTIONS.get(ctx))) return;
   ctx.tools.register({
     name: toolName,
     description,
@@ -1862,6 +1876,8 @@ export function apply(ctx, config) {
   const workbench = createWorkbenchEnvironment(config);
   const currentConfig = () => workbench.presetConfig();
   OUTPUT_CONFIGS.set(ctx, currentConfig);
+  const domainSelection = resolveToolDomainSelection(currentConfig());
+  DOMAIN_SELECTIONS.set(ctx, domainSelection);
   const inspectRanges = createRangeInspector(ctx.fs);
   const results = createToolResults();
   const calculation = createCalculationRunner();
@@ -2085,7 +2101,7 @@ export function apply(ctx, config) {
     '静态检查本地 ELF：头信息、checksec（NX/PIE/RELRO/canary/FORTIFY）、导入、PLT/GOT、gadget 与 libc 导出。',
     { file_path: PATH_SCHEMA },
     async (args, _execution, location) => inspectElf(await readAttachment(ctx, args.file_path, location)), undefined, fileResults);
-  if (extendedAudit) {
+  if (extendedAudit || domainSelection.allowedTools?.has('pwn_cyclic')) {
     registerTool(ctx, 'pwn_cyclic',
       '生成或查找 pwntools 兼容 De Bruijn 循环模式（阶 4）。',
       PWN_PATTERN_PROPERTIES,
@@ -2328,6 +2344,8 @@ export function apply(ctx, config) {
   }
   registerExtraTools(ctx, currentConfig, {
     extendedAudit,
+    domainSelection,
+    shouldRegister: toolName => shouldRegisterTool(toolName, domainSelection),
     location: execution => workspaceLocation(ctx, execution),
     async input(location, path) {
       const parts = pathParts(path);
