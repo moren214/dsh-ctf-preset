@@ -74,12 +74,14 @@ RUN if [ "$WITH_APK" = "1" ]; then \
         && chmod +x /usr/local/bin/apktool; \
     fi
 
-# 4. 符号执行引擎 angr
+# 4. 符号执行引擎 angr（版本锁定见 docker/requirements-heavy.txt）
+COPY requirements-heavy.txt /tmp/requirements-heavy.txt
 RUN if [ "$WITH_ANGR" = "1" ]; then \
         PIP_ARGS="--no-cache-dir" \
         && if [ -n "$PIP_INDEX_URL" ]; then PIP_ARGS="$PIP_ARGS -i $PIP_INDEX_URL"; fi \
-        && pip3 install $PIP_ARGS angr; \
-    fi
+        && pip3 install $PIP_ARGS -r /tmp/requirements-heavy.txt; \
+    fi \
+    && rm -f /tmp/requirements-heavy.txt
 
 # 5. 高阶数学/格密码引擎 SageMath（默认关闭，传 --build-arg WITH_SAGE=1 启用）
 RUN if [ "$WITH_SAGE" = "1" ]; then \

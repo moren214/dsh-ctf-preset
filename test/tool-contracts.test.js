@@ -17,11 +17,12 @@ function collectTools(config) {
 const coreTools = collectTools({ compact: true });
 const fullTools = collectTools({ compact: true, enableExtendedAudit: true });
 
-test('default Core Tier registers 27 slimmed tools and reduces schema size significantly', () => {
-  assert.equal(coreTools.size, 27);
+test('default Core Tier registers 28 slimmed tools and reduces schema size significantly', () => {
+  assert.equal(coreTools.size, 28);
   assert.ok(coreTools.has('ctf_sandbox'));
   assert.ok(coreTools.has('ctf_graph'));
   assert.ok(coreTools.has('ctf_arena'));
+  assert.ok(coreTools.has('ctf_domain'));
   assert.equal(coreTools.has('pwn_cyclic'), false);
   assert.equal(coreTools.has('cloud_metadata'), false);
   assert.equal(coreTools.has('verify_evidence'), false);
@@ -30,11 +31,11 @@ test('default Core Tier registers 27 slimmed tools and reduces schema size signi
   const schemaChars = JSON.stringify(
     [...coreTools.values()].map(({ name, description, parameters }) => ({ name, description, parameters })),
   ).length;
-  assert.ok(schemaChars < 38000, `expected core schema < 38000 chars, got ${schemaChars}`);
+  assert.ok(schemaChars < 40000, `expected core schema < 40000 chars, got ${schemaChars}`);
 });
 
-test('enableExtendedAudit: true restores all 45 tools with full backward compatibility', () => {
-  assert.equal(fullTools.size, 45);
+test('enableExtendedAudit: true restores all 46 tools with full backward compatibility', () => {
+  assert.equal(fullTools.size, 46);
   for (const name of ['pwn_cyclic', 'pwn_payload', 'verify_evidence', 'mobile_apk', 'cloud_metadata', 'competition_api', 'submit_check']) {
     assert.ok(fullTools.has(name), `expected ${name} in full tier`);
   }

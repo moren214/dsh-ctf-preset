@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
 import { ATTACHMENT_OPERATIONS } from './offline-calculation.js';
+import { ToolError } from './tool-errors.js';
 
 export const EXPERIMENT_TOOLS = ['scan_binary', 'inspect_attachment', 'read_binary_range', 'read_archive_member', 'calculate_offline'];
 
 function canonical(value, depth = 0) {
-  if (depth > 12) throw new Error('input nesting');
+  if (depth > 12) throw new ToolError('unsupported', 'input nesting');
   if (Array.isArray(value)) return value.map(item => canonical(item, depth + 1));
   if (value === null || typeof value !== 'object') return value;
   return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key], depth + 1)]));

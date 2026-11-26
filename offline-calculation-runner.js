@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
 import { CALCULATION_RESUME_ID, calculationReport, supportsCalculationReplay } from './offline-calculation.js';
+import { ToolError } from './tool-errors.js';
 
 const workerFile = new URL('./offline-calculation-worker.js', import.meta.url);
 const MAX_RUNNING = 2;
@@ -30,7 +31,7 @@ export function createCalculationRunner({ budgetMs = 5000, createWorker = startW
   return {
     async run(steps, signal, resolvedInputs, { candidates, resumeId, session, directoryKey } = {}) {
       signal?.throwIfAborted();
-      if (disposed) throw new Error('CTF 计算器已关闭。');
+      if (disposed) throw new ToolError('conflict', 'CTF 计算器已关闭。');
       if (running.size >= MAX_RUNNING) return { status: 'busy', reason: '当前有两项计算在运行。' };
       for (const [id, checkpoint] of checkpoints) {
         if (checkpoint.expires <= Date.now() || checkpoint.session.deref() === undefined) checkpoints.delete(id);
@@ -42,7 +43,7 @@ export function createCalculationRunner({ budgetMs = 5000, createWorker = startW
         const checkpoint = typeof resumeId === 'string' && CALCULATION_RESUME_ID.test(resumeId) ? checkpoints.get(resumeId) : undefined;
         if (!canReplay || !checkpoint || !sessionPresent || checkpoint.session.deref() !== session
           || checkpoint.directoryKey !== directoryKey || checkpoint.digest !== requestDigest(steps, candidates, resolvedInputs)) {
-          throw new Error('续算编号失效或计算参数已变化。请使用同一会话和原计算参数，或重新开始。');
+          throw new ToolError('conflict', '续算编号失效或计算参数已变化。请使用同一会话和原计算参数，或重新开始。');
         }
         completed = [...checkpoint.completed];
       }
@@ -59,7 +60,7 @@ export function createCalculationRunner({ budgetMs = 5000, createWorker = startW
             if (error === undefined) resolve(result);
             else reject(error);
           };
-          const abort = () => complete(signal.reason ?? new Error('计算已取消。'));
+          const abort = () => complete(signal.reason ?? new ToolError('abort', '计算已取消。'));
           const timer = setTimeout(() => {
             try {
               if (completed.length > 0 && completed.length === steps.length) {
@@ -89,7 +90,7 @@ export function createCalculationRunner({ budgetMs = 5000, createWorker = startW
             }
           }, budgetMs);
           worker.on('error', error => complete(error));
-          worker.once('exit', () => complete(new Error('CTF 计算进程已结束。')));
+          worker.once('exit', () => complete(new ToolError('dependency', 'CTF 计算进程已结束。')));
           worker.on('message', ({ report, error, step }) => {
             if (settled) return;
             if (step !== undefined) {
@@ -97,7 +98,7 @@ export function createCalculationRunner({ budgetMs = 5000, createWorker = startW
               return;
             }
             if (error === undefined && resumeId !== undefined) checkpoints.delete(resumeId);
-            complete(error === undefined ? undefined : new Error(error), report);
+            complete(error === undefined ? undefined : new ToolError('unsupported', error), report);
           });
           signal?.addEventListener('abort', abort, { once: true });
           if (signal?.aborted) abort();

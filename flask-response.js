@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { RESULT_HASH } from './ctf-result-values.js';
 import { decodeEvidenceText, parseEvidenceJson } from './evidence.js';
 import { httpTextRows, pathFromTarget, statusCode } from './http-evidence.js';
+import { ToolError } from './tool-errors.js';
 
 const MAX_REPORTED_SITES = 12;
 export const FLASK_RESPONSE_PROPERTIES = {
@@ -17,7 +18,7 @@ function sha256(bytes) {
 
 async function priorReport(files, id, tool) {
   const result = typeof id === 'string' && RESULT_HASH.test(id) ? await files.result(id) : undefined;
-  if (result?.tool !== tool) throw new Error(`请提供当前会话和目录中 ${tool} 返回的完整结果编号。`);
+  if (result?.tool !== tool) throw new ToolError('conflict', `请提供当前会话和目录中 ${tool} 返回的完整结果编号。`);
   return result.report;
 }
 
@@ -119,11 +120,11 @@ export async function verifyFlaskResponse(args, files) {
   const index = args.observation_index;
   const observation = Number.isSafeInteger(index) && index >= 0 ? http.observations[index] : undefined;
   if (http.correlation !== 'request_id' || observation?.match !== 'matched' || observation.format === 'expectations_jsonl') {
-    throw new Error('请选择按请求 ID 唯一定位的实际响应记录。');
+    throw new ToolError('unsupported', '请选择按请求 ID 唯一定位的实际响应记录。');
   }
   const { request } = http;
   if (flask.request.method !== request.method || flask.request.path !== request.path) {
-    throw new Error('HTTP 观测和 Flask 源码结果须对应同一方法与路径。');
+    throw new ToolError('unsupported', 'HTTP 观测和 Flask 源码结果须对应同一方法与路径。');
   }
   const file_path = files.normalizePath(args.file_path);
   const sources = [observation.source, ...flask.sources];
@@ -140,7 +141,7 @@ export async function verifyFlaskResponse(args, files) {
   const { bytes } = await files.readEvent(file_path);
   const event = { file_path, sha256: sha256(bytes) };
   const text = decodeEvidenceText(bytes);
-  if (text === null) throw new Error(`应用事件日志须使用有效的 UTF-8 文本。${file_path}`);
+  if (text === null) throw new ToolError('encoding', `应用事件日志须使用有效的 UTF-8 文本。${file_path}`);
   const checkedHashes = new Map([[file_path, event.sha256]]);
   for (const source of sources) {
     if (!checkedHashes.has(source.file_path)) {

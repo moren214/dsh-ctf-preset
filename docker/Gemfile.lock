@@ -1,0 +1,19 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    one_gadget (1.10.0)
+    seccomp-tools (1.7.1)
+    zsteg (0.2.14)
+
+PLATFORMS
+  ruby
+  x86_64-linux
+  aarch64-linux
+
+DEPENDENCIES
+  one_gadget (= 1.10.0)
+  seccomp-tools (= 1.7.1)
+  zsteg (= 0.2.14)
+
+BUNDLED WITH
+  2.5.11

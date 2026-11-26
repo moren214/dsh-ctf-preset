@@ -134,7 +134,7 @@ function normalizeSource(source, normalizePath) {
     || (source.byte_length !== undefined && source.byte_offset === undefined)
     || (source.json_pointer !== undefined && (!isResultPointer(source.json_pointer) || source.line !== undefined || source.byte_offset !== undefined))
     || (source.sha256 !== undefined && (typeof source.sha256 !== 'string' || !HASH.test(source.sha256)))) {
-    throw new Error('证据位置或 SHA-256 格式无效。');
+    throw new ToolError('unsupported', '证据位置或 SHA-256 格式无效。');
   }
   return {
     file_path: normalizePath(source.file_path), line: source.line, byte_offset: source.byte_offset,
@@ -143,7 +143,7 @@ function normalizeSource(source, normalizePath) {
 }
 
 function normalizeValues(values, normalizePath) {
-  if (!Array.isArray(values) || values.length > MAX_ENTRIES) throw new Error(`最多可核对 ${MAX_ENTRIES} 项工具值。`);
+  if (!Array.isArray(values) || values.length > MAX_ENTRIES) throw new ToolError('unsupported', `最多可核对 ${MAX_ENTRIES} 项工具值。`);
   const labels = new Set();
   return values.map(entry => {
     if (!keysMatch(entry, Object.keys(VALUE_FIELDS)) || !isText(entry.label) || labels.has(entry.label)
@@ -151,7 +151,7 @@ function normalizeValues(values, normalizePath) {
       || !isResultPointer(entry.pointer) || !isResultScalar(entry.value)
       || (entry.tool !== undefined && (typeof entry.tool !== 'string' || !/^[a-z_]{1,40}$/u.test(entry.tool)))
       || (entry.sources !== undefined && (!Array.isArray(entry.sources) || entry.sources.length > MAX_RESULT_SOURCES))) {
-      throw new Error('工具值需要唯一标签、有效的 result_id、字段路径和标量值。');
+      throw new ToolError('unsupported', '工具值需要唯一标签、有效的 result_id、字段路径和标量值。');
     }
     labels.add(entry.label);
     return {
@@ -162,7 +162,7 @@ function normalizeValues(values, normalizePath) {
 }
 
 function normalizeExperiments(entries, normalizePath) {
-  if (!Array.isArray(entries) || entries.length > MAX_EXPERIMENTS) throw new Error('单题验证最多记录 12 项。');
+  if (!Array.isArray(entries) || entries.length > MAX_EXPERIMENTS) throw new ToolError('unsupported', '单题验证最多记录 12 项。');
   const labels = new Set();
   return entries.map(entry => {
     if (!keysMatch(entry, Object.keys(EXPERIMENT_FIELDS)) || !isText(entry.label) || labels.has(entry.label)
@@ -172,7 +172,7 @@ function normalizeExperiments(entries, normalizePath) {
       || (entry.tool !== undefined && !EXPERIMENT_TOOLS.includes(entry.tool))
       || (entry.request_sha256 !== undefined && (typeof entry.request_sha256 !== 'string' || !RESULT_HASH.test(entry.request_sha256)))
       || (entry.sources !== undefined && (!Array.isArray(entry.sources) || entry.sources.length > MAX_RESULT_SOURCES))) {
-      throw new Error('验证记录需要唯一标签、假设、结果字段路径和预期标量值。');
+      throw new ToolError('unsupported', '验证记录需要唯一标签、假设、结果字段路径和预期标量值。');
     }
     labels.add(entry.label);
     return { ...entry, ...(entry.sources === undefined ? {} : {
@@ -183,40 +183,40 @@ function normalizeExperiments(entries, normalizePath) {
 
 function normalizeCommands(commands) {
   if (!Array.isArray(commands) || commands.length > 16) {
-    throw new Error('最多可记录 16 条命令。');
+    throw new ToolError('unsupported', '最多可记录 16 条命令。');
   }
   return commands.map(entry => {
     if (!keysMatch(entry, ['command', 'exit_code', 'output', 'cwd']) || !isText(entry.command)
       || (entry.exit_code !== undefined && !Number.isSafeInteger(entry.exit_code))
       || (entry.output !== undefined && !isText(entry.output))
       || (entry.cwd !== undefined && !isText(entry.cwd))) {
-      throw new Error('命令记录需要单行命令，可选整数退出码、单行输出和目录。');
+      throw new ToolError('unsupported', '命令记录需要单行命令，可选整数退出码、单行输出和目录。');
     }
     return { command: entry.command, exit_code: entry.exit_code, output: entry.output, cwd: entry.cwd };
   });
 }
 
 function normalizeInsights(insights) {
-  if (!Array.isArray(insights) || insights.length > 16) throw new Error('关键判断来源最多记录 16 条。');
+  if (!Array.isArray(insights) || insights.length > 16) throw new ToolError('unsupported', '关键判断来源最多记录 16 条。');
   return insights.map(entry => {
     if (!keysMatch(entry, ['text', 'source', 'note']) || !isText(entry.text)
       || !['self', 'human', 'external'].includes(entry.source)
       || (entry.note !== undefined && !isText(entry.note))) {
-      throw new Error('关键判断需要单行说明和来源（self、human 或 external），可选单行备注。');
+      throw new ToolError('unsupported', '关键判断需要单行说明和来源（self、human 或 external），可选单行备注。');
     }
     return { text: entry.text, source: entry.source, ...(entry.note === undefined ? {} : { note: entry.note }) };
   });
 }
 
 function normalizeHints(hints) {
-  if (!Array.isArray(hints) || hints.length > 16) throw new Error('提示吸收记录最多 16 条。');
+  if (!Array.isArray(hints) || hints.length > 16) throw new ToolError('unsupported', '提示吸收记录最多 16 条。');
   return hints.map(entry => {
     if (!keysMatch(entry, ['hint', 'source', 'hypothesis', 'test', 'verified'])
       || !isText(entry.hint) || !['self', 'human', 'external'].includes(entry.source)
       || !isText(entry.hypothesis)
       || (entry.test !== undefined && !isText(entry.test))
       || (entry.verified !== undefined && typeof entry.verified !== 'boolean')) {
-      throw new Error('提示吸收记录需要提示原文、来源和可证伪假设；可选最小验证和布尔 verified。');
+      throw new ToolError('unsupported', '提示吸收记录需要提示原文、来源和可证伪假设；可选最小验证和布尔 verified。');
     }
     return {
       hint: entry.hint, source: entry.source, hypothesis: entry.hypothesis,
@@ -230,11 +230,11 @@ function normalizeProgress(progress, normalizePath) {
   if (!keysMatch(progress, Object.keys(PROGRESS_FIELDS))
     || !Array.isArray(progress.confirmed) || progress.confirmed.length > MAX_ENTRIES
     || !validList(progress.ruled_out) || !validList(progress.pending)) {
-    throw new Error(`续接记录需要已核验、已排除和待补三组条目，每组最多 ${MAX_ENTRIES} 条。`);
+    throw new ToolError('unsupported', `续接记录需要已核验、已排除和待补三组条目，每组最多 ${MAX_ENTRIES} 条。`);
   }
   const attachments = progress.attachments;
   if (attachments !== undefined && (!Array.isArray(attachments) || attachments.length > MAX_ATTACHMENTS)) {
-    throw new Error('attachments 最多记录 64 个附件路径。');
+    throw new ToolError('unsupported', 'attachments 最多记录 64 个附件路径。');
   }
   return {
     ...(progress.insights === undefined ? {} : { insights: normalizeInsights(progress.insights) }),
@@ -242,7 +242,7 @@ function normalizeProgress(progress, normalizePath) {
     confirmed: [...progress.confirmed].map(entry => {
       if (!keysMatch(entry, ['text', 'sources']) || !isText(entry.text) || !Array.isArray(entry.sources)
         || entry.sources.length < 1 || entry.sources.length > MAX_SOURCES) {
-        throw new Error(`每条已核验结论需要单行说明和 1 至 ${MAX_SOURCES} 个可定位的原件引用。`);
+        throw new ToolError('unsupported', `每条已核验结论需要单行说明和 1 至 ${MAX_SOURCES} 个可定位的原件引用。`);
       }
       return {
         text: entry.text,
@@ -272,12 +272,12 @@ function managedBlock(text, kind, allowModified = false) {
   if (from < 0 && to < 0) return null;
   if (from < 0 || to <= from || text.indexOf(start, from + start.length) >= 0
     || text.indexOf(end, to + end.length) >= 0) {
-    throw new Error('文档中的 CTF 记录区不完整或有重复标记。');
+    throw new ToolError('unsupported', '文档中的 CTF 记录区不完整或有重复标记。');
   }
   const raw = text.slice(from + start.length, to).replace(/\r\n/gu, '\n');
   const match = /^\n<!-- sha256:([a-f0-9]{64}) -->\n([\s\S]*)\n$/u.exec(raw);
   if (!match || (!allowModified && digest(match[2]) !== match[1])) {
-    throw new Error('CTF 记录区已有手工改动，可用 repair 重新核对并恢复。');
+    throw new ToolError('unsupported', 'CTF 记录区已有手工改动，可用 repair 重新核对并恢复。');
   }
   return { from, to: to + end.length, content: match[2] };
 }
@@ -295,10 +295,10 @@ function withManagedBlock(text, kind, content, allowModified = false) {
 
 function validateStoredProgress(progress) {
   if (progress.confirmed.some(entry => entry.sources.some(source => !source.sha256))) {
-    throw new Error('续接记录中的已核验条目缺少原件 SHA-256。');
+    throw new ToolError('unsupported', '续接记录中的已核验条目缺少原件 SHA-256。');
   }
   if (progress.values?.some(entry => !entry.tool || !entry.sources || entry.sources.some(source => !source.sha256))) {
-    throw new Error('续接记录中的工具值缺少工具名或已核对的原件。');
+    throw new ToolError('unsupported', '续接记录中的工具值缺少工具名或已核对的原件。');
   }
   return progress;
 }
@@ -306,12 +306,12 @@ function validateStoredProgress(progress) {
 function inlineRecord(content, normalizePath) {
   const current = /^<!-- dsh-ctf-data-v2\n([\s\S]*?)\n-->\n/u.exec(content);
   const legacy = current ? null : /^<!-- dsh-ctf-data:([A-Za-z0-9+/=]+) -->\n/u.exec(content);
-  if (!current && !legacy) throw new Error('续接记录缺少结构化数据。');
+  if (!current && !legacy) throw new ToolError('encoding', '续接记录缺少结构化数据。');
   let value;
   try {
     value = JSON.parse(current ? current[1] : Buffer.from(legacy[1], 'base64').toString('utf8'));
   } catch {
-    throw new Error('续接记录中的结构化数据无法读取。');
+    throw new ToolError('encoding', '续接记录中的结构化数据无法读取。');
   }
   return { progress: validateStoredProgress(normalizeProgress(value, normalizePath)), meta: {} };
 }
@@ -354,7 +354,7 @@ async function readStored(files, notes, state, allowModified = false) {
         // Old inline data can still be used when present.
       }
     }
-    if (!block || header) throw new Error('当前状态与上一份有效状态均不可读取。');
+    if (!block || header) throw new ToolError('encoding', '当前状态与上一份有效状态均不可读取。');
   }
   return block ? inlineRecord(block.content, files.normalizePath) : null;
 }
@@ -373,7 +373,7 @@ async function retainPrevious(files, state) {
   const backup = await files.readDocument(STATE_BACKUP);
   if (backup.text === state.text) return;
   const current = await files.readDocument(STATE_FILE);
-  if (current.version !== state.version) throw new Error('续接记录已被更新，请重新读取。');
+  if (current.version !== state.version) throw new ToolError('conflict', '续接记录已被更新，请重新读取。');
   try {
     await files.writeDocument({ ...backup, name: STATE_BACKUP }, state.text);
   } catch (error) {
@@ -584,7 +584,7 @@ async function verifySources(progress, readEvidence, saving) {
           invalid_location: '证据位置或范围无效。',
           location_unavailable: '超过 32 MiB 的原件请使用行号、字节范围或原件哈希复核。',
         }[status];
-        throw new Error(reason + file);
+        throw new ToolError('unsupported', reason + file);
       }
       checked.set(reference, saving ? { ...reference, sha256: hash } : { ...reference, status });
     }
@@ -637,7 +637,7 @@ function observedValue(claim, readResult, saved = []) {
 }
 
 function checkValues(claims, files, saved = []) {
-  if (claims.length === 0) throw new Error('claims 至少需要一项工具值。');
+  if (claims.length === 0) throw new ToolError('unsupported', 'claims 至少需要一项工具值。');
   const checks = claims.map(claim => {
     const found = observedValue(claim, files.readResult, saved);
     const reference = { label: claim.label, result_id: claim.result_id, pointer: claim.pointer, expected: claim.value };
@@ -706,23 +706,23 @@ async function checkExperiments(entries, files) {
 
 export async function manageProgress(args, files) {
   const { action, revision } = args;
-  if (!PROGRESS_PROPERTIES.action.enum.includes(action)) throw new Error('请选择读取、核对、保存、生成题解、接替、查看结果或修复。');
+  if (!PROGRESS_PROPERTIES.action.enum.includes(action)) throw new ToolError('unsupported', '请选择读取、核对、保存、生成题解、接替、查看结果或修复。');
   if (action === 'results') {
     if (revision !== undefined || args.progress !== undefined || args.claims !== undefined) {
-      throw new Error('results 只需 action。');
+      throw new ToolError('unsupported', 'results 只需 action。');
     }
     return { status: 'results', file: 'notes.md', results: files.listResults?.() ?? [] };
   }
   if (action === 'experiments') {
-    if (!keysMatch(args, PROGRESS_ACTION_KEYS.experiments)) throw new Error('experiments 只接受 action 和 experiment_query。');
+    if (!keysMatch(args, PROGRESS_ACTION_KEYS.experiments)) throw new ToolError('unsupported', 'experiments 只接受 action 和 experiment_query。');
     const { experiment_query: query } = args;
     let requestHash;
     if (query !== undefined) {
-      if (!keysMatch(query, ['tool', 'args'])) throw new Error('找验证记录需要工具名和原调用参数。');
+      if (!keysMatch(query, ['tool', 'args'])) throw new ToolError('unsupported', '找验证记录需要工具名和原调用参数。');
       const input = typeof query.args?.file_path === 'string'
         ? { ...query.args, file_path: files.normalizePath(query.args.file_path) } : query.args;
       requestHash = experimentRequestHash(query.tool, input);
-      if (requestHash === undefined) throw new Error('无法为这组工具参数计算验证编号。');
+      if (requestHash === undefined) throw new ToolError('unsupported', '无法为这组工具参数计算验证编号。');
     }
     const notes = await files.readDocument('notes.md');
     const state = await files.readDocument(STATE_FILE);
@@ -732,19 +732,19 @@ export async function manageProgress(args, files) {
     return { status: 'experiments', experiments: await checkExperiments(entries, files) };
   }
   if (action === 'check') {
-    if (revision !== undefined || args.progress !== undefined) throw new Error('check 只需 action 和 claims。');
+    if (revision !== undefined || args.progress !== undefined) throw new ToolError('unsupported', 'check 只需 action 和 claims。');
     const notes = await files.readDocument('notes.md');
     const state = await files.readDocument(STATE_FILE);
     const record = await readStored(files, notes, state);
     return checkValues(normalizeValues(args.claims, files.normalizePath), files, record?.progress.values);
   }
-  if (args.claims !== undefined) throw new Error('claims 用于 check。保存工具值时请填写 progress.values。');
+  if (args.claims !== undefined) throw new ToolError('unsupported', 'claims 用于 check。保存工具值时请填写 progress.values。');
   if (((action === 'load' || action === 'handoff') && revision !== undefined) || (action !== 'save' && args.progress !== undefined)) {
-    throw new Error('load 和 handoff 只需 action。writeup 可附 revision，progress 用于 save。');
+    throw new ToolError('unsupported', 'load 和 handoff 只需 action。writeup 可附 revision，progress 用于 save。');
   }
   if ((action === 'save' || action === 'repair' || revision !== undefined)
     && (typeof revision !== 'string' || (revision !== 'absent' && !HASH.test(revision)))) {
-    throw new Error('请先用 load 读取 notes.md，再传入返回的 revision。');
+    throw new ToolError('unsupported', '请先用 load 读取 notes.md，再传入返回的 revision。');
   }
 
   const draft = action === 'save' ? normalizeProgress(args.progress, files.normalizePath) : undefined;
@@ -781,8 +781,8 @@ export async function manageProgress(args, files) {
     if (values !== undefined) {
       draft.values = values.map(claim => {
         const found = observedValue(claim, files.readResult, stored?.values);
-        if (!found) throw new Error('工具结果或字段无法定位。请在当前会话重新调用工具。' + claim.label);
-        if (found.value !== claim.value) throw new Error('工具值与结果不一致。' + claim.label);
+        if (!found) throw new ToolError('unsupported', '工具结果或字段无法定位。请在当前会话重新调用工具。' + claim.label);
+        if (found.value !== claim.value) throw new ToolError('conflict', '工具值与结果不一致。' + claim.label);
         valueStates.set(found.label, found.origin === 'recorded' ? 'recorded'
           : hasOriginals(found.sources) ? 'reverified' : 'tool_match');
         return {
@@ -859,7 +859,7 @@ export async function manageProgress(args, files) {
     const backupName = `notes.ctf-backup-${current.slice(0, 16)}.md`;
     const backup = await files.readDocument(backupName);
     if (backup.version === undefined) await files.writeDocument(backup, notes.text);
-    else if (backup.text !== notes.text) throw new Error('修复备份路径已有不同内容。');
+    else if (backup.text !== notes.text) throw new ToolError('conflict', '修复备份路径已有不同内容。');
     if (stateChanged) await files.writeDocument({ ...state, name: STATE_FILE }, body);
     if (content !== notes.text) await files.writeDocument(notes, content);
     await mirrorState(files, body);

@@ -1,5 +1,12 @@
 # 变更记录
 
+## 1.0.0
+
+- **Core Runtime 底座正式成型并分化双预设与无头 Runner**：
+  - `core/` 封装统一 `ToolError` 契约、`createCtfRuntime`、`createToolExecutor`、SQLite WAL 权威事务账本（图谱 + `network_grants` + `instance_locks` + `submission_receipts` + `ArtifactStore`）、常驻 stdio 管道热容器池（`< 30 ms` 热复用）、中英双语路由器与 `ctf_domain` 动态热扩域。
+  - **双预设分化（Single Plugin -> Dual Presets）**：`presets/copilot/`（`triage_card` + `approval-gate` 审批门）与 `presets/autonomous/`（`triage` 极简冷启动 + `ctf_swarm` Best-of-N 调度 + `ctf_verify_exit` 机器验证退出），在 `cordis.patch.yml` 并列暴露 `CTF Copilot` 与 `CTF Autonomous`。
+  - **Stage 6**：6 个 Python worker 收拢至 `core/workers/`（配 `tests/python/test_workers.py`），新增无头比赛 Runner（`runner/cli.js` + `runner/http-server.js`）、`docker/Dockerfile.agent` 以及 `requirements-base.txt` / `requirements-heavy.txt` / `Gemfile.lock` / 全架构 `ffuf` SHA-256 供应链锁定。
+
 ## 0.51.5
 
 - **Windows 上 Ghidra 不再因为编码问题静默回退 objdump**：`DECOMPILE_SCRIPT` 生成 Ghidra postScript 时用的是默认编码，而 Windows runner 的 ANSI 代码页是 cp1252，脚本里的中文提示让 `write()` 抛 `UnicodeEncodeError`，上层把它当成「Ghidra 失败」后回退到 objdump（CI 注解里就是 `expected: ghidra / actual: objdump`）。现在脚本、结果 JSON 与缓存 `meta.json` 的读写都显式 `encoding="utf-8"`。
@@ -235,7 +242,8 @@
 
 | 插件版本 | DSH 版本 | 说明 |
 |---|---|---|
-| 0.51.x | `>=0.2.2-rc.5 <0.3.0` | 当前版本。补审计回归用例、CI 容器冒烟与镜像 digest/SHA-256 锁定，提交账本坏行可见；基础镜像恢复 r2/r2ghidra 并修好 r2 反编译调用；7z 容器先验签，避免 Ubuntu 24.04 的 libarchive 段错误。 |
+| 1.0.x | `>=0.2.2-rc.5 <0.3.0` | 当前版本。Core Runtime 底座 + 双预设（CTF Copilot / CTF Autonomous）+ 运行时 `ctf_domain` 热扩域 + SQLite 权威事务提交账本 + 常驻 stdio 容器池 + 无头 Runner 与全供应链锁。 |
+| 0.51.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。补审计回归用例、CI 容器冒烟与镜像 digest/SHA-256 锁定，提交账本坏行可见；基础镜像恢复 r2/r2ghidra 并修好 r2 反编译调用；7z 容器先验签，避免 Ubuntu 24.04 的 libarchive 段错误。 |
 | 0.50.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。保持 Core Tier（27 核心 / 45 全量）；精简 `ctf_progress` schema、新增 `ctf_graph` 分页/`export_writeup`、`ctf_arena` GZCTF Cookie/续期/solves 排优、`browser_session` Web 进阶、Docker 加固与 `bkcrack`/`ffuf`/`sqlmap` 等兵器、`mobile_apk` 沙箱桥接、`inspect_media(kind: "model")` 及 3 个密码学脚手架。 |
 | 0.49.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。默认 Core Tier（27 工具，`enableExtendedAudit: true` 恢复全部 45 工具）；新增 `ctf_sandbox`（双层镜像自动路由/WSL2 兜底）、`ctf_graph`、`ctf_arena` 与 `crypto_solver solve`。 |
 | 0.48.x | `>=0.2.2-rc.5 <0.3.0` | 旧版本。函数级 Rev 控制流分析，以及 ZIP 候选检查、文件片段复读和压缩附件链路需要对应工具及宿主能力。 |

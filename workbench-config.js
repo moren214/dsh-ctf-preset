@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { accessSync, constants, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
+import { ToolError } from './tool-errors.js';
 
 const WINDOWS = process.platform === 'win32';
 const PROBE = 'import json, sys; print(json.dumps(sys.executable)) if sys.version_info >= (3, 11) else sys.exit(1)';
@@ -168,7 +169,7 @@ export function createWorkbenchEnvironment(overrides = {}, configFile) {
       }
       try {
         accessSync(source, constants.R_OK);
-        if (!statSync(source).isFile()) throw new Error('not a file');
+        if (!statSync(source).isFile()) throw new ToolError('conflict', 'not a file');
       } catch {
         throw new WorkbenchDependencyError('Base100 工作台源码不可读取。请检查 ctf-workbench.json 的 base100Source。');
       }

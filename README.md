@@ -255,6 +255,7 @@ preset 已声明平台 shell（Windows 为 `pwsh`，其他平台为 `bash`），
 
 ## 迁移说明
 
+- **v0.51 → v1.0.0**：底座拆分完成：单一包内提供 `CTF Copilot`（`presets/copilot`，`triage_card` + `approval-gate`）与 `CTF Autonomous`（`presets/autonomous`，`ctf_swarm` + `ctf_verify_exit`）双预设，新增 `ctf_domain` 运行时热扩域（28 核心 / 46 全量）、常驻 stdio 沙箱池、SQLite 权威提交账本、`runner/` 无头解题器及供应链锁定。
 - **v0.48 → v0.49**：新增 `enableExtendedAudit` 工具分层（默认 `false` 加载 27 个核心工具，设为 `true` 可 100% 恢复全部 45 个工具）；新增 `ctf_sandbox`（双层镜像自动路由 + WSL2 自动回退）、`ctf_graph`（`.ctf-graph/` 共享图谱）、`ctf_arena`（CTFd/GZCTF 原生适配）与 `crypto_solver solve`；配置新增可选字段 `sandboxBackend`、`sandboxImage`、`sandboxHeavyImage`、`sandboxWslDistro`、`platformType`、`platformGameId`、`platformChallengesPath`，原有配置与续接文件无需改动。
 - **v0.28 → v0.30**：附件导入目录由 `.ctf-imports/` 改为 `.ctf-attachments/`，并新增 `manifest.jsonl` 登记来源与时间；工具错误新增 `missing`；`ctf_progress results` 可列出 `result_id`。
 - **v0.31 → v0.32**：`verify_evidence` 支持 `result_id`；新增 `ctf_doctor` 与 `competition_api`；续接提示自动注入。
@@ -263,9 +264,9 @@ preset 已声明平台 shell（Windows 为 `pwsh`，其他平台为 `bash`），
 
 ## 变更记录
 
-完整变更与兼容矩阵见 `CHANGELOG.md`（当前 `0.51.5`）。近期摘要：
+完整变更与兼容矩阵见 `CHANGELOG.md`（当前 `1.0.0`）。近期摘要：
 
-- Unreleased：图谱租约拒绝未认领任务直接结案并分页 `ruled_out`；Python 热重载、CRLF Bash 脚本、反编译失败诊断、平台认证探测、只读看板与续接错误分类得到加固；平台附件复用适配器认证，模型扫描截断显示不完整状态。
+- 1.0.0 Core Runtime 底座解耦与双预设（`CTF Copilot` + `CTF Autonomous`）分化，新增 `ctf_domain` 动态扩域（28 个核心实战工具，启用扩展审计后共 46 个）、SQLite 事务提交账本、常驻 stdio 容器池、无头 Runner 与供应链锁定。
 
 - 0.51.5 `DECOMPILE_SCRIPT` 的脚本、结果与缓存元数据显式 UTF-8 读写，修掉 Windows 上因 ANSI 代码页编码失败而静默回退 objdump（`.bat` 走 `cmd.exe /c` 的修复见 0.51.4）。
 - 0.51.4 Windows 原生 Ghidra 改走 `cmd.exe /c` 执行 `.bat`，不再静默回退 objdump；CI 容器隔离断言补齐 `--tmpfs /tmp`、摘帽与 `NoNewPrivs`，并与 `buildDockerArgs` 用同一组参数。

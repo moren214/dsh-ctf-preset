@@ -1,5 +1,6 @@
 import { checkPrimeSync, createCipheriv, createDecipheriv, createHash, createHmac } from 'node:crypto';
 import { RESULT_HASH } from './ctf-result-values.js';
+import { ToolError } from './tool-errors.js';
 
 const MAX_STEPS = 12;
 const MAX_CANDIDATES = 8;
@@ -1944,18 +1945,18 @@ function isBase(value) {
 
 export function validateSteps(steps) {
   if (!Array.isArray(steps) || steps.length < 1 || steps.length > MAX_STEPS) {
-    throw new Error('请提供 1 至 12 个计算步骤。');
+    throw new ToolError('unsupported', '请提供 1 至 12 个计算步骤。');
   }
   const references = [];
   for (const [index, step] of steps.entries()) {
     const number = index + 1;
     if (!isObject(step) || typeof step.operation !== 'string' || !Object.hasOwn(OPERATIONS, step.operation)) {
-      throw new Error('第 ' + number + ' 步的运算类型无效。');
+      throw new ToolError('unsupported', '第 ' + number + ' 步的运算类型无效。');
     }
     const spec = OPERATIONS[step.operation];
     const allowed = ['operation', 'inputs', 'expected', 'result_offset', ...(spec.options ?? [])];
     if (!Object.keys(step).every(key => allowed.includes(key))) {
-      throw new Error('第 ' + number + ' 步含有当前运算用不到的参数。');
+      throw new ToolError('unsupported', '第 ' + number + ' 步含有当前运算用不到的参数。');
     }
     const inputCount = Array.isArray(step.inputs) ? step.inputs.length : 0;
     const countValid = spec.inputs === 'variable'
@@ -1964,12 +1965,12 @@ export function validateSteps(steps) {
     if (!Array.isArray(step.inputs) || !countValid
       || ![...step.inputs].every(value => validInput(value, index))) {
       const expected = spec.inputs === 'variable' ? '1 至 ' + MAX_ATTACK_INPUTS : spec.inputs;
-      throw new Error('第 ' + number + ' 步需要 ' + expected + ' 个有效字符串或引用。');
+      throw new ToolError('unsupported', '第 ' + number + ' 步需要 ' + expected + ' 个有效字符串或引用。');
     }
     for (const [inputIndex, input] of step.inputs.entries()) {
       if (!isAttachmentInput(input)) continue;
       if (!ATTACHMENT_INPUT_OPERATIONS.includes(step.operation)) {
-        throw new Error('第 ' + number + ' 步须使用前序结果处理附件。直接引用仅用于编解码、格式转换、哈希和字节转整数。');
+        throw new ToolError('unsupported', '第 ' + number + ' 步须使用前序结果处理附件。直接引用仅用于编解码、格式转换、哈希和字节转整数。');
       }
       references.push({
         step: number, input: inputIndex, ...input,
@@ -1977,39 +1978,39 @@ export function validateSteps(steps) {
       });
     }
     if (step.expected !== undefined && !fitsValue(step.expected)) {
-      throw new Error('第 ' + number + ' 步的期望值须为不超过 4096 字符的有效文本。');
+      throw new ToolError('unsupported', '第 ' + number + ' 步的期望值须为不超过 4096 字符的有效文本。');
     }
     if (step.result_offset !== undefined && (!Number.isInteger(step.result_offset)
       || step.result_offset < 0 || step.result_offset > MAX_RESULT_CHARACTERS)) {
-      throw new Error('第 ' + number + ' 步的 result_offset 超出结果范围上限。');
+      throw new ToolError('size', '第 ' + number + ' 步的 result_offset 超出结果范围上限。');
     }
     if (step.operation === 'convert_base' && (!isBase(step.from_base) || !isBase(step.to_base))) {
-      throw new Error('第 ' + number + ' 步须指定 2 至 36 的起始和目标进制。');
+      throw new ToolError('unsupported', '第 ' + number + ' 步须指定 2 至 36 的起始和目标进制。');
     }
     if (step.operation === 'convert_encoding'
       && (!ENCODINGS.includes(step.from_encoding) || !ENCODINGS.includes(step.to_encoding))) {
-      throw new Error('第 ' + number + ' 步须指定 utf8、hex、base64 或 base64url 编码。');
+      throw new ToolError('unsupported', '第 ' + number + ' 步须指定 utf8、hex、base64 或 base64url 编码。');
     }
     if (spec.options?.includes('width') && !WORD_WIDTHS.includes(step.width)) {
-      throw new Error('第 ' + number + ' 步须指定 8、16、32 或 64 位字宽。');
+      throw new ToolError('unsupported', '第 ' + number + ' 步须指定 8、16、32 或 64 位字宽。');
     }
     if (spec.options?.includes('from_width') && (!WORD_WIDTHS.includes(step.from_width) || step.from_width > step.width)) {
-      throw new Error('第 ' + number + ' 步的原字宽须为 8、16、32 或 64，且最多等于目标字宽。');
+      throw new ToolError('unsupported', '第 ' + number + ' 步的原字宽须为 8、16、32 或 64，且最多等于目标字宽。');
     }
     if (spec.options?.includes('byte_order') && !BYTE_ORDERS.includes(step.byte_order)) {
-      throw new Error('第 ' + number + ' 步须指定 little 或 big 字节序。');
+      throw new ToolError('unsupported', '第 ' + number + ' 步须指定 little 或 big 字节序。');
     }
     if (spec.validate) {
       try {
         spec.validate(step);
       } catch (error) {
-        if (error instanceof CalculationError) throw new Error('第 ' + number + ' 步' + error.message);
+        if (error instanceof CalculationError) throw new ToolError('unsupported', '第 ' + number + ' 步' + error.message);
         throw error;
       }
     }
   }
   if (references.length && steps.some(step => !ATTACHMENT_OPERATIONS.includes(step.operation))) {
-    throw new Error('引用原件的批次仅支持编解码、格式转换、哈希和整数复算。');
+    throw new ToolError('unsupported', '引用原件的批次仅支持编解码、格式转换、哈希和整数复算。');
   }
   return references;
 }
@@ -2055,7 +2056,7 @@ function validateCandidates(candidates, steps) {
   if (candidates === undefined) return;
   if (!supportsCalculationReplay(steps) || !Array.isArray(candidates)
     || candidates.length < 1 || candidates.length > MAX_CANDIDATES) {
-    throw new Error('候选核对仅用于确定性复算，须提供 1 至 8 个候选。');
+    throw new ToolError('unsupported', '候选核对仅用于确定性复算，须提供 1 至 8 个候选。');
   }
   const labels = new Set();
   for (const candidate of candidates) {
@@ -2065,7 +2066,7 @@ function validateCandidates(candidates, steps) {
       || candidate.checkpoints.length > steps.length
       || !candidate.checkpoints.every((number, index, list) => Number.isInteger(number)
         && number > (list[index - 1] ?? 0) && steps[number - 1]?.expected !== undefined)) {
-      throw new Error('候选标签须唯一，检查点须按编号递增并引用带 expected 的步骤。');
+      throw new ToolError('unsupported', '候选标签须唯一，检查点须按编号递增并引用带 expected 的步骤。');
     }
     labels.add(candidate.label);
   }
@@ -2101,7 +2102,7 @@ export function calculateSteps(steps, resolvedInputs = [], { completed = [], onS
   validateCandidates(candidates, steps);
   if (!Array.isArray(resolvedInputs) || resolvedInputs.length !== references.length
     || !resolvedInputs.every(value => typeof value === 'string')) {
-    throw new Error('附件引用未完整解析，请重新读取原件。');
+    throw new ToolError('unsupported', '附件引用未完整解析，请重新读取原件。');
   }
   const attachments = new Map();
   for (const [index, reference] of references.entries()) {

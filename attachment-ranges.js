@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { ToolError } from './tool-errors.js';
 
 const HASH_CHUNK_BYTES = 4 * 1024 * 1024;
 const CACHED_FILES = 8;
@@ -22,7 +23,7 @@ export async function requireCurrentFile(fs, file, signal) {
 
 export function checkAttachmentHash(expected, actual) {
   if (expected !== undefined && expected !== actual) {
-    throw new Error('原件 SHA-256 与待核对的值不同，请重新读取第一页或第一段。');
+    throw new ToolError('conflict', '原件 SHA-256 与待核对的值不同，请重新读取第一页或第一段。');
   }
 }
 
@@ -127,7 +128,7 @@ export function createRangeInspector(fs) {
 }
 
 export async function inspectLogWindow({ size, read }, offset, length) {
-  if (offset > size) throw new Error('byte_offset 超出了原件大小。');
+  if (offset > size) throw new ToolError('size', 'byte_offset 超出了原件大小。');
   if (offset === size) return { report: { byte_offset: offset, byte_length: 0, next_byte_offset: null, text: '' } };
 
   const first = Math.max(0, offset - UTF8_LOOKAROUND);
@@ -141,10 +142,10 @@ export async function inspectLogWindow({ size, read }, offset, length) {
   let text;
   try {
     const snippet = bytes.subarray(start, end);
-    if (snippet.includes(0)) throw new Error('包含 NUL 字节');
+    if (snippet.includes(0)) throw new ToolError('encoding', '包含 NUL 字节');
     text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(snippet);
   } catch {
-    throw new Error('所选范围须是有效的 UTF-8 文本。');
+    throw new ToolError('encoding', '所选范围须是有效的 UTF-8 文本。');
   }
   return { report: {
     byte_offset: first + start,

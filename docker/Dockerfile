@@ -26,6 +26,7 @@ ARG PWNINIT_VERSION=3.3.1
 ARG BKCRACK_SHA256=38dc3ae78923474b769ab1969bb2cffcbc501a90fde6bf68a6410f7ccf25c0f5
 ARG PWNINIT_SHA256=1b72653be59f8f13ea934d1153e8d845eac0dbac62a8c4d9dc4a25577f009362
 ARG FFUF_SHA256_AMD64=fc2c82736c14dcbea4daf3d3cf3878c1c4773008ba45c2bc0fceba7d17b40bb5
+ARG FFUF_SHA256_ARM64=6ae920d09d5202762fca21967a460c6fb88135bdfa806bee4d3d2c430dcedeea
 ARG GEF_SHA256=cf5795a042585d3791e5d63880050364f6338c10a91b409e530391c2391fe48d
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -110,35 +111,21 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# 3. 高频 Pwn / Rev / Crypto / Web / 内存取证 Python 兵器库
+# 3. 高频 Pwn / Rev / Crypto / Web / 内存取证 Python 兵器库（版本锁定见 docker/requirements-base.txt）
+COPY requirements-base.txt /tmp/requirements-base.txt
 RUN python3 -m venv --system-site-packages /opt/ctf-venv \
     && PIP_ARGS="--no-cache-dir" \
     && if [ -n "$PIP_INDEX_URL" ]; then PIP_ARGS="$PIP_ARGS -i $PIP_INDEX_URL"; fi \
-    && pip3 install $PIP_ARGS \
-        pwntools \
-        ROPgadget \
-        ropper \
-        capstone \
-        z3-solver \
-        pycryptodome \
-        sympy \
-        gmpy2 \
-        ecdsa \
-        pyjwt \
-        itsdangerous \
-        requests \
-        beautifulsoup4 \
-        flask \
-        volatility3 \
-        pillow \
-        "numpy<2" \
-        scipy \
-        scapy \
-        xdis \
-        pyinstxtractor-ng
+    && pip3 install $PIP_ARGS -r /tmp/requirements-base.txt \
+    && rm -f /tmp/requirements-base.txt
 
-# 4.5 高频独立安全工具（bkcrack / ffuf / pwninit，锁定版本）
+# 4.5 高频独立安全工具（bkcrack / ffuf / pwninit，全架构强制 SHA-256 校验）
 RUN ARCH="$(dpkg --print-architecture)" \
+    && case "$ARCH" in \
+        amd64) FFUF_ARCH="amd64"; FFUF_SHA256="$FFUF_SHA256_AMD64" ;; \
+        arm64) FFUF_ARCH="arm64"; FFUF_SHA256="$FFUF_SHA256_ARM64" ;; \
+        *) echo "Unsupported architecture for ffuf: $ARCH" >&2; exit 2 ;; \
+    esac \
     && if [ "$ARCH" = "amd64" ]; then \
         curl -fsSL "${GITHUB_BASE_URL}/kimci86/bkcrack/releases/download/v${BKCRACK_VERSION}/bkcrack-${BKCRACK_VERSION}-Linux.tar.gz" -o /tmp/bkcrack.tgz \
         && echo "${BKCRACK_SHA256}  /tmp/bkcrack.tgz" | sha256sum -c - \
@@ -149,9 +136,8 @@ RUN ARCH="$(dpkg --print-architecture)" \
         && echo "${PWNINIT_SHA256}  /usr/local/bin/pwninit" | sha256sum -c - \
         && chmod +x /usr/local/bin/pwninit; \
     fi \
-    && FFUF_ARCH="$( [ "$ARCH" = "arm64" ] && echo arm64 || echo amd64 )" \
     && curl -fsSL "${GITHUB_BASE_URL}/ffuf/ffuf/releases/download/v${FFUF_VERSION}/ffuf_${FFUF_VERSION}_linux_${FFUF_ARCH}.tar.gz" -o /tmp/ffuf.tgz \
-    && if [ "$FFUF_ARCH" = "amd64" ]; then echo "${FFUF_SHA256_AMD64}  /tmp/ffuf.tgz" | sha256sum -c -; fi \
+    && echo "${FFUF_SHA256}  /tmp/ffuf.tgz" | sha256sum -c - \
     && tar -xzf /tmp/ffuf.tgz -C /usr/local/bin ffuf \
     && chmod +x /usr/local/bin/ffuf \
     && rm -f /tmp/ffuf.tgz
@@ -189,9 +175,9 @@ RUN if [ "$WITH_R2" = "1" ]; then \
     fi
 
 RUN if [ "$RUBYGEMS_SOURCE_URL" = "https://rubygems.org" ]; then \
-        gem install --no-document seccomp-tools one_gadget zsteg; \
+        gem install --no-document seccomp-tools:1.7.1 one_gadget:1.10.0 zsteg:0.2.14; \
     else \
-        gem install --no-document --source "$RUBYGEMS_SOURCE_URL" seccomp-tools one_gadget zsteg; \
+        gem install --no-document --source "$RUBYGEMS_SOURCE_URL" seccomp-tools:1.7.1 one_gadget:1.10.0 zsteg:0.2.14; \
     fi
 
 RUN groupadd --gid 10001 ctf \

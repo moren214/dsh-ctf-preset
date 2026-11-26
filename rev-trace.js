@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { isResultScalar, RESULT_HASH } from './ctf-result-values.js';
 import { parseEvidenceJson } from './evidence.js';
 import { revText } from './rev-evidence.js';
+import { ToolError } from './tool-errors.js';
 
 const FIELDS = ['function', 'address', 'input', 'state_before', 'state', 'value_before', 'value', 'output'];
 
@@ -18,7 +19,7 @@ function readTrace(bytes, file_path) {
   let previous = 0;
   for (const { content, location } of rows) {
     const data = parseEvidenceJson(content);
-    if (!Number.isSafeInteger(data?.step) || data.step <= previous) throw new Error(`${file_path} 第 ${location.line} 行须有唯一递增的正整数 step。`);
+    if (!Number.isSafeInteger(data?.step) || data.step <= previous) throw new ToolError('unsupported', `${file_path} 第 ${location.line} 行须有唯一递增的正整数 step。`);
     previous = data.step;
     records.push({ data, source: { ...source, ...location } });
   }
@@ -27,7 +28,7 @@ function readTrace(bytes, file_path) {
 
 async function machineTrace(id, files) {
   const cached = typeof id === 'string' && RESULT_HASH.test(id) ? await files.result(id) : undefined;
-  if (cached?.tool !== 'verify_rev_machine') throw new Error('请使用当前会话和目录中 verify_rev_machine 的结果编号。');
+  if (cached?.tool !== 'verify_rev_machine') throw new ToolError('conflict', '请使用当前会话和目录中 verify_rev_machine 的结果编号。');
   const machine = cached.report;
   const [source] = machine.sources;
   const current = await files.snapshot(source.file_path);
@@ -72,10 +73,10 @@ function compareRows(expected, observed, fields) {
 export async function compareRevTrace(args, files) {
   const fields = args.fields;
   if (!Array.isArray(fields) || !fields.length || fields.some(field => !FIELDS.includes(field)) || new Set(fields).size !== fields.length) {
-    throw new Error('请选择要核对的不同轨迹字段。');
+    throw new ToolError('unsupported', '请选择要核对的不同轨迹字段。');
   }
   if ((args.reference_path === undefined) === (args.machine_result_id === undefined)) {
-    throw new Error('请选用参考文件或当前会话的状态机结果。');
+    throw new ToolError('unsupported', '请选用参考文件或当前会话的状态机结果。');
   }
   const file_path = files.normalizePath(args.file_path);
   const input = await files.read(file_path);
@@ -84,7 +85,7 @@ export async function compareRevTrace(args, files) {
   if (args.reference_path !== undefined) {
     const reference = files.normalizePath(args.reference_path);
     const file = await files.read(reference);
-    if ((input.targetKey ?? file_path) === (file.targetKey ?? reference)) throw new Error('请使用不同的观测和参考记录。');
+    if ((input.targetKey ?? file_path) === (file.targetKey ?? reference)) throw new ToolError('unsupported', '请使用不同的观测和参考记录。');
     expected = readTrace(file.bytes, reference);
   } else {
     expected = await machineTrace(args.machine_result_id, files);

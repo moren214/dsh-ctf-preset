@@ -1,6 +1,7 @@
 import { parseEvidenceJson } from './evidence.js';
 import { calculateSteps, WORD_ACCUMULATOR_OPERATIONS, WORD_WIDTHS } from './offline-calculation.js';
 import { revText } from './rev-evidence.js';
+import { ToolError } from './tool-errors.js';
 
 const MAX_INPUT_BYTES = 64;
 const STATE = /^[A-Za-z_][A-Za-z_0-9.-]{0,63}$/u;
@@ -34,31 +35,31 @@ function readRules(rows) {
     if (!start) {
       if (!allowed(row, ['kind', 'state', 'width', 'value']) || row.kind !== 'start' || !test(row.state, STATE)
         || !WORD_WIDTHS.includes(row.width) || !test(row.value, WORD)) {
-        throw new Error(`第 ${location.line} 行须声明起始状态、字宽和初始整数。`);
+        throw new ToolError('unsupported', `第 ${location.line} 行须声明起始状态、字宽和初始整数。`);
       }
       start = { ...row, line: location.line };
       continue;
     }
     if (!allowed(row, ['kind', 'state', 'byte', 'next', 'operation', 'operand', 'emit']) || row.kind !== 'rule'
       || !test(row.state, STATE) || !test(row.next, STATE) || (row.byte !== '*' && !test(row.byte, BYTE))
-      || (row.emit !== undefined && typeof row.emit !== 'boolean')) throw new Error(`第 ${location.line} 行的转换规则无效。`);
+      || (row.emit !== undefined && typeof row.emit !== 'boolean')) throw new ToolError('unsupported', `第 ${location.line} 行的转换规则无效。`);
     if (row.operation !== undefined ? !WORD_ACCUMULATOR_OPERATIONS.includes(row.operation) || !(row.operand === 'input' || test(row.operand, WORD))
-      : row.operand !== undefined) throw new Error(`第 ${location.line} 行的运算或操作数无效。`);
+      : row.operand !== undefined) throw new ToolError('unsupported', `第 ${location.line} 行的运算或操作数无效。`);
     const key = transitionKey(row.state, row.byte.toLowerCase());
-    if (rules.has(key)) throw new Error(`第 ${location.line} 行与已有状态和字节规则重复。`);
+    if (rules.has(key)) throw new ToolError('unsupported', `第 ${location.line} 行与已有状态和字节规则重复。`);
     rules.set(key, { ...row, line: location.line });
   }
-  if (!start || rules.size === 0) throw new Error('请提供起始状态和至少一条状态转换规则。');
+  if (!start || rules.size === 0) throw new ToolError('unsupported', '请提供起始状态和至少一条状态转换规则。');
   return { start, rules };
 }
 
 export function verifyRevMachine(bytes, file_path, args) {
   const { input_hex: input, expected_value: expected, expected_state: expectedState } = args;
   if (typeof input !== 'string' || input.length > MAX_INPUT_BYTES * 2 || input.length % 2 !== 0 || /[^\da-f]/iu.test(input)) {
-    throw new Error('输入须为最多 64 字节的成对 Hex。');
+    throw new ToolError('unsupported', '输入须为最多 64 字节的成对 Hex。');
   }
   if ((expected !== undefined && !test(expected, /^\d{1,20}$/u)) || (expectedState !== undefined && !test(expectedState, STATE))) {
-    throw new Error('最终期望值须使用无符号十进制字符串，期望状态须为有效状态名称。');
+    throw new ToolError('unsupported', '最终期望值须使用无符号十进制字符串，期望状态须为有效状态名称。');
   }
   const { source, rows } = revText(bytes, file_path, 512);
   const { start, rules } = readRules(rows);

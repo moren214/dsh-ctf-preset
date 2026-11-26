@@ -1,3 +1,4 @@
+import { ToolError } from './tool-errors.js';
 const ALPHABET = 'abcdefghijklmnopqrstuvwxyz';
 const ORDER = 4;
 const MAX_PATTERN = 1024 * 1024;
@@ -34,11 +35,11 @@ function sequence() {
 
 function parseValue(raw, byteOrder) {
   if (typeof raw !== 'string' || raw.length === 0) {
-    throw new Error('value 必须是十六进制字节串或 0x 开头的整数。');
+    throw new ToolError('unsupported', 'value 必须是十六进制字节串或 0x 开头的整数。');
   }
   if (/^0x[0-9a-f]+$/iu.test(raw)) {
     const value = BigInt(raw);
-    if (value > 0xffffffffffffffffn) throw new Error('value 不能超过 8 字节。');
+    if (value > 0xffffffffffffffffn) throw new ToolError('size', 'value 不能超过 8 字节。');
     const width = Math.max(1, Math.ceil(value.toString(16).length / 2));
     const bytes = Buffer.alloc(width);
     if (byteOrder === 'big') {
@@ -57,20 +58,20 @@ function parseValue(raw, byteOrder) {
     return bytes;
   }
   if (!/^(?:[0-9a-f]{2})+$/iu.test(raw)) {
-    throw new Error('value 必须是不带 0x 的偶数位十六进制字节串。');
+    throw new ToolError('unsupported', 'value 必须是不带 0x 的偶数位十六进制字节串。');
   }
   const bytes = Buffer.from(raw, 'hex');
-  if (bytes.length > MAX_VALUE_BYTES) throw new Error(`value 最多 ${MAX_VALUE_BYTES} 字节。`);
+  if (bytes.length > MAX_VALUE_BYTES) throw new ToolError('unsupported', `value 最多 ${MAX_VALUE_BYTES} 字节。`);
   return bytes;
 }
 
 function create(length) {
   const size = length ?? 256;
   if (!Number.isInteger(size) || size < 1 || size > MAX_OUTPUT) {
-    throw new Error(`length 必须是 1–${MAX_OUTPUT} 的整数。`);
+    throw new ToolError('unsupported', `length 必须是 1–${MAX_OUTPUT} 的整数。`);
   }
   const pattern = sequence();
-  if (size > pattern.length) throw new Error(`循环模式最多 ${pattern.length} 字符。`);
+  if (size > pattern.length) throw new ToolError('unsupported', `循环模式最多 ${pattern.length} 字符。`);
   return {
     operation: 'create',
     length: size,
@@ -143,8 +144,8 @@ export const PWN_PATTERN_PROPERTIES = {
 export function cyclicPattern(input) {
   if (input.operation === 'create') return create(input.length);
   if (input.operation === 'find') {
-    if (input.value === undefined) throw new Error('find 需要 value。');
+    if (input.value === undefined) throw new ToolError('unsupported', 'find 需要 value。');
     return find(input.value, input.byte_order);
   }
-  throw new Error('operation 必须是 create 或 find。');
+  throw new ToolError('unsupported', 'operation 必须是 create 或 find。');
 }

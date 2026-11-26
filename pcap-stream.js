@@ -5,6 +5,7 @@ import { inspectCapture as inspectCaptureLayout, pcapngPacketBlock } from './cap
 import { interfaceClock, formatTimestamp, pcapngPacketTicks } from './pcapng-statistics.js';
 import { ipv4Fragments } from './pcap-fragments.js';
 import { dnsDetails } from './pcap-dns.js';
+import { ToolError } from './tool-errors.js';
 
 const MAX_FILE_SIZE = 64 * 1024 * 1024;
 const MAX_STREAMED_FILE_SIZE = 1024 * 1024 * 1024;
@@ -70,7 +71,7 @@ export const PCAP_STREAM_PROPERTIES = {
 };
 
 function makeAbortError() {
-  const error = new Error('操作已取消。');
+  const error = new ToolError('abort', '操作已取消。');
   error.name = 'AbortError';
   return error;
 }
@@ -81,50 +82,50 @@ function throwIfAborted(signal) {
 
 function parseOptions(options) {
   if (options === null || typeof options !== 'object' || Array.isArray(options)) {
-    throw new Error('options 必须是对象。');
+    throw new ToolError('unsupported', 'options 必须是对象。');
   }
   for (const key of Object.keys(options)) {
-    if (key !== 'signal' && key !== 'cwd') throw new Error(`options 不支持 ${key}。`);
+    if (key !== 'signal' && key !== 'cwd') throw new ToolError('unsupported', `options 不支持 ${key}。`);
   }
   const { signal } = options;
   if (signal !== undefined && (signal === null || typeof signal !== 'object'
     || typeof signal.aborted !== 'boolean')) {
-    throw new Error('options.signal 必须是 AbortSignal。');
+    throw new ToolError('unsupported', 'options.signal 必须是 AbortSignal。');
   }
   const cwd = options.cwd === undefined ? process.cwd() : options.cwd;
-  if (typeof cwd !== 'string' || cwd.trim() === '') throw new Error('options.cwd 必须是非空路径字符串。');
+  if (typeof cwd !== 'string' || cwd.trim() === '') throw new ToolError('unsupported', 'options.cwd 必须是非空路径字符串。');
   return { signal, cwd: path.resolve(cwd) };
 }
 
 function parseArguments(input) {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) {
-    throw new Error('pcap_stream 参数必须是 JSON 对象。');
+    throw new ToolError('unsupported', 'pcap_stream 参数必须是 JSON 对象。');
   }
   for (const key of Object.keys(input)) {
-    if (!Object.hasOwn(PCAP_STREAM_PROPERTIES, key)) throw new Error(`pcap_stream 不支持参数 ${key}。`);
+    if (!Object.hasOwn(PCAP_STREAM_PROPERTIES, key)) throw new ToolError('unsupported', `pcap_stream 不支持参数 ${key}。`);
   }
   const maxFlows = input.max_flows === undefined ? DEFAULT_MAX_FLOWS : input.max_flows;
   if (!Number.isInteger(maxFlows) || maxFlows < 1 || maxFlows > MAX_FLOWS_LIMIT) {
-    throw new Error(`max_flows 必须是 1 至 ${MAX_FLOWS_LIMIT} 的整数。`);
+    throw new ToolError('unsupported', `max_flows 必须是 1 至 ${MAX_FLOWS_LIMIT} 的整数。`);
   }
   const maxBytes = input.max_bytes_per_flow === undefined
     ? DEFAULT_MAX_BYTES_PER_FLOW
     : input.max_bytes_per_flow;
   if (!Number.isInteger(maxBytes) || maxBytes < MIN_BYTES_PER_FLOW || maxBytes > MAX_BYTES_PER_FLOW_LIMIT) {
-    throw new Error(`max_bytes_per_flow 必须是 ${MIN_BYTES_PER_FLOW} 至 ${MAX_BYTES_PER_FLOW_LIMIT} 的整数。`);
+    throw new ToolError('unsupported', `max_bytes_per_flow 必须是 ${MIN_BYTES_PER_FLOW} 至 ${MAX_BYTES_PER_FLOW_LIMIT} 的整数。`);
   }
   const includeHex = input.include_hex === undefined ? false : input.include_hex;
-  if (typeof includeHex !== 'boolean') throw new Error('include_hex 必须是布尔值。');
+  if (typeof includeHex !== 'boolean') throw new ToolError('unsupported', 'include_hex 必须是布尔值。');
   const filter = input.filter;
   if (filter !== undefined && (filter === null || typeof filter !== 'object' || Array.isArray(filter)
     || Object.keys(filter).some(key => !['protocol', 'src_ip', 'dst_ip', 'src_port', 'dst_port', 'start_utc', 'end_utc'].includes(key)))) {
-    throw new Error('filter 必须是包含已声明字段的对象。');
+    throw new ToolError('unsupported', 'filter 必须是包含已声明字段的对象。');
   }
   const normalizeIp = (value, field) => {
     if (value === undefined) return undefined;
     const pieces = typeof value === 'string' ? value.split('.') : [];
     if (pieces.length !== 4 || pieces.some(piece => !/^\d{1,3}$/u.test(piece) || Number(piece) > 255)) {
-      throw new Error(`filter.${field} 必须是 IPv4 地址。`);
+      throw new ToolError('unsupported', `filter.${field} 必须是 IPv4 地址。`);
     }
     return pieces.map(Number).join('.');
   };
@@ -132,24 +133,24 @@ function parseArguments(input) {
     if (value === undefined) return undefined;
     if (typeof value !== 'string' || value.length > 40
       || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/u.test(value)) {
-      throw new Error(`filter.${field} 须为 UTC ISO 8601 时间并以 Z 结尾。`);
+      throw new ToolError('unsupported', `filter.${field} 须为 UTC ISO 8601 时间并以 Z 结尾。`);
     }
     const time = Date.parse(value);
     const whole = value.slice(0, 19);
-    if (!Number.isFinite(time) || new Date(value).toISOString().slice(0, 19) !== whole) throw new Error(`filter.${field} 时间无效。`);
+    if (!Number.isFinite(time) || new Date(value).toISOString().slice(0, 19) !== whole) throw new ToolError('unsupported', `filter.${field} 时间无效。`);
     return time;
   };
   let normalizedFilter;
   if (filter !== undefined) {
-    if (filter.protocol !== undefined && !['tcp', 'udp', 'dns'].includes(filter.protocol)) throw new Error('filter.protocol 须为 tcp、udp 或 dns。');
+    if (filter.protocol !== undefined && !['tcp', 'udp', 'dns'].includes(filter.protocol)) throw new ToolError('unsupported', 'filter.protocol 须为 tcp、udp 或 dns。');
     for (const field of ['src_port', 'dst_port']) {
       if (filter[field] !== undefined && (!Number.isInteger(filter[field]) || filter[field] < 1 || filter[field] > 65535)) {
-        throw new Error(`filter.${field} 须在 1 至 65535 之间。`);
+        throw new ToolError('unsupported', `filter.${field} 须在 1 至 65535 之间。`);
       }
     }
     const startTime = parseTime(filter.start_utc, 'start_utc');
     const endTime = parseTime(filter.end_utc, 'end_utc');
-    if (startTime !== undefined && endTime !== undefined && startTime > endTime) throw new Error('filter.start_utc 不能晚于 end_utc。');
+    if (startTime !== undefined && endTime !== undefined && startTime > endTime) throw new ToolError('unsupported', 'filter.start_utc 不能晚于 end_utc。');
     normalizedFilter = {
       ...(filter.protocol === undefined ? {} : { protocol: filter.protocol }),
       ...(normalizeIp(filter.src_ip, 'src_ip') === undefined ? {} : { src_ip: normalizeIp(filter.src_ip, 'src_ip') }),
@@ -164,21 +165,21 @@ function parseArguments(input) {
 }
 
 function normalizeFilePath(value) {
-  if (value === undefined) throw new Error('缺少必填参数 file_path。');
-  if (typeof value !== 'string' || value.trim() === '') throw new Error('file_path 必须是非空字符串。');
-  if (value.length > MAX_PATH_LENGTH) throw new Error(`file_path 不能超过 ${MAX_PATH_LENGTH} 个字符。`);
-  if (/[\u0000-\u001f\u007f]/u.test(value)) throw new Error('file_path 不能包含控制字符。');
+  if (value === undefined) throw new ToolError('unsupported', '缺少必填参数 file_path。');
+  if (typeof value !== 'string' || value.trim() === '') throw new ToolError('unsupported', 'file_path 必须是非空字符串。');
+  if (value.length > MAX_PATH_LENGTH) throw new ToolError('path', `file_path 不能超过 ${MAX_PATH_LENGTH} 个字符。`);
+  if (/[\u0000-\u001f\u007f]/u.test(value)) throw new ToolError('path', 'file_path 不能包含控制字符。');
   const raw = value.replaceAll('\\', '/');
   if (raw.startsWith('/') || /^[A-Za-z]:/u.test(raw)) {
-    throw new Error('file_path 必须是相对会话工作目录的路径，不能是绝对路径或盘符。');
+    throw new ToolError('path', 'file_path 必须是相对会话工作目录的路径，不能是绝对路径或盘符。');
   }
-  if (raw.includes(':')) throw new Error('file_path 不能包含盘符或冒号。');
+  if (raw.includes(':')) throw new ToolError('path', 'file_path 不能包含盘符或冒号。');
   const pieces = raw.split('/');
   if (pieces.some(piece => piece === '..')) {
-    throw new Error('file_path 不能包含 ".." 路径段。');
+    throw new ToolError('path', 'file_path 不能包含 ".." 路径段。');
   }
   const parts = pieces.filter(piece => piece !== '' && piece !== '.');
-  if (parts.length === 0) throw new Error('file_path 不能为空。');
+  if (parts.length === 0) throw new ToolError('path', 'file_path 不能为空。');
   return { display: parts.join('/'), parts };
 }
 
@@ -648,16 +649,16 @@ function parseHttpMessages(payload) {
 }
 
 function parseClassicPcap(bytes, collector) {
-  if (bytes.length < 24) throw new Error('PCAP 文件头被截断。');
+  if (bytes.length < 24) throw new ToolError('unsupported', 'PCAP 文件头被截断。');
   const magic = bytes.readUInt32BE(0);
   const info = PCAP_MAGICS.get(magic);
-  if (info === undefined) throw new Error('不支持的抓包格式：只支持经典 PCAP 和 PCAPNG。');
+  if (info === undefined) throw new ToolError('unsupported', '不支持的抓包格式：只支持经典 PCAP 和 PCAPNG。');
   const read = createReader(bytes, info.littleEndian);
   const major = read.u16(4);
-  if (major !== 2) throw new Error(`不支持的 PCAP 版本 ${major}.${read.u16(6)}。`);
+  if (major !== 2) throw new ToolError('unsupported', `不支持的 PCAP 版本 ${major}.${read.u16(6)}。`);
   const linkType = read.u32(20) & 0xffff;
   if (!SUPPORTED_LINK_TYPES.has(linkType)) {
-    throw new Error('不支持的链路类型（unsupported）：' + linkType + '。支持 BSD 回环、Ethernet、裸 IP、Linux SLL 和 SLL2。');
+    throw new ToolError('unsupported', '不支持的链路类型（unsupported）：' + linkType + '。支持 BSD 回环、Ethernet、裸 IP、Linux SLL 和 SLL2。');
   }
 
   let cursor = 24;
@@ -670,7 +671,7 @@ function parseClassicPcap(bytes, collector) {
     if (bytes.length - cursor < 16) break;
     const captured = read.u32(cursor + 8);
     if (captured > MAX_PACKET_CAPTURE) {
-      throw new Error(`PCAP 包数据长度 ${captured} 超过 16 MiB 上限。`);
+      throw new ToolError('size', `PCAP 包数据长度 ${captured} 超过 16 MiB 上限。`);
     }
     packets += 1;
     if (captured > bytes.length - cursor - 16) break;
@@ -701,42 +702,42 @@ function parsePcapng(bytes, collector) {
 
   while (cursor < bytes.length) {
     if (bytes.length - cursor < 12) {
-      throw new Error(`PCAPNG 块头在偏移 ${cursor} 处被截断。`);
+      throw new ToolError('unsupported', `PCAPNG 块头在偏移 ${cursor} 处被截断。`);
     }
     const rawType = bytes.readUInt32BE(cursor);
     let size;
     if (rawType === SECTION_HEADER) {
       if (bytes.length - cursor < 28) {
-        throw new Error(`PCAPNG 节头块在偏移 ${cursor} 处被截断。`);
+        throw new ToolError('unsupported', `PCAPNG 节头块在偏移 ${cursor} 处被截断。`);
       }
       const byteOrderMagic = bytes.readUInt32BE(cursor + 8);
       if (byteOrderMagic === 0x1a2b3c4d) read = createReader(bytes, false);
       else if (byteOrderMagic === 0x4d3c2b1a) read = createReader(bytes, true);
-      else throw new Error(`PCAPNG 节头块在偏移 ${cursor} 处的字节序标记无效。`);
+      else throw new ToolError('unsupported', `PCAPNG 节头块在偏移 ${cursor} 处的字节序标记无效。`);
       size = read.u32(cursor + 4);
     } else {
-      if (read === undefined) throw new Error('PCAPNG 文件必须以节头块开始。');
+      if (read === undefined) throw new ToolError('unsupported', 'PCAPNG 文件必须以节头块开始。');
       size = read.u32(cursor + 4);
     }
     if (size < 12 || size % 4 !== 0) {
-      throw new Error(`PCAPNG 块在偏移 ${cursor} 处的长度无效。`);
+      throw new ToolError('unsupported', `PCAPNG 块在偏移 ${cursor} 处的长度无效。`);
     }
     if (size > bytes.length - cursor) {
-      throw new Error(`PCAPNG 块在偏移 ${cursor} 处被截断。`);
+      throw new ToolError('unsupported', `PCAPNG 块在偏移 ${cursor} 处被截断。`);
     }
     if (read.u32(cursor + size - 4) !== size) {
-      throw new Error(`PCAPNG 块在偏移 ${cursor} 处的块头与块尾长度不一致。`);
+      throw new ToolError('unsupported', `PCAPNG 块在偏移 ${cursor} 处的块头与块尾长度不一致。`);
     }
 
     if (rawType === SECTION_HEADER) {
-      if (size < 28) throw new Error(`PCAPNG 节头块在偏移 ${cursor} 处的长度无效。`);
+      if (size < 28) throw new ToolError('unsupported', `PCAPNG 节头块在偏移 ${cursor} 处的长度无效。`);
       read = createReader(bytes, bytes.readUInt32BE(cursor + 8) === 0x4d3c2b1a);
       interfaces = [];
       sectionNumber++;
     } else {
       const type = read.u32(cursor);
       if (type === INTERFACE_DESCRIPTION) {
-        if (size < 20) throw new Error(`PCAPNG 接口描述块在偏移 ${cursor} 处的长度无效。`);
+        if (size < 20) throw new ToolError('unsupported', `PCAPNG 接口描述块在偏移 ${cursor} 处的长度无效。`);
         const linkType = read.u16(cursor + 8);
         let clock;
         try {
@@ -759,7 +760,7 @@ function parsePcapng(bytes, collector) {
         if (packet !== undefined) {
           const { captured, dataOffset, info, name, original, interfaceId, simple } = packet;
           if (captured > MAX_PACKET_CAPTURE) {
-            throw new Error(`PCAPNG 包数据长度 ${captured} 超过 16 MiB 上限。`);
+            throw new ToolError('size', `PCAPNG 包数据长度 ${captured} 超过 16 MiB 上限。`);
           }
           packetBlockCounts[name]++;
           packets += 1;
@@ -774,7 +775,7 @@ function parsePcapng(bytes, collector) {
     }
     cursor += size;
   }
-  if (read === undefined) throw new Error('PCAPNG 文件缺少节头块。');
+  if (read === undefined) throw new ToolError('unsupported', 'PCAPNG 文件缺少节头块。');
   return { format: 'PCAPNG', linkType: firstLinkType ?? 0, packets, linkTypes, packetBlockCounts, invalidClocks };
 }
 
@@ -810,22 +811,22 @@ async function streamLargeCapture(filePath, size, collector, signal) {
     if (pending.length) await exact(pending.length);
   }
   try {
-    if (size < 4) throw new Error('不支持的抓包格式：只支持经典 PCAP 和 PCAPNG。');
+    if (size < 4) throw new ToolError('unsupported', '不支持的抓包格式：只支持经典 PCAP 和 PCAPNG。');
     const prefix = await exact(4);
-    if (prefix.length !== 4) throw new Error('抓包文件头被截断。');
+    if (prefix.length !== 4) throw new ToolError('unsupported', '抓包文件头被截断。');
     const firstMagic = prefix.readUInt32BE(0);
     let parseInfo;
     if (firstMagic !== SECTION_HEADER) {
       const rest = await exact(20);
-      if (rest.length !== 20) throw new Error('PCAP 文件头被截断。');
+      if (rest.length !== 20) throw new ToolError('unsupported', 'PCAP 文件头被截断。');
       const header = Buffer.concat([prefix, rest], 24);
       const info = PCAP_MAGICS.get(header.readUInt32BE(0));
-      if (info === undefined) throw new Error('不支持的抓包格式：只支持经典 PCAP 和 PCAPNG。');
+      if (info === undefined) throw new ToolError('unsupported', '不支持的抓包格式：只支持经典 PCAP 和 PCAPNG。');
       const read = createReader(header, info.littleEndian);
       const major = read.u16(4);
-      if (major !== 2) throw new Error(`不支持的 PCAP 版本 ${major}.${read.u16(6)}。`);
+      if (major !== 2) throw new ToolError('unsupported', `不支持的 PCAP 版本 ${major}.${read.u16(6)}。`);
       const linkType = read.u32(20) & 0xffff;
-      if (!SUPPORTED_LINK_TYPES.has(linkType)) throw new Error('不支持的链路类型：' + linkType + '。');
+      if (!SUPPORTED_LINK_TYPES.has(linkType)) throw new ToolError('unsupported', '不支持的链路类型：' + linkType + '。');
       const snapshot = read.u32(16);
       const exponent = info.timestampUnit === 'nanoseconds' ? 9 : 6;
       const units = 10 ** exponent;
@@ -838,7 +839,7 @@ async function streamLargeCapture(filePath, size, collector, signal) {
         if (record.length < 16) { partial = true; issue = 'truncated_record_header'; break; }
         const recordRead = createReader(record, info.littleEndian);
         const captured = recordRead.u32(8);
-        if (captured > MAX_PACKET_CAPTURE) throw new Error(`PCAP 包数据长度 ${captured} 超过 16 MiB 上限。`);
+        if (captured > MAX_PACKET_CAPTURE) throw new ToolError('size', `PCAP 包数据长度 ${captured} 超过 16 MiB 上限。`);
         const packetBytes = await exact(captured);
         packets += 1;
         if (packetBytes.length < captured) {
@@ -881,33 +882,33 @@ async function streamLargeCapture(filePath, size, collector, signal) {
           const byteOrder = bom.readUInt32BE(0);
           if (byteOrder === 0x1a2b3c4d) littleEndian = false;
           else if (byteOrder === 0x4d3c2b1a) littleEndian = true;
-          else throw new Error(`PCAPNG 节头块在偏移 ${recordOffset} 处的字节序标记无效。`);
+          else throw new ToolError('unsupported', `PCAPNG 节头块在偏移 ${recordOffset} 处的字节序标记无效。`);
           const firstRead = createReader(first, littleEndian);
           blockSize = firstRead.u32(4);
           leading = Buffer.concat([first, bom], 12);
         } else {
-          if (!sectionReady || littleEndian === undefined) throw new Error('PCAPNG 文件必须以节头块开始。');
+          if (!sectionReady || littleEndian === undefined) throw new ToolError('unsupported', 'PCAPNG 文件必须以节头块开始。');
           blockSize = createReader(first, littleEndian).u32(4);
         }
       if (blockSize < (rawType === SECTION_HEADER ? 28 : 12) || blockSize % 4 !== 0 || blockSize > MAX_PCAPNG_BLOCK) {
           const label = rawType === SECTION_HEADER ? 'Section Header Block' : '块';
-          throw new Error(`PCAPNG ${label} 在偏移 ${recordOffset} 处的长度无效或超过解析上限。`);
+          throw new ToolError('size', `PCAPNG ${label} 在偏移 ${recordOffset} 处的长度无效或超过解析上限。`);
         }
         if (blockSize > size - recordOffset) { partial = true; issue = 'truncated_block'; break; }
         const tail = await exact(blockSize - leading.length);
         if (tail.length < blockSize - leading.length) { partial = true; issue = 'truncated_block'; break; }
         const block = Buffer.concat([leading, tail], blockSize);
         const read = createReader(block, littleEndian);
-        if (read.u32(blockSize - 4) !== blockSize) throw new Error(`PCAPNG 块在偏移 ${recordOffset} 处的块头与块尾长度不一致。`);
+        if (read.u32(blockSize - 4) !== blockSize) throw new ToolError('unsupported', `PCAPNG 块在偏移 ${recordOffset} 处的块头与块尾长度不一致。`);
         if (rawType === SECTION_HEADER) {
-          if (read.u16(12) !== 1) throw new Error('不支持的 PCAPNG 主版本。');
+          if (read.u16(12) !== 1) throw new ToolError('unsupported', '不支持的 PCAPNG 主版本。');
           sectionReady = true;
           interfaces = [];
           sectionNumber++;
         } else {
           const type = read.u32(0);
           if (type === INTERFACE_DESCRIPTION) {
-            if (blockSize < 20) throw new Error(`PCAPNG 接口描述块在偏移 ${recordOffset} 处的长度无效。`);
+            if (blockSize < 20) throw new ToolError('unsupported', `PCAPNG 接口描述块在偏移 ${recordOffset} 处的长度无效。`);
             const linkType = read.u16(8);
             let clock;
             try { clock = interfaceClock(block, read, 0); } catch { invalidClocks++; }
@@ -923,7 +924,7 @@ async function streamLargeCapture(filePath, size, collector, signal) {
             }
             if (packet !== undefined) {
               const { captured, dataOffset, info, name, original, interfaceId, simple } = packet;
-              if (captured > MAX_PACKET_CAPTURE) throw new Error(`PCAPNG 包数据长度 ${captured} 超过 16 MiB 上限。`);
+              if (captured > MAX_PACKET_CAPTURE) throw new ToolError('size', `PCAPNG 包数据长度 ${captured} 超过 16 MiB 上限。`);
               packetBlockCounts[name]++;
               packets++;
               const ticks = simple || !info.clock ? undefined : pcapngPacketTicks(read, 0);
@@ -934,7 +935,7 @@ async function streamLargeCapture(filePath, size, collector, signal) {
         }
         blockPrefix = Buffer.alloc(0);
       }
-      if (!sectionReady) throw new Error('PCAPNG 文件缺少完整节头块。');
+      if (!sectionReady) throw new ToolError('unsupported', 'PCAPNG 文件缺少完整节头块。');
       parseInfo = { format: 'PCAPNG', linkType: firstLinkType ?? 0, packets, linkTypes, packetBlockCounts, invalidClocks };
     }
     await drain();
@@ -1056,17 +1057,17 @@ export async function pcapStream(input, options = {}) {
   throwIfAborted(signal);
   const { display, parts } = normalizeFilePath(filePath);
   const absolute = path.resolve(cwd, ...parts);
-  if (!insideDirectory(cwd, absolute)) throw new Error('file_path 不能越出会话工作目录。');
+  if (!insideDirectory(cwd, absolute)) throw new ToolError('path', 'file_path 不能越出会话工作目录。');
 
   let info;
   try {
     info = await stat(absolute);
   } catch {
-    throw new Error(`无法读取文件 ${display}。`);
+    throw new ToolError('missing', `无法读取文件 ${display}。`);
   }
-  if (!info.isFile()) throw new Error(`${display} 不是普通文件。`);
+  if (!info.isFile()) throw new ToolError('missing', `${display} 不是普通文件。`);
   if (info.size > MAX_STREAMED_FILE_SIZE) {
-    throw new Error(`${display} 超过 1 GiB，PCAP 流式分析上限为 1 GiB。`);
+    throw new ToolError('size', `${display} 超过 1 GiB，PCAP 流式分析上限为 1 GiB。`);
   }
   throwIfAborted(signal);
   let realCwd;
@@ -1076,9 +1077,9 @@ export async function pcapStream(input, options = {}) {
     realFile = stripLongPathPrefix(await realpath(absolute));
   } catch (error) {
     if (error?.name === 'AbortError') throw error;
-    throw new Error(`无法读取文件 ${display}。`);
+    throw new ToolError('missing', `无法读取文件 ${display}。`);
   }
-  if (!insideDirectory(realCwd, realFile)) throw new Error('file_path 解析后越出会话工作目录。');
+  if (!insideDirectory(realCwd, realFile)) throw new ToolError('path', 'file_path 解析后越出会话工作目录。');
 
   const collector = createCollector(maxFlows, maxBytes, includeHex, filter);
   let parseInfo;
@@ -1092,18 +1093,18 @@ export async function pcapStream(input, options = {}) {
       packet_count: parseInfo.packets, packet_records: parseInfo.packets, malformed_packets: 0,
       issues: streamed.issue === undefined ? [] : [{ code: streamed.issue }] };
     const after = await stat(absolute);
-    if (after.size !== info.size || after.mtimeMs !== info.mtimeMs) throw new Error('抓包文件在流式读取期间发生变化，请重新运行分析。');
+    if (after.size !== info.size || after.mtimeMs !== info.mtimeMs) throw new ToolError('conflict', '抓包文件在流式读取期间发生变化，请重新运行分析。');
   } else {
     let bytes;
     try {
       bytes = await readFile(absolute, { signal });
     } catch (error) {
       if (error?.name === 'AbortError') throw error;
-      throw new Error(`无法读取文件 ${display}。`);
+      throw new ToolError('missing', `无法读取文件 ${display}。`);
     }
-    if (bytes.length > MAX_FILE_SIZE) throw new Error(`${display} 在读取期间增大并超过 64 MiB 内存读取上限。`);
+    if (bytes.length > MAX_FILE_SIZE) throw new ToolError('size', `${display} 在读取期间增大并超过 64 MiB 内存读取上限。`);
     throwIfAborted(signal);
-    if (bytes.length < 4) throw new Error('不支持的抓包格式：只支持经典 PCAP 和 PCAPNG。');
+    if (bytes.length < 4) throw new ToolError('unsupported', '不支持的抓包格式：只支持经典 PCAP 和 PCAPNG。');
     captureLayout = inspectCaptureLayout(bytes, { offset: 0, limit: 0 });
     const magic = bytes.readUInt32BE(0);
     if (magic === SECTION_HEADER) parseInfo = parsePcapng(bytes, collector);

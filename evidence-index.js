@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { isResultPointer, isResultScalar, RESULT_HASH, summarize } from './ctf-result-values.js';
+import { ToolError } from './tool-errors.js';
 
 const INDEX_LIMIT = 4 * 1024 * 1024;
 const ENTRY_LIMIT = 128 * 1024;
@@ -53,7 +54,7 @@ function records(text) {
   if (!text) return [];
   const content = JSON.parse(text);
   if (content.version !== 1 || !Array.isArray(content.entries) || content.entries.length > MAX_ENTRIES
-    || Buffer.byteLength(text) > INDEX_LIMIT) throw new Error('证据索引格式或大小无效。');
+    || Buffer.byteLength(text) > INDEX_LIMIT) throw new ToolError('encoding', '证据索引格式或大小无效。');
   return content.entries;
 }
 

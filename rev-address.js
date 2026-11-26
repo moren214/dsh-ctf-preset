@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { peSections, readPeHeader, wasmSections, wasmVersion } from './attachment.js';
 import { elfLoadRanges } from './elf.js';
 import { hexAddress, MAX_REV_ADDRESS, revAddress, REV_HEX_ADDRESS } from './rev-evidence.js';
+import { ToolError } from './tool-errors.js';
 
 const COORDINATES = ['file_offset', 'va', 'rva', 'runtime_va', 'section_offset'];
 const MAX_QUERIES = 12;
@@ -28,7 +29,7 @@ export const REV_ADDRESS_PROPERTIES = {
 
 function prepareQueries(args) {
   if (!Array.isArray(args.queries) || args.queries.length < 1 || args.queries.length > MAX_QUERIES) {
-    throw new Error('请选择 1 至 12 处待核对地址。');
+    throw new ToolError('unsupported', '请选择 1 至 12 处待核对地址。');
   }
   return args.queries.map(query => {
     const value = revAddress(query?.value);
@@ -39,7 +40,7 @@ function prepareQueries(args) {
       || (query.kind === 'section_offset' ? !Number.isSafeInteger(index) || index < 0 : index !== undefined)
       || (expected !== undefined && (!Number.isSafeInteger(expected) || expected < 0))
       || Object.keys(query).some(key => !['kind', 'value', 'byte_length', 'section_index', 'expected_file_offset'].includes(key))) {
-      throw new Error('地址、偏移类型或字节范围无效。');
+      throw new ToolError('unsupported', '地址、偏移类型或字节范围无效。');
     }
     return { query, value, span: BigInt(span) };
   });
@@ -48,7 +49,7 @@ function prepareQueries(args) {
 function optionalAddress(value) {
   if (value === undefined) return undefined;
   const result = revAddress(value);
-  if (result === undefined) throw new Error('基址须为有效的 0x 十六进制地址。');
+  if (result === undefined) throw new ToolError('unsupported', '基址须为有效的 0x 十六进制地址。');
   return result;
 }
 
@@ -143,7 +144,7 @@ export function mapRevAddress(bytes, file_path, args) {
     const header = readPeHeader(bytes);
     if (header.status !== 'ok') return { format: header.format, status: 'unsupported', sources: [source] };
     format = header.magic === 0x10b ? 'PE32' : 'PE32+';
-    if (imageBase !== undefined && imageBase !== header.imageBase) throw new Error('给出的链接基址与 PE 原件的 ImageBase 不一致。');
+    if (imageBase !== undefined && imageBase !== header.imageBase) throw new ToolError('conflict', '给出的链接基址与 PE 原件的 ImageBase 不一致。');
     imageBase = header.imageBase;
     const ranges = peRanges(bytes, header);
     map = selection => nativeMapping(selection, ranges, imageBase, loadBase, source);

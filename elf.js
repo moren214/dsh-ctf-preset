@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { ToolError } from './tool-errors.js';
 
 const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
 const MAX_HEADERS = 8192;
@@ -76,7 +77,7 @@ function hex(value) {
 }
 
 function invalid(message) {
-  throw new Error(`ELF 结构不完整或无效：${message}`);
+  throw new ToolError('unsupported', `ELF 结构不完整或无效：${message}`);
 }
 
 function fileRange(bytes, offset, length) {
@@ -94,7 +95,7 @@ function tableOffsets(bytes, offset, count, stride, minimumStride, label) {
 
 function parseElf(bytes) {
   if (!bytes.subarray(0, 4).equals(ELF_MAGIC)) {
-    throw new Error('此附件的文件头不是 ELF。请提供支持的 ELF 文件或其他格式的静态导出。');
+    throw new ToolError('unsupported', '此附件的文件头不是 ELF。请提供支持的 ELF 文件或其他格式的静态导出。');
   }
   const is64 = bytes[4] === 2;
   const littleEndian = bytes[5] === 1;

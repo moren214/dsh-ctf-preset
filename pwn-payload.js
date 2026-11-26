@@ -1,3 +1,4 @@
+import { ToolError } from './tool-errors.js';
 const MAX_PWN_PAYLOAD_BYTES = 16 * 1024;
 const MAX_ADDRESS = 0xffffffffffffffffn;
 const ADDRESS = { type: 'string', maxLength: 20, description: '十进制或 0x 开头的 64 位地址/偏移字符串。' };
@@ -30,10 +31,10 @@ export const PWN_PAYLOAD_PROPERTIES = {
 
 function parseAddress(value, label) {
   if (typeof value !== 'string' || !/^(?:0[xX][0-9a-fA-F]{1,16}|[0-9]{1,20})$/u.test(value)) {
-    throw new Error(`${label} 须为十进制或 0x 开头的 64 位地址/偏移字符串。`);
+    throw new ToolError('unsupported', `${label} 须为十进制或 0x 开头的 64 位地址/偏移字符串。`);
   }
   const parsed = BigInt(value);
-  if (parsed < 0n || parsed > MAX_ADDRESS) throw new Error(`${label} 超出 64 位无符号范围。`);
+  if (parsed < 0n || parsed > MAX_ADDRESS) throw new ToolError('unsupported', `${label} 超出 64 位无符号范围。`);
   return parsed;
 }
 
@@ -45,15 +46,15 @@ function calculateImageBase(input) {
   const leak = parseAddress(input.leak, 'leak');
   const symbolOffset = parseAddress(input.symbol_offset, 'symbol_offset');
   const base = leak - symbolOffset;
-  if (base < 0n) throw new Error('leak 必须大于或等于 symbol_offset。');
+  if (base < 0n) throw new ToolError('unsupported', 'leak 必须大于或等于 symbol_offset。');
   const targets = Object.create(null);
   const offsets = input.target_offsets ?? {};
   if (offsets === null || typeof offsets !== 'object' || Array.isArray(offsets)
-    || Object.keys(offsets).length > 12) throw new Error('target_offsets 须为最多 12 项的对象。');
+    || Object.keys(offsets).length > 12) throw new ToolError('unsupported', 'target_offsets 须为最多 12 项的对象。');
   for (const [name, rawOffset] of Object.entries(offsets)) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/u.test(name)) throw new Error(`目标符号名无效：${name}。`);
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/u.test(name)) throw new ToolError('unsupported', `目标符号名无效：${name}。`);
     const address = base + parseAddress(rawOffset, `target_offsets.${name}`);
-    if (address > MAX_ADDRESS) throw new Error(`目标符号 ${name} 的运行时地址超出 64 位。`);
+    if (address > MAX_ADDRESS) throw new ToolError('unsupported', `目标符号 ${name} 的运行时地址超出 64 位。`);
     targets[name] = hex(address);
   }
   const baseField = input.operation === 'pie_base' ? 'pie_base' : 'libc_base';
@@ -66,11 +67,11 @@ function calculateImageBase(input) {
 
 function buildRet2Libc(input) {
   if (!Number.isSafeInteger(input.offset) || input.offset < 0 || input.offset > MAX_PWN_PAYLOAD_BYTES) {
-    throw new Error(`offset 须为 0 至 ${MAX_PWN_PAYLOAD_BYTES} 的整数。`);
+    throw new ToolError('unsupported', `offset 须为 0 至 ${MAX_PWN_PAYLOAD_BYTES} 的整数。`);
   }
   const padText = input.padding_byte ?? '41';
   if (typeof padText !== 'string' || !/^[0-9a-fA-F]{2}$/u.test(padText)) {
-    throw new Error('padding_byte 须是两位十六进制字节。');
+    throw new ToolError('unsupported', 'padding_byte 须是两位十六进制字节。');
   }
   const entries = [
     ['pop_rdi_ret', input.pop_rdi_ret],
@@ -81,7 +82,7 @@ function buildRet2Libc(input) {
   if (input.exit !== undefined) entries.push(['exit', input.exit]);
   const words = entries.map(([name, raw]) => ({ name, value: parseAddress(raw, name) }));
   const length = input.offset + words.length * 8;
-  if (length > MAX_PWN_PAYLOAD_BYTES) throw new Error(`payload 总长度不能超过 ${MAX_PWN_PAYLOAD_BYTES} 字节。`);
+  if (length > MAX_PWN_PAYLOAD_BYTES) throw new ToolError('size', `payload 总长度不能超过 ${MAX_PWN_PAYLOAD_BYTES} 字节。`);
   const payload = Buffer.alloc(length);
   payload.fill(Number.parseInt(padText, 16), 0, input.offset);
   const layout = words.map((word, index) => {
@@ -108,10 +109,10 @@ export function buildPwnPayload(input) {
     : input.operation === 'ret2libc_x64'
       ? ['operation', 'offset', 'padding_byte', 'pop_rdi_ret', 'bin_sh', 'system', 'alignment_ret', 'exit']
       : undefined;
-  if (allowed === undefined) throw new Error('operation 须为 libc_base、pie_base 或 ret2libc_x64。');
+  if (allowed === undefined) throw new ToolError('unsupported', 'operation 须为 libc_base、pie_base 或 ret2libc_x64。');
   const unsupported = Object.keys(input).find(key => !allowed.includes(key));
-  if (unsupported !== undefined) throw new Error(`${input.operation} 不支持参数 ${unsupported}。`);
+  if (unsupported !== undefined) throw new ToolError('unsupported', `${input.operation} 不支持参数 ${unsupported}。`);
   if (input.operation === 'libc_base' || input.operation === 'pie_base') return calculateImageBase(input);
   if (input.operation === 'ret2libc_x64') return buildRet2Libc(input);
-  throw new Error('operation 须为 libc_base 或 ret2libc_x64。');
+  throw new ToolError('unsupported', 'operation 须为 libc_base 或 ret2libc_x64。');
 }

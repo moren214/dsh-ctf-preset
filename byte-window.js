@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { ToolError } from './tool-errors.js';
 
 const ENCODINGS = ['auto', 'hexdump', 'hex', 'base64', 'utf8'];
 export const MAX_WINDOW_BYTES = 4096;
@@ -15,13 +16,13 @@ export function parseByteWindow(args, defaultEncoding, defaultLength) {
   const { byte_offset: offset = 0, byte_length: length = defaultLength, encoding = defaultEncoding } = args;
   if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 1
     || length > MAX_WINDOW_BYTES || !ENCODINGS.includes(encoding)) {
-    throw new Error('请输入非负整数偏移、有效的编码和 1 至 4096 的字节数。');
+    throw new ToolError('unsupported', '请输入非负整数偏移、有效的编码和 1 至 4096 的字节数。');
   }
   return { offset, length, encoding };
 }
 
 export function windowLength(size, { offset, length }) {
-  if (offset > size) throw new Error('byte_offset 超出原件或归档成员大小。');
+  if (offset > size) throw new ToolError('size', 'byte_offset 超出原件或归档成员大小。');
   return Math.min(length, size - offset);
 }
 
@@ -51,7 +52,7 @@ function utf8(bytes) {
 export function describeByteWindow(bytes, size, { offset, encoding }) {
   const text = encoding === 'auto' || encoding === 'utf8' ? utf8(bytes) : undefined;
   if (encoding === 'auto') encoding = text === undefined ? 'hexdump' : 'utf8';
-  if (encoding === 'utf8' && text === undefined) throw new Error('这段数据不是完整的 UTF-8 文本，请改用 hex、hexdump 或 base64。');
+  if (encoding === 'utf8' && text === undefined) throw new ToolError('encoding', '这段数据不是完整的 UTF-8 文本，请改用 hex、hexdump 或 base64。');
   const data = encoding === 'utf8' ? text : encoding === 'hexdump' ? hexdump(bytes, offset) : bytes.toString(encoding);
   return {
     byte_offset: offset,

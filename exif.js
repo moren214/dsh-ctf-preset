@@ -1,3 +1,4 @@
+import { ToolError } from './tool-errors.js';
 const ENTRY_BYTES = 12;
 const ORIENTATION = 0x0112;
 const EXIF_IFD = 0x8769;
@@ -12,10 +13,10 @@ const DETAIL_TEXT = new Map([[0x9004, 'date_time_digitized'], [0x9011, 'offset_t
 const RATIONAL_FIELDS = new Map([[0x829a, 'exposure_time'], [0x829d, 'f_number'], [0x920a, 'focal_length']]);
 
 function directoryEntries(bytes, offset, read16, visit) {
-  if (offset < 8 || offset + 2 > bytes.length) throw new Error('目录偏移超出 EXIF 数据范围。');
+  if (offset < 8 || offset + 2 > bytes.length) throw new ToolError('size', '目录偏移超出 EXIF 数据范围。');
   const count = read16(offset);
   const first = offset + 2;
-  if (first + count * ENTRY_BYTES + 4 > bytes.length) throw new Error('EXIF 目录条目不完整。');
+  if (first + count * ENTRY_BYTES + 4 > bytes.length) throw new ToolError('unsupported', 'EXIF 目录条目不完整。');
   for (let index = 0; index < count; index++) {
     const entry = first + index * ENTRY_BYTES;
     visit(read16(entry), entry);
@@ -25,10 +26,10 @@ function directoryEntries(bytes, offset, read16, visit) {
 export function inspectExif(bytes, fileOffset) {
   try {
     const byteOrder = bytes.toString('latin1', 0, 2);
-    if (bytes.length < 8 || (byteOrder !== 'II' && byteOrder !== 'MM')) throw new Error('EXIF TIFF 文件头无效。');
+    if (bytes.length < 8 || (byteOrder !== 'II' && byteOrder !== 'MM')) throw new ToolError('unsupported', 'EXIF TIFF 文件头无效。');
     const read16 = (byteOrder === 'II' ? bytes.readUInt16LE : bytes.readUInt16BE).bind(bytes);
     const read32 = (byteOrder === 'II' ? bytes.readUInt32LE : bytes.readUInt32BE).bind(bytes);
-    if (read16(2) !== 42) throw new Error('EXIF TIFF 标记无效。');
+    if (read16(2) !== 42) throw new ToolError('unsupported', 'EXIF TIFF 标记无效。');
     let orientation;
     let exifDirectory;
     let gpsDirectory;
@@ -126,12 +127,12 @@ export function inspectExif(bytes, fileOffset) {
         const length = read32(entry + 4);
         const offset = read32(entry + 8);
         if (read16(entry + 2) !== 2 || length !== 20 || offset < 8 || offset + length > bytes.length || bytes[offset + 19] !== 0) {
-          throw new Error('EXIF DateTimeOriginal 字段无效。');
+          throw new ToolError('unsupported', 'EXIF DateTimeOriginal 字段无效。');
         }
         const value = bytes.toString('latin1', offset, offset + 19);
         // An all-blank timestamp with its separators retained represents an unknown time.
         if (value.replace(/[: ]/gu, '') === '') return;
-        if (!/^\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}$/u.test(value)) throw new Error('EXIF DateTimeOriginal 格式无效。');
+        if (!/^\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}$/u.test(value)) throw new ToolError('unsupported', 'EXIF DateTimeOriginal 格式无效。');
         dateTimeOriginal = { value, file_offset: fileOffset + offset };
       });
     }

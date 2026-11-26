@@ -4,10 +4,11 @@ import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { decodeEvidenceText } from './evidence.js';
 import { WorkbenchDependencyError } from './workbench-config.js';
+import { ToolError } from './tool-errors.js';
 
 export const MAX_FLASK_SOURCE_BYTES = 256 * 1024;
 const MAX_RELATED_FILES = 7;
-const WORKER = fileURLToPath(new URL('./flask-route-worker.py', import.meta.url));
+const WORKER = fileURLToPath(new URL('./core/workers/flask-route-worker.py', import.meta.url));
 const METHOD = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,32}$/u;
 const PATH = /^\/[^\u0000-\u0020\u007f\\?#<>\p{Cs}]*$/u;
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/u;
@@ -36,13 +37,13 @@ async function runParser(input, signal, workbench) {
     const child = execFile(python, ['-I', '-S', '-B', '-X', 'utf8', WORKER], {
       cwd: dirname(python), signal, windowsHide: true, timeout: 10000, maxBuffer: 128 * 1024, encoding: 'utf8',
     }, (error, stdout) => {
-      if (error) return reject(new Error(signal?.aborted ? 'Flask 源码核对已取消。' : '本机 Flask 源码读取器未返回有效结果。'));
+      if (error) return reject(new ToolError('abort', signal?.aborted ? 'Flask 源码核对已取消。' : '本机 Flask 源码读取器未返回有效结果。'));
       try {
         const parsed = JSON.parse(stdout);
-        if (!['matched', 'not_found', 'ambiguous', 'incomplete'].includes(parsed.status)) throw new Error('invalid status');
+        if (!['matched', 'not_found', 'ambiguous', 'incomplete'].includes(parsed.status)) throw new ToolError('unsupported', 'invalid status');
         resolve(parsed);
       } catch {
-        reject(new Error('本机 Flask 源码读取器返回了无效结果。'));
+        reject(new ToolError('unsupported', '本机 Flask 源码读取器返回了无效结果。'));
       }
     });
     child.stdin.on('error', () => {
@@ -57,16 +58,16 @@ export async function traceFlaskRoute(args, files, signal, workbench) {
   if (!request || typeof request !== 'object' || Object.keys(request).some(key => !['method', 'path'].includes(key))
     || typeof request.method !== 'string' || !METHOD.test(request.method)
     || typeof request.path !== 'string' || request.path.length > 2048 || !PATH.test(request.path)) {
-    throw new Error('请提供已知的 HTTP 方法和不带查询串的 / 路径。');
+    throw new ToolError('unsupported', '请提供已知的 HTTP 方法和不带查询串的 / 路径。');
   }
   const entrypoint = args.entrypoint ?? 'app';
-  if (typeof entrypoint !== 'string' || !IDENTIFIER.test(entrypoint)) throw new Error('entrypoint 须为 Flask 入口变量或工厂的简单名称。');
+  if (typeof entrypoint !== 'string' || !IDENTIFIER.test(entrypoint)) throw new ToolError('unsupported', 'entrypoint 须为 Flask 入口变量或工厂的简单名称。');
   const related = args.source_files ?? [];
-  if (!Array.isArray(related) || related.length > MAX_RELATED_FILES) throw new Error('除入口文件外最多提供 7 个相关模块。');
+  if (!Array.isArray(related) || related.length > MAX_RELATED_FILES) throw new ToolError('unsupported', '除入口文件外最多提供 7 个相关模块。');
 
   const sourceRoot = args.source_root === undefined || args.source_root === '.' ? undefined : files.normalizePath(args.source_root);
   const paths = [args.entry_file, ...related].map(files.normalizePath);
-  if (paths.some(path => !path.endsWith('.py'))) throw new Error('请提供源码根目录内的 .py 文件。');
+  if (paths.some(path => !path.endsWith('.py'))) throw new ToolError('unsupported', '请提供源码根目录内的 .py 文件。');
   const entries = [];
   const hashes = new Map();
   const keys = new Set();
@@ -75,7 +76,7 @@ export async function traceFlaskRoute(args, files, signal, workbench) {
     const file_path = sourceRoot === undefined ? module_path : files.normalizePath(`${sourceRoot}/${module_path}`);
     const { bytes, targetKey } = await files.read(file_path);
     const key = targetKey ?? file_path;
-    if (keys.has(key)) throw new Error('每个 Flask 源码文件只能引用一次。');
+    if (keys.has(key)) throw new ToolError('unsupported', '每个 Flask 源码文件只能引用一次。');
     keys.add(key);
     const source = decodeEvidenceText(bytes);
     entries.push({ file_path, module_path, source });

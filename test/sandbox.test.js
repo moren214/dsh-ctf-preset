@@ -152,9 +152,11 @@ test('parseWslList 正确解析 UTF-16LE 与 UTF-8 输出，chooseWslDistro 自�
 
 test('docker/Dockerfile 与 docker/Dockerfile.heavy 双层镜像定义完整且包含关键安全工具链', async () => {
   const baseDf = await readFile(new URL('../docker/Dockerfile', import.meta.url), 'utf8');
+  const reqBase = await readFile(new URL('../docker/requirements-base.txt', import.meta.url), 'utf8');
+  const baseSpec = `${baseDf}\n${reqBase}`;
   const heavyDf = await readFile(new URL('../docker/Dockerfile.heavy', import.meta.url), 'utf8');
   for (const token of ['ARG UBUNTU_BASE_IMAGE=ubuntu:24.04', 'FROM ${UBUNTU_BASE_IMAGE}', 'libc6:i386', 'qemu-user', 'gdb-multiarch', 'python3-fpylll', 'pwntools', 'volatility3', 'zsteg', '/opt/gef/gef.py', 'radare2', 'cpio', 'wabt', 'sleuthkit', 'pillow', 'numpy', 'scipy', 'scapy', 'xdis', 'WORKDIR /work']) {
-    assert.ok(baseDf.includes(token), `Dockerfile should include ${token}`);
+    assert.ok(baseSpec.includes(token), `Dockerfile + requirements-base.txt should include ${token}`);
   }
   for (const token of ['ARG BASE_IMAGE=dsh-ctf-sandbox:latest', 'FROM ${BASE_IMAGE}', 'WITH_GHIDRA', 'WITH_ANGR', 'WITH_APK', 'WITH_SAGE', 'GHIDRA_HOME=/opt/ghidra', 'analyzeHeadless', 'jadx', 'apktool', 'WORKDIR /work']) {
     assert.ok(heavyDf.includes(token), `Dockerfile.heavy should include ${token}`);
@@ -360,21 +362,44 @@ test('auto 不会把要求隔离的命令静默交给 WSL2', async t => {
  * 其次才是装了发行版的 WSL；两者都没有时返回 null，由调用方 skip —— 直接调
  * `wsl.exe --exec sh` 在没有发行版的机器上会报错，那是环境缺失而不是被测逻辑出错。
  */
+function probePosixShell(binary, prefix) {
+  try {
+    execFileSync(binary, [...prefix, '-c', 'true'], { stdio: 'ignore', timeout: 3000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function findPosixShell() {
   if (process.platform !== 'win32') return { binary: '/bin/sh', prefix: [] };
+  const candidates = [];
   try {
-    execFileSync('where', ['bash'], { stdio: 'ignore' });
-    return { binary: 'bash', prefix: [] };
+    const found = execFileSync('where', ['bash'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    for (const line of found.split(/\r?\n/u).map(s => s.trim()).filter(Boolean)) {
+      candidates.push(line);
+    }
   } catch {
-    // 没有 Git Bash，继续尝试 WSL。
+    // where bash failed; fall through to known Git Bash locations
+  }
+  for (const fallback of ['D:/Git/bin/bash.exe', 'C:/Program Files/Git/bin/bash.exe', 'C:/Program Files (x86)/Git/bin/bash.exe']) {
+    if (!candidates.some(item => item.toLowerCase() === fallback.toLowerCase())) {
+      candidates.push(fallback);
+    }
+  }
+  for (const candidate of candidates) {
+    if (probePosixShell(candidate, [])) return { binary: candidate, prefix: [] };
   }
   try {
     const listed = execFileSync('wsl.exe', ['-l', '-q'], {
       encoding: 'buffer',
       stdio: ['ignore', 'pipe', 'ignore'],
     });
-    const distros = listed.toString('utf16le').replace(/\0/gu, '').trim();
-    if (distros) return { binary: 'wsl.exe', prefix: ['--exec', 'sh'] };
+    const distros = parseWslList(listed);
+    const chosen = chooseWslDistro(distros);
+    if (chosen && probePosixShell('wsl.exe', ['-d', chosen, '--exec', 'sh'])) {
+      return { binary: 'wsl.exe', prefix: ['-d', chosen, '--exec', 'sh'] };
+    }
   } catch {
     // 没有 WSL 或没有可用发行版。
   }
@@ -661,7 +686,7 @@ test('DECOMPILE_SCRIPT：r2 单次进程分析回退 pdc，Ghidra 按二进制 S
     assert.doesNotMatch(DECOMPILE_SCRIPT, /timeout=90/u);
 
     assert.doesNotMatch(DECOMPILE_SCRIPT, /removeprefix\(/u);
-    assert.match(DECOMPILE_SCRIPT, /def norm_addr\(raw\):.*s\.lstrip\('0'\) or '0'.*target_norm = norm_addr\(target\)/su);
+    assert.match(DECOMPILE_SCRIPT, /def norm_addr\(raw\):.*s\.lstrip\('0'\) or '0'.*target_norm = norm_addr\((?:target|one)\)/su);
 
     const ghCalls = (await readFile(ghLog, 'utf8')).trim().split(/\r?\n/u).map(line => JSON.parse(line));
     assert.equal(ghCalls.length, 8);
@@ -750,12 +775,14 @@ test('buildDockerArgs 容器加固（cap-drop/no-new-privileges/只读挂载）�
 
   // Dockerfile 版本锁定与新增工具校验
   const dockerfile = await readFile(new URL('../docker/Dockerfile', import.meta.url), 'utf8');
+  const reqBase = await readFile(new URL('../docker/requirements-base.txt', import.meta.url), 'utf8');
+  const dockerSpec = `${dockerfile}\n${reqBase}`;
   for (const token of [
     'ARG RADARE2_VERSION=', 'ARG GEF_VERSION=', 'ARG BKCRACK_VERSION=',
     'ARG FFUF_VERSION=', 'ARG PWNINIT_VERSION=',
     'tesseract-ocr', 'john', 'sqlmap', 'pyinstxtractor-ng', 'bkcrack', 'ffuf', 'pwninit',
   ]) {
-    assert.ok(dockerfile.includes(token), `docker/Dockerfile 应包含 ${token}`);
+    assert.ok(dockerSpec.includes(token), `docker/Dockerfile (+ requirements-base.txt) 应包含 ${token}`);
   }
   assert.match(dockerfile, /USER 10001:10001/u);
   assert.match(dockerfile, /ARG APT_MIRROR=/u);

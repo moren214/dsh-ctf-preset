@@ -176,23 +176,18 @@ test('Safetensors __metadata__ 里的模板注入必须判为 high', async t => 
 });
 
 test('Ghidra 反编译契约：返回 image_base 且接受相对地址', async () => {
-  const source = await readFile(new URL('../sandbox-runner.js', import.meta.url), 'utf8');
-  assert.ok((source.match(/'image_base': img_base_hex/gu) ?? []).length >= 2,
+  assert.ok((DECOMPILE_SCRIPT.match(/'image_base': img_base_hex/gu) ?? []).length >= 2,
     'list 与 function 两种模式都必须回报 image_base');
-  assert.match(source, /item\['offset'\] = hex\(entry_off - img_base\)/u, 'list 必须附带相对偏移');
-  assert.match(source, /rel_s == target_norm/u, 'function 必须同时按绝对地址与相对地址匹配');
+  assert.match(DECOMPILE_SCRIPT, /item\['offset'\] = hex\(entry_off - img_base\)/u, 'list 必须附带相对偏移');
+  assert.match(DECOMPILE_SCRIPT, /rel_s == target_norm/u, 'function 必须同时按绝对地址与相对地址匹配');
 });
 
 test('r2 反编译路径不得给 r2 传 "--"，函数名要按 sym. 前缀回退', async () => {
-  const source = await readFile(new URL('../sandbox-runner.js', import.meta.url), 'utf8');
-  // r2 的 `--` 是"不打开任何文件"，不是选项结束符：传了它 aflj 恒返回 []、pdg 无输出，
-  // 表现成"r2 没有识别到函数"（exit 0），极难从错误信息反推。
-  assert.doesNotMatch(source, /"-c", "aflj", "--"/u, 'r2 调用不能带 --');
-  assert.doesNotMatch(source, /"-c", "[^"]*", "--"/u, 'r2 调用不能带 --');
-  // r2 的 flag 名带 sym. 前缀（pdg @ check_flag 会报 Invalid tmpseek address）。
-  assert.match(source, /candidates\.append\("sym\." \+ target\)/u, '必须按 sym.<name> 回退');
-  assert.match(source, /pdg @ %s/u, '必须实际执行 pdg');
-  assert.match(source, /__DSH_R2_PDG__/u, '多候选输出必须用 section 标记切分');
+  assert.doesNotMatch(DECOMPILE_SCRIPT, /"-c", "aflj", "--"/u, 'r2 调用不能带 --');
+  assert.doesNotMatch(DECOMPILE_SCRIPT, /"-c", "[^"]*", "--"/u, 'r2 调用不能带 --');
+  assert.match(DECOMPILE_SCRIPT, /candidates\.append\("sym\." \+ target\)/u, '必须按 sym.<name> 回退');
+  assert.match(DECOMPILE_SCRIPT, /pdg @ %s/u, '必须实际执行 pdg');
+  assert.match(DECOMPILE_SCRIPT, /__DSH_R2_PDG__/u, '多候选输出必须用 section 标记切分');
 });
 
 test('ctf_sandbox 的返回必须带 result_id（零拷贝链路）', async t => {

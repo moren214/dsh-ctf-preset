@@ -1,4 +1,5 @@
 import { checkRange, inPage, page } from './attachment-layout.js';
+import { ToolError } from './tool-errors.js';
 
 const IF_TSRESOL = 9;
 const IF_TSOFFSET = 14;
@@ -21,7 +22,7 @@ export const PCAPNG_QUERY_SCHEMA = {
 function parseBoundary(value, field) {
   if (value === undefined) return undefined;
   const match = typeof value === 'string' && UTC_TIMESTAMP.exec(value);
-  const error = () => new Error(`${field} 须是有效的 UTC 时间，例如 2026-11-21T00:00:00.25Z。`);
+  const error = () => new ToolError('unsupported', `${field} 须是有效的 UTC 时间，例如 2026-11-21T00:00:00.25Z。`);
   if (!match) throw error();
   const [, whole, fraction = ''] = match;
   const date = new Date(whole + 'Z');
@@ -34,20 +35,20 @@ export function parsePcapngQuery(query) {
   if (query === undefined) return undefined;
   if (query === null || typeof query !== 'object' || Array.isArray(query)
     || Object.keys(query).some(key => !Object.hasOwn(PCAPNG_QUERY_SCHEMA.properties, key))) {
-    throw new Error('pcapng 须为有效的接口或时间窗口查询。');
+    throw new ToolError('unsupported', 'pcapng 须为有效的接口或时间窗口查询。');
   }
   const { view = 'interfaces', section_index: section, interface_id: id } = query;
-  if (view !== 'interfaces' && view !== 'packets') throw new Error('pcapng.view 须为 interfaces 或 packets。');
+  if (view !== 'interfaces' && view !== 'packets') throw new ToolError('unsupported', 'pcapng.view 须为 interfaces 或 packets。');
   if ([section, id].some(value => value !== undefined && (!Number.isSafeInteger(value) || value < 0))) {
-    throw new Error('section_index 和 interface_id 须为非负整数。');
+    throw new ToolError('unsupported', 'section_index 和 interface_id 须为非负整数。');
   }
   const start = parseBoundary(query.start_utc, 'start_utc');
   const end = parseBoundary(query.end_utc, 'end_utc');
   const endInclusive = query.end_inclusive ?? false;
-  if (typeof endInclusive !== 'boolean' || (endInclusive && !end)) throw new Error('end_inclusive 须是布尔值，开启时需要 end_utc。');
+  if (typeof endInclusive !== 'boolean' || (endInclusive && !end)) throw new ToolError('unsupported', 'end_inclusive 须是布尔值，开启时需要 end_utc。');
   if (start && end) {
     const difference = start.value * end.scale - end.value * start.scale;
-    if (difference > 0n || (difference === 0n && !endInclusive)) throw new Error('PCAPNG 时间窗口的起点、终点顺序不正确。');
+    if (difference > 0n || (difference === 0n && !endInclusive)) throw new ToolError('unsupported', 'PCAPNG 时间窗口的起点、终点顺序不正确。');
   }
   return { view, section, id, start, end, endInclusive };
 }
@@ -75,14 +76,14 @@ export function interfaceClock(bytes, { u16, u32, i64 }, offset, query = {}) {
     const padded = Math.ceil(length / 4) * 4;
     checkRange(end, start, padded, optionLabel);
     if (code === 0) {
-      if (length !== 0) throw new Error(`${optionLabel}的结束标记长度无效。`);
+      if (length !== 0) throw new ToolError('unsupported', `${optionLabel}的结束标记长度无效。`);
       break;
     }
     if (code === IF_TSRESOL) {
-      if (length !== 1 || resolution !== undefined) throw new Error(`${optionLabel}的 if_tsresol 长度无效或重复。`);
+      if (length !== 1 || resolution !== undefined) throw new ToolError('unsupported', `${optionLabel}的 if_tsresol 长度无效或重复。`);
       resolution = bytes[start];
     } else if (code === IF_TSOFFSET) {
-      if (length !== 8 || offsetSeconds !== undefined) throw new Error(`${optionLabel}的 if_tsoffset 长度无效或重复。`);
+      if (length !== 8 || offsetSeconds !== undefined) throw new ToolError('unsupported', `${optionLabel}的 if_tsoffset 长度无效或重复。`);
       offsetSeconds = i64(start);
     }
     cursor = start + padded;

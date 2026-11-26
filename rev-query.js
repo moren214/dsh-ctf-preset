@@ -4,8 +4,9 @@ import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ToolError } from './tool-errors.js';
 
-const WORKER = fileURLToPath(new URL('rev-disasm-worker.py', import.meta.url));
+const WORKER = fileURLToPath(new URL('core/workers/rev-disasm-worker.py', import.meta.url));
 const WORKER_TIMEOUT = 15_000;
 const MAX_WORKER_OUTPUT = 4 * 1024 * 1024;
 const MAX_FILE_SIZE = 64 * 1024 * 1024;
@@ -47,28 +48,28 @@ class WorkerUnavailableError extends Error {
 
 function requireText(value, label, maximum = 512) {
   if (typeof value !== 'string' || value.trim() === '') {
-    throw new Error(`${label} 必须是非空字符串。`);
+    throw new ToolError('unsupported', `${label} 必须是非空字符串。`);
   }
-  if (value.length > maximum) throw new Error(`${label} 过长。`);
-  if (/[\0\r\n]/u.test(value)) throw new Error(`${label} 包含不允许的控制字符。`);
+  if (value.length > maximum) throw new ToolError('unsupported', `${label} 过长。`);
+  if (/[\0\r\n]/u.test(value)) throw new ToolError('unsupported', `${label} 包含不允许的控制字符。`);
   return value;
 }
 
 function normalizeFilePath(value) {
   const raw = requireText(value, 'file_path', 1024).replaceAll('\\', '/');
   if (raw.startsWith('/') || /^[A-Za-z]:/u.test(raw)) {
-    throw new Error('file_path 必须是相对会话工作目录的路径，不能是绝对路径。');
+    throw new ToolError('path', 'file_path 必须是相对会话工作目录的路径，不能是绝对路径。');
   }
   const parts = raw.split('/').filter((part) => part !== '' && part !== '.');
-  if (parts.length === 0) throw new Error('file_path 不能为空。');
+  if (parts.length === 0) throw new ToolError('path', 'file_path 不能为空。');
   if (parts.some((part) => part === '..')) {
-    throw new Error('file_path 不能包含 ".."，不能越出会话工作目录。');
+    throw new ToolError('path', 'file_path 不能包含 ".."，不能越出会话工作目录。');
   }
   if (parts.some((part) => /[. ]$/u.test(part))) {
-    throw new Error('file_path 的路径段不能以点或空格结尾。');
+    throw new ToolError('path', 'file_path 的路径段不能以点或空格结尾。');
   }
   if (parts.some((part) => part.includes(':'))) {
-    throw new Error('file_path 不能包含 ":"。');
+    throw new ToolError('path', 'file_path 不能包含 ":"。');
   }
   return parts.join('/');
 }
@@ -81,30 +82,30 @@ function optionalName(value, label, maximum) {
 function normalizeAddress(value) {
   if (typeof value === 'bigint') {
     if (value < 0n || value > 0xffffffffffffffffn) {
-      throw new Error('address 超出 64 位地址范围。');
+      throw new ToolError('unsupported', 'address 超出 64 位地址范围。');
     }
     return `0x${value.toString(16)}`;
   }
   if (typeof value === 'number') {
     if (!Number.isSafeInteger(value) || value < 0) {
-      throw new Error('address 必须是非负整数或 0x 开头的十六进制字符串。');
+      throw new ToolError('unsupported', 'address 必须是非负整数或 0x 开头的十六进制字符串。');
     }
     return `0x${value.toString(16)}`;
   }
   const text = requireText(value, 'address', 32).trim();
   if (!/^(?:0[xX][0-9a-fA-F]+|[0-9]+)$/u.test(text)) {
-    throw new Error('address 必须是 0x 开头的十六进制数或十进制数。');
+    throw new ToolError('unsupported', 'address 必须是 0x 开头的十六进制数或十进制数。');
   }
   const parsed = BigInt(text);
-  if (parsed > 0xffffffffffffffffn) throw new Error('address 超出 64 位地址范围。');
+  if (parsed > 0xffffffffffffffffn) throw new ToolError('unsupported', 'address 超出 64 位地址范围。');
   return `0x${parsed.toString(16)}`;
 }
 
 function integerInRange(value, fallback, minimum, maximum, label) {
   if (value === undefined || value === null) return fallback;
-  if (!Number.isInteger(value)) throw new Error(`${label} 必须是整数。`);
+  if (!Number.isInteger(value)) throw new ToolError('unsupported', `${label} 必须是整数。`);
   if (value < minimum || value > maximum) {
-    throw new Error(`${label} 必须在 ${minimum} 到 ${maximum} 之间。`);
+    throw new ToolError('unsupported', `${label} 必须在 ${minimum} 到 ${maximum} 之间。`);
   }
   return value;
 }
@@ -114,7 +115,7 @@ function explicitPython(input, options) {
   if (value === undefined || value === null) return undefined;
   const text = requireText(value, 'python_path', 1024).trim();
   if (!path.isAbsolute(text)) {
-    throw new Error('python_path 必须是 Python 解释器的绝对路径。');
+    throw new ToolError('path', 'python_path 必须是 Python 解释器的绝对路径。');
   }
   return text;
 }
@@ -139,7 +140,7 @@ async function digestFile(absolutePath, display) {
   try {
     for await (const chunk of createReadStream(absolutePath)) hash.update(chunk);
   } catch {
-    throw new Error(`无法读取文件 ${display}。`);
+    throw new ToolError('missing', `无法读取文件 ${display}。`);
   }
   return hash.digest('hex');
 }
@@ -194,19 +195,19 @@ function spawnWorker(candidate, request, options) {
       }
     };
     const onAbort = () => {
-      finish(new Error('反汇编查询已取消。'));
+      finish(new ToolError('abort', '反汇编查询已取消。'));
       kill();
     };
 
     if (options.signal?.aborted) {
-      finish(new Error('反汇编查询已取消。'));
+      finish(new ToolError('abort', '反汇编查询已取消。'));
       kill();
       return;
     }
     options.signal?.addEventListener('abort', onAbort, { once: true });
 
     timer = setTimeout(() => {
-      finish(new Error('反汇编工作台响应超时（15 秒），已终止 Python 进程。'));
+      finish(new ToolError('timeout', '反汇编工作台响应超时（15 秒），已终止 Python 进程。'));
       kill();
     }, WORKER_TIMEOUT);
 
@@ -214,7 +215,7 @@ function spawnWorker(candidate, request, options) {
     child.stdout.on('data', (chunk) => {
       stdout += chunk;
       if (Buffer.byteLength(stdout, 'utf8') > MAX_WORKER_OUTPUT) {
-        finish(new Error('反汇编工作台的输出超出限制。'));
+        finish(new ToolError('size', '反汇编工作台的输出超出限制。'));
         kill();
       }
     });
@@ -229,7 +230,7 @@ function spawnWorker(candidate, request, options) {
         ));
         return;
       }
-      finish(new Error(`无法启动 Python 反汇编工作台（${error.code ?? '未知错误'}）。`));
+      finish(new ToolError('dependency', `无法启动 Python 反汇编工作台（${error.code ?? '未知错误'}）。`));
     });
     child.on('close', (code) => {
       if (settled) return;
@@ -247,18 +248,18 @@ function spawnWorker(candidate, request, options) {
       try {
         reply = JSON.parse(line);
       } catch {
-        finish(new Error('反汇编工作台返回了无法解析的响应。'));
+        finish(new ToolError('encoding', '反汇编工作台返回了无法解析的响应。'));
         return;
       }
       if (reply === null || typeof reply !== 'object' || Array.isArray(reply)) {
-        finish(new Error('反汇编工作台返回了无法解析的响应。'));
+        finish(new ToolError('encoding', '反汇编工作台返回了无法解析的响应。'));
         return;
       }
       if (reply.ok !== true) {
         const message = typeof reply.error === 'string' && reply.error !== ''
           ? reply.error
           : '反汇编工作台报告了未知错误。';
-        finish(new Error(message));
+        finish(new ToolError('unsupported', message));
         return;
       }
       const { ok: _ok, ...report } = reply;
@@ -284,9 +285,9 @@ async function runWorker(request, pythonPath, options) {
     }
   }
   if (pythonPath !== undefined) {
-    throw new Error(`${lastError?.message ?? 'Python 解释器不可用。'}请检查 python_path。`);
+    throw new ToolError('dependency', `${lastError?.message ?? 'Python 解释器不可用。'}请检查 python_path。`);
   }
-  throw new Error(
+  throw new ToolError('dependency',
     `未找到可用的 Python 解释器（${lastError?.message ?? '均启动失败'}）。`
     + '请通过 python_path 指定本机 Python 3.11 或更高版本的绝对路径。',
   );
@@ -301,12 +302,12 @@ async function runWorker(request, pythonPath, options) {
  */
 export async function runRevQuery(input, options = {}) {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) {
-    throw new Error('rev_query 参数必须是 JSON 对象。');
+    throw new ToolError('unsupported', 'rev_query 参数必须是 JSON 对象。');
   }
   if (options === null || typeof options !== 'object') options = {};
   const operation = input.operation;
   if (operation !== 'disassemble' && operation !== 'cfg' && operation !== 'strings' && operation !== 'triage') {
-    throw new Error('operation 必须是 disassemble、cfg、strings 或 triage。');
+    throw new ToolError('unsupported', 'operation 必须是 disassemble、cfg、strings 或 triage。');
   }
 
   const file = normalizeFilePath(input.file_path);
@@ -315,18 +316,18 @@ export async function runRevQuery(input, options = {}) {
   const relative = path.relative(cwd, absolute);
   if (relative === '' || relative === '..'
     || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new Error('file_path 不能越出会话工作目录。');
+    throw new ToolError('path', 'file_path 不能越出会话工作目录。');
   }
 
   let info;
   try {
     info = await stat(absolute);
   } catch {
-    throw new Error(`无法读取文件 ${file}。`);
+    throw new ToolError('missing', `无法读取文件 ${file}。`);
   }
-  if (!info.isFile()) throw new Error(`${file} 不是普通文件。`);
+  if (!info.isFile()) throw new ToolError('missing', `${file} 不是普通文件。`);
   if (info.size > MAX_FILE_SIZE) {
-    throw new Error(`${file} 超过 64 MiB，反汇编查询最多处理 64 MiB。`);
+    throw new ToolError('size', `${file} 超过 64 MiB，反汇编查询最多处理 64 MiB。`);
   }
 
   const request = { file: absolute, operation };
@@ -337,7 +338,7 @@ export async function runRevQuery(input, options = {}) {
   const section = optionalName(input.section, 'section', 128);
   if (operation === 'disassemble') {
     if (address !== undefined && symbol !== undefined) {
-      throw new Error('address 与 symbol 不能同时指定。');
+      throw new ToolError('unsupported', 'address 与 symbol 不能同时指定。');
     }
     if (symbol !== undefined) request.symbol = symbol;
     if (address !== undefined) request.address = address;
@@ -347,13 +348,13 @@ export async function runRevQuery(input, options = {}) {
     );
   } else if (operation === 'cfg') {
     if (address !== undefined && symbol !== undefined) {
-      throw new Error('cfg 的 address 与 symbol 不能同时指定。');
+      throw new ToolError('unsupported', 'cfg 的 address 与 symbol 不能同时指定。');
     }
     if (address === undefined && symbol === undefined) {
-      throw new Error('cfg 必须指定 symbol 或 address。');
+      throw new ToolError('unsupported', 'cfg 必须指定 symbol 或 address。');
     }
     if (section !== undefined) {
-      throw new Error('cfg 不接受 section；请指定函数 symbol 或 address。');
+      throw new ToolError('unsupported', 'cfg 不接受 section；请指定函数 symbol 或 address。');
     }
     if (symbol !== undefined) request.symbol = symbol;
     if (address !== undefined) request.address = address;
@@ -366,7 +367,7 @@ export async function runRevQuery(input, options = {}) {
     );
   } else if (operation === 'strings') {
     if (symbol !== undefined || address !== undefined) {
-      throw new Error('strings 查询不接受 symbol 或 address。');
+      throw new ToolError('unsupported', 'strings 查询不接受 symbol 或 address。');
     }
     if (section !== undefined) request.section = section;
     request.min_length = integerInRange(
@@ -374,7 +375,7 @@ export async function runRevQuery(input, options = {}) {
     );
   } else {
     if (symbol !== undefined || address !== undefined || section !== undefined) {
-      throw new Error('triage 查询不接受 symbol、address 或 section。');
+      throw new ToolError('unsupported', 'triage 查询不接受 symbol、address 或 section。');
     }
   }
 

@@ -2,6 +2,7 @@ import { addAbortSignal } from 'node:stream';
 import { createGunzip, createInflate, createInflateRaw, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import { checkRange, inPage, label, MAX_ARCHIVE_MEMBER_BYTES, MAX_ATTACHMENT_BYTES, MAX_MEMBER_NAME, page } from './attachment-layout.js';
 import { inspectZip, isZip } from './zip-directory.js';
+import { ToolError } from './tool-errors.js';
 
 const SAFE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 const TAR_BLOCK = 512;
@@ -31,7 +32,7 @@ function tarNumber(bytes, binary = true) {
     if (value === '') return 0;
     if (/^[0-7]+$/u.test(value)) return Number.parseInt(value, 8);
   }
-  throw new Error('附件结构无效：TAR 数值字段格式不受支持或超出范围。');
+  throw new ToolError('size', '附件结构无效：TAR 数值字段格式不受支持或超出范围。');
 }
 
 function tarText(bytes) {
@@ -44,19 +45,19 @@ function readPax(data, fields) {
   let cursor = 0;
   while (cursor < data.length) {
     const lengthEnd = data.subarray(cursor, cursor + 9).indexOf(0x20);
-    if (lengthEnd < 1) throw new Error('附件结构无效：PAX 扩展长度字段无效。');
+    if (lengthEnd < 1) throw new ToolError('unsupported', '附件结构无效：PAX 扩展长度字段无效。');
     const digits = data.toString('latin1', cursor, cursor + lengthEnd);
     if (!/^[1-9][0-9]*$/u.test(digits)) {
-      throw new Error('附件结构无效：PAX 扩展长度字段无效。');
+      throw new ToolError('unsupported', '附件结构无效：PAX 扩展长度字段无效。');
     }
     const size = Number(digits);
     checkRange(data.length, cursor, size, 'PAX 扩展记录');
     const start = cursor + lengthEnd + 1;
     const end = cursor + size;
-    if (end <= start || data[end - 1] !== 0x0a) throw new Error('附件结构无效：PAX 扩展记录不完整。');
+    if (end <= start || data[end - 1] !== 0x0a) throw new ToolError('unsupported', '附件结构无效：PAX 扩展记录不完整。');
     const pair = data.subarray(start, end - 1);
     const equals = pair.indexOf(0x3d);
-    if (equals < 1) throw new Error('附件结构无效：PAX 元数据缺少键值分隔符。');
+    if (equals < 1) throw new ToolError('unsupported', '附件结构无效：PAX 元数据缺少键值分隔符。');
     const key = pair.toString('latin1', 0, Math.min(GNU_SPARSE_PREFIX.length, equals));
     if (key === GNU_SPARSE_PREFIX) return false;
     if (key === 'path') fields.path = pair.length > equals + 1 ? tarText(pair.subarray(equals + 1)) : null;
@@ -64,7 +65,7 @@ function readPax(data, fields) {
       const value = pair.toString('latin1', equals + 1, equals + 18);
       const memberSize = Number(value);
       if (value.length > 16 || !/^[0-9]*$/u.test(value) || !Number.isSafeInteger(memberSize)) {
-        throw new Error('附件结构无效：PAX 条目大小字段无效。');
+        throw new ToolError('unsupported', '附件结构无效：PAX 条目大小字段无效。');
       }
       fields.size = value === '' ? null : memberSize;
     }
@@ -80,7 +81,7 @@ function tarHeader(bytes, cursor) {
   for (let index = 0; index < TAR_BLOCK; index++) {
     computed += index >= 148 && index < 156 ? 32 : header[index];
   }
-  if (checksum !== computed) throw new Error('附件结构无效：TAR 条目头校验和不匹配。');
+  if (checksum !== computed) throw new ToolError('unsupported', '附件结构无效：TAR 条目头校验和不匹配。');
   return header;
 }
 
@@ -95,7 +96,7 @@ function inspectTar(bytes, paging, format) {
   for (;;) {
     checkRange(bytes.length, cursor, TAR_BLOCK, 'TAR 条目头或归档结束块');
     if (bytes.subarray(cursor, cursor + TAR_BLOCK).equals(TAR_ZERO_BLOCK)) {
-      if (awaitingMember) throw new Error('附件结构无效：TAR 扩展条目不完整。');
+      if (awaitingMember) throw new ToolError('unsupported', '附件结构无效：TAR 扩展条目不完整。');
       endBlocks = bytes.subarray(cursor, cursor + TAR_END.length).equals(TAR_END) ? 2 : 1;
       break;
     }
@@ -191,8 +192,8 @@ function unpackTarOrCompressed(bytes, formatHint) {
   try {
     payload = decompressBuffer(bytes, kind);
   } catch (error) {
-    if (error.code === 'ERR_BUFFER_TOO_LARGE') throw new Error('解压后的数据超过 32 MiB。');
-    throw new Error('附件结构无效：压缩流无法读取或校验失败。');
+    if (error.code === 'ERR_BUFFER_TOO_LARGE') throw new ToolError('size', '解压后的数据超过 32 MiB。');
+    throw new ToolError('unsupported', '附件结构无效：压缩流无法读取或校验失败。');
   }
   return { format: compressedFormat(kind, payload), payload };
 }
@@ -233,12 +234,12 @@ async function unpackCompressedMember(bytes, kind, signal) {
       if (format === undefined && size >= TAR_END.length) {
         format = compressedFormat(kind, Buffer.concat(chunks, size));
       }
-      if (format === kind && size > MAX_ARCHIVE_MEMBER_BYTES) throw new Error('归档成员解压后须在 1 MiB 内。');
-      if (format !== kind && size > MAX_ATTACHMENT_BYTES) throw new Error('解压后的 TAR 超过 32 MiB。');
+      if (format === kind && size > MAX_ARCHIVE_MEMBER_BYTES) throw new ToolError('unsupported', '归档成员解压后须在 1 MiB 内。');
+      if (format !== kind && size > MAX_ATTACHMENT_BYTES) throw new ToolError('size', '解压后的 TAR 超过 32 MiB。');
     }
   } catch (error) {
     signal?.throwIfAborted();
-    if (error.code?.startsWith('Z_')) throw new Error('附件结构无效：压缩流无法读取或校验失败。');
+    if (error.code?.startsWith('Z_')) throw new ToolError('unsupported', '附件结构无效：压缩流无法读取或校验失败。');
     throw error;
   }
   const payload = Buffer.concat(chunks, size);
@@ -252,15 +253,15 @@ export async function readTarOrCompressedMember(bytes, memberIndex, signal, form
   if (archive === undefined) return undefined;
   const { format, payload } = archive;
   if (format === kind) {
-    if (memberIndex !== 0) throw new Error('压缩的单文件使用 member_index 0。');
+    if (memberIndex !== 0) throw new ToolError('unsupported', '压缩的单文件使用 member_index 0。');
     return { format, name: gzipMember(payload).name, bytes: payload };
   }
   const report = inspectTar(payload, { offset: memberIndex, limit: 1 }, format);
-  if (report.status !== 'ok') throw new Error(report.reason);
+  if (report.status !== 'ok') throw new ToolError('unsupported', report.reason);
   const [member] = report.layout.rows;
-  if (member === undefined) throw new Error('member_index 超出归档目录范围。');
-  if (!['file', 'contiguous_file'].includes(member.type)) throw new Error('请选择 TAR 中的普通文件成员。');
-  if (member.size > MAX_ARCHIVE_MEMBER_BYTES) throw new Error('归档成员解压后须在 1 MiB 内。');
+  if (member === undefined) throw new ToolError('size', 'member_index 超出归档目录范围。');
+  if (!['file', 'contiguous_file'].includes(member.type)) throw new ToolError('unsupported', '请选择 TAR 中的普通文件成员。');
+  if (member.size > MAX_ARCHIVE_MEMBER_BYTES) throw new ToolError('unsupported', '归档成员解压后须在 1 MiB 内。');
   const contentOffset = member.header_offset + TAR_BLOCK;
   return { format, name: member.name, bytes: payload.subarray(contentOffset, contentOffset + member.size) };
 }
@@ -271,7 +272,7 @@ export async function readDecompressedStreamMember(bytes, memberIndex, signal, f
     if (member === undefined) return undefined;
     return { ...member, format: 'TAR.' + format.toUpperCase() };
   }
-  if (memberIndex !== 0) throw new Error('压缩的单文件使用 member_index 0。');
-  if (bytes.length > MAX_ARCHIVE_MEMBER_BYTES) throw new Error('压缩的单文件成员解压后须在 1 MiB 内。');
+  if (memberIndex !== 0) throw new ToolError('unsupported', '压缩的单文件使用 member_index 0。');
+  if (bytes.length > MAX_ARCHIVE_MEMBER_BYTES) throw new ToolError('unsupported', '压缩的单文件成员解压后须在 1 MiB 内。');
   return { format, name: gzipMember(bytes).name, bytes };
 }

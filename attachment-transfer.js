@@ -5,6 +5,7 @@ import https from 'node:https';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { pinAddress, pinnedLookup, webUrl } from './network-boundary.js';
+import { ToolError } from './tool-errors.js';
 
 export const MAX_TRANSFER_BYTES = 256 * 1024 * 1024;
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
@@ -19,7 +20,7 @@ export async function stageAttachment(source, destination, { signal, limit = MAX
   let size = 0;
   const meter = new Transform({
     transform(bytes, _encoding, done) {
-      if (size + bytes.length > limit) return done(new Error('附件超过大小上限，已终止传输。'));
+      if (size + bytes.length > limit) return done(new ToolError('size', '附件超过大小上限，已终止传输。'));
       if (size < head.length) bytes.copy(head, size, 0, Math.min(head.length - size, bytes.length));
       size += bytes.length;
       hash.update(bytes);
@@ -44,14 +45,14 @@ function requestAttachment(url, address, signal, extraHeaders = {}) {
 export async function downloadAttachment(target, destination, {
   signal, resolveAddress, authorizeHop, headersFor, request = requestAttachment, limit = MAX_TRANSFER_BYTES,
 } = {}) {
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_TRANSFER_BYTES) throw new Error('附件下载上限无效。');
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_TRANSFER_BYTES) throw new ToolError('unsupported', '附件下载上限无效。');
   const timeout = AbortSignal.timeout(60000);
   const deadline = signal ? AbortSignal.any([signal, timeout]) : timeout;
   let url = webUrl(target);
   const seen = new Set();
   for (let hops = 0; hops <= 5; hops++) {
     deadline.throwIfAborted();
-    if (seen.has(url.href)) throw new Error('下载重定向循环。');
+    if (seen.has(url.href)) throw new ToolError('network', '下载重定向循环。');
     seen.add(url.href);
     const address = authorizeHop
       ? await authorizeHop(url, deadline)
@@ -61,19 +62,19 @@ export async function downloadAttachment(target, destination, {
     const status = response.statusCode ?? 0;
     if (REDIRECTS.has(status)) {
       response.destroy();
-      if (hops === 5 || typeof response.headers.location !== 'string') throw new Error('下载跳转超限或缺少目标。');
+      if (hops === 5 || typeof response.headers.location !== 'string') throw new ToolError('unsupported', '下载跳转超限或缺少目标。');
       const next = webUrl(new URL(response.headers.location, url));
-      if (url.protocol === 'https:' && next.protocol === 'http:') throw new Error('拒绝附件下载从 HTTPS 降级。');
+      if (url.protocol === 'https:' && next.protocol === 'http:') throw new ToolError('permission', '拒绝附件下载从 HTTPS 降级。');
       url = next;
       continue;
     }
     if (status < 200 || status >= 300 || status === 206 || Number(response.headers['content-length']) > limit) {
       response.destroy();
-      throw new Error('附件响应不可用或超过大小上限（HTTP ' + status + '）。');
+      throw new ToolError('size', '附件响应不可用或超过大小上限（HTTP ' + status + '）。');
     }
     const contentType = String(response.headers['content-type'] ?? '').slice(0, 200);
     const attachment = await stageAttachment(response, destination, { signal: deadline, limit });
     return { ...attachment, status, contentType, finalUrl: provenanceUrl(url) };
   }
-  throw new Error('下载重定向次数超出上限。');
+  throw new ToolError('network', '下载重定向次数超出上限。');
 }

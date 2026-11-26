@@ -448,10 +448,10 @@ test('redactPlatformToken 与 platformAuthHeaders 覆盖自定义头、空方案
 });
 
 test('sandbox-runner Ghidra 脚本兼容 Jython 2.7 地址归一化，Dockerfile 向 UID 10001 复制 r2ghidra', async () => {
-  const runnerSrc = await readFile(new URL('../sandbox-runner.js', import.meta.url), 'utf8');
-  assert.doesNotMatch(runnerSrc, /removeprefix\(/u, 'Ghidra Jython 2.7 脚本不得使用 Python 3.9 removeprefix');
-  assert.match(runnerSrc, /def norm_addr\(raw\):/u);
-  assert.match(runnerSrc, /target_norm = norm_addr\(target\)/u);
+  const { DECOMPILE_SCRIPT } = await import('../sandbox-runner.js');
+  assert.doesNotMatch(DECOMPILE_SCRIPT, /removeprefix\(/u, 'Ghidra Jython 2.7 脚本不得使用 Python 3.9 removeprefix');
+  assert.match(DECOMPILE_SCRIPT, /def norm_addr\(raw\):/u);
+  assert.match(DECOMPILE_SCRIPT, /target_norm = norm_addr\((?:target|one)\)/u);
   const dockerfile = await readFile(new URL('../docker/Dockerfile', import.meta.url), 'utf8');
   assert.match(dockerfile, /\/home\/ctf\/\.local\/share\/radare2/u);
   assert.match(dockerfile, /apt-get purge -y --auto-remove cmake ninja-build meson/u);

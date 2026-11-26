@@ -1,6 +1,7 @@
 import http from 'node:http';
 import net from 'node:net';
 import { pinnedLookup, webUrl } from './network-boundary.js';
+import { ToolError } from './tool-errors.js';
 
 const SKIP_HEADERS = new Set(['connection', 'proxy-connection', 'proxy-authorization', 'keep-alive', 'upgrade',
   'transfer-encoding', 'te', 'trailer']);
@@ -22,10 +23,10 @@ export async function browserGateway(authorize, { timeoutMs = 30000 } = {}) {
   const server = http.createServer(async (input, output) => {
     try {
       const url = webUrl(input.url);
-      if (url.protocol !== 'http:') throw new Error('需要通过 HTTPS 隧道。');
+      if (url.protocol !== 'http:') throw new ToolError('network', '需要通过 HTTPS 隧道。');
       const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(timeoutMs)]);
       const address = await authorize(url, signal);
-      if (lifecycle.signal.aborted) throw new Error('网关已关闭。');
+      if (lifecycle.signal.aborted) throw new ToolError('abort', '网关已关闭。');
       const upstream = http.request(url, {
         method: input.method, lookup: pinnedLookup(address), agent: false,
         headers: { ...forwardHeaders(input.headers), host: url.host },
@@ -35,7 +36,7 @@ export async function browserGateway(authorize, { timeoutMs = 30000 } = {}) {
         response.once('error', error => output.destroy(error));
         response.pipe(output);
       });
-      upstream.setTimeout(timeoutMs, () => upstream.destroy(new Error('上游响应空闲超时。')));
+      upstream.setTimeout(timeoutMs, () => upstream.destroy(new ToolError('timeout', '上游响应空闲超时。')));
       upstream.once('error', () => {
         if (!output.headersSent) output.writeHead(502);
         output.end();
@@ -51,12 +52,12 @@ export async function browserGateway(authorize, { timeoutMs = 30000 } = {}) {
   server.on('connect', async (message, client, head) => {
     try {
       const url = webUrl('https://' + message.url);
-      if (url.pathname !== '/' || url.search || url.hash) throw new Error('隧道目标无效。');
+      if (url.pathname !== '/' || url.search || url.hash) throw new ToolError('network', '隧道目标无效。');
       const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(timeoutMs)]);
       const address = await authorize(url, signal);
       if (client.destroyed) return;
       const upstream = track(net.createConnection({ host: address.address, port: Number(url.port || 443) }));
-      const connectTimer = setTimeout(() => upstream.destroy(new Error('上游连接超时。')), timeoutMs);
+      const connectTimer = setTimeout(() => upstream.destroy(new ToolError('timeout', '上游连接超时。')), timeoutMs);
       upstream.once('connect', () => {
         clearTimeout(connectTimer);
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');

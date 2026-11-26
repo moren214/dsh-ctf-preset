@@ -140,7 +140,7 @@ async function removeProfile(profile, root) {
   }
 }
 
-export function createBrowserSession({ resolveBinary, authorize, environment, allowInsecureTls, onStart, onStop }) {
+export function createBrowserSession({ resolveBinary, authorize, environment, allowInsecureTls, inContainer = false, onStart, onStop }) {
   let state;
   let active;
   let cleanup;
@@ -189,19 +189,19 @@ export function createBrowserSession({ resolveBinary, authorize, environment, al
       };
       const abort = () => { cleanupConnection(); reject(signal.reason); };
       const ready = () => { cleanupConnection(); resolve(); };
-      const failed = () => { cleanupConnection(); reject(new Error('无法连接浏览器的调试端口。')); };
+      const failed = () => { cleanupConnection(); reject(new ToolError('network', '无法连接浏览器的调试端口。')); };
       signal.addEventListener('abort', abort, { once: true });
       socket.addEventListener('open', ready, { once: true });
       socket.addEventListener('error', failed, { once: true });
       socket.addEventListener('close', () => {
         failed();
-        for (const entry of browser.pending.values()) entry.finish(new Error('浏览器调试连接已关闭。'));
+        for (const entry of browser.pending.values()) entry.finish(new ToolError('network', '浏览器调试连接已关闭。'));
       });
       socket.addEventListener('message', event => {
         let payload;
         try { payload = JSON.parse(event.data); } catch { return; }
         if (payload.id !== undefined) {
-          browser.pending.get(payload.id)?.finish(payload.error ? new Error('浏览器调试调用失败。') : undefined, payload.result);
+          browser.pending.get(payload.id)?.finish(payload.error ? new ToolError('unsupported', '浏览器调试调用失败。') : undefined, payload.result);
         } else {
           handleCdpEvent(browser, payload);
         }
@@ -212,7 +212,7 @@ export function createBrowserSession({ resolveBinary, authorize, environment, al
 
   function send(browser, method, params, signal, sessionId = browser.sessionId) {
     signal.throwIfAborted();
-    if (browser.socket?.readyState !== 1) throw new Error('浏览器会话未建立。');
+    if (browser.socket?.readyState !== 1) throw new ToolError('network', '浏览器会话未建立。');
     const id = ++browser.nextId;
     return new Promise((resolve, reject) => {
       const finish = (error, result) => {
@@ -247,8 +247,11 @@ export function createBrowserSession({ resolveBinary, authorize, environment, al
       browser.profile = await mkdtemp(path.join(browser.root, PROFILE_PREFIX));
       signal.throwIfAborted();
       const insecureTls = typeof allowInsecureTls === 'function' ? allowInsecureTls() === true : allowInsecureTls === true;
+      const containerMode = (typeof inContainer === 'function' ? inContainer() === true : inContainer === true)
+        || process.env.CTF_BROWSER_IN_CONTAINER === 'true';
       browser.child = spawn(binary, [
         '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+        ...(containerMode ? ['--no-sandbox', '--disable-dev-shm-usage'] : []),
         '--disable-extensions', '--mute-audio', '--remote-debugging-port=0', '--disable-background-networking',
         '--disable-quic', '--dns-prefetch-disable', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
         ...(insecureTls ? ['--ignore-certificate-errors'] : []),
@@ -275,15 +278,15 @@ export function createBrowserSession({ resolveBinary, authorize, environment, al
           await wait(50, undefined, { signal });
         }
       }
-      if (!contents) throw new Error('Chrome/Edge 启动失败。');
+      if (!contents) throw new ToolError('dependency', 'Chrome/Edge 启动失败。');
       const port = contents.split(/\r?\n/u)[0];
-      if (!/^\d{1,5}$/u.test(port) || Number(port) < 1 || Number(port) > 65535) throw new Error('调试端口无效。');
+      if (!/^\d{1,5}$/u.test(port) || Number(port) < 1 || Number(port) > 65535) throw new ToolError('network', '调试端口无效。');
       const reply = await httpRequest({ url: 'http://127.0.0.1:' + port + '/json/version',
         timeout_ms: 3000, follow_redirects: false }, { signal });
-      if (reply.status !== 200 || !reply.body_complete) throw new Error('无法读取本机浏览器的调试配置。');
+      if (reply.status !== 200 || !reply.body_complete) throw new ToolError('network', '无法读取本机浏览器的调试配置。');
       const debuggerUrl = new URL(JSON.parse(reply.body).webSocketDebuggerUrl);
       if (debuggerUrl.protocol !== 'ws:' || debuggerUrl.hostname !== '127.0.0.1' || debuggerUrl.port !== port
-        || debuggerUrl.username || debuggerUrl.password) throw new Error('调试连接超出本机浏览器。');
+        || debuggerUrl.username || debuggerUrl.password) throw new ToolError('network', '调试连接超出本机浏览器。');
       await connect(browser, debuggerUrl.href, signal);
       const { targetId } = await send(browser, 'Target.createTarget', { url: 'about:blank' }, signal, null);
       const attached = await send(browser, 'Target.attachToTarget', { targetId, flatten: true }, signal, null);
@@ -301,13 +304,13 @@ export function createBrowserSession({ resolveBinary, authorize, environment, al
 
   async function evaluate(browser, expression, signal) {
     const result = await send(browser, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, signal);
-    if (result.exceptionDetails) throw new Error('无法读取页面的所选内容。');
+    if (result.exceptionDetails) throw new ToolError('unsupported', '无法读取页面的所选内容。');
     return result.result?.value;
   }
 
   return {
     async run(timeoutMs, parent, operation) {
-      if (active || cleanup) throw new Error('此浏览器会话正忙。');
+      if (active || cleanup) throw new ToolError('conflict', '此浏览器会话正忙。');
       const deadline = AbortSignal.timeout(timeoutMs);
       const controller = new AbortController();
       const signal = AbortSignal.any([deadline, controller.signal, ...(parent ? [parent] : [])]);
@@ -335,7 +338,7 @@ export function createBrowserSession({ resolveBinary, authorize, environment, al
     },
     async navigate(browser, url, signal) {
       const navigation = await send(browser, 'Page.navigate', { url }, signal);
-      if (navigation.errorText || navigation.isDownload) throw new Error('页面打开失败，或者目标返回了下载。');
+      if (navigation.errorText || navigation.isDownload) throw new ToolError('network', '页面打开失败，或者目标返回了下载。');
       while (await evaluate(browser, 'document.readyState', signal) !== 'complete') await wait(75, undefined, { signal });
       const current = await evaluate(browser, 'location.href', signal);
       if (current !== 'about:blank') await authorize(current, signal);
@@ -353,7 +356,7 @@ export function createBrowserSession({ resolveBinary, authorize, environment, al
       } else if (action === 'select') {
         const text = JSON.stringify(value);
         operation = `if (!(node instanceof HTMLSelectElement)) return {status:'not_select'}; if (node.disabled) return {status:'disabled'}; if (!Array.from(node.options).some(option=>option.value===${text})) return {status:'option_not_found'}; const setter=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set; setter.call(node,${text}); node.dispatchEvent(new Event('input',{bubbles:true,composed:true})); node.dispatchEvent(new Event('change',{bubbles:true,composed:true})); return {status:'selected',value:node.value};`;
-      } else throw new Error('不支持的浏览器交互操作。');
+      } else throw new ToolError('unsupported', '不支持的浏览器交互操作。');
       const expression = `(() => { let nodes; try { nodes=Array.from(document.querySelectorAll(${query})); } catch { return {status:'invalid_selector'}; } if (nodes.length!==1) return {status:'match_count',count:nodes.length}; const node=nodes[0]; ${operation} })()`;
       return evaluate(browser, expression, signal);
     },

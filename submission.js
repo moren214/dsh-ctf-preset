@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
+import { ToolError } from './tool-errors.js';
 
 const patternWorker = new URL('./flag-pattern-worker.js', import.meta.url);
-const patternWorkers = new Set();
 const PATTERN_TIMEOUT_MS = 500;
 const MAX_PATTERN_WORKERS = 4;
 
@@ -48,7 +48,7 @@ function isSubmission(receipt) {
     && (receipt.platform_status != null || ['accepted', 'duplicate', 'unknown', 'pending'].includes(receipt.verdict)));
 }
 
-async function checkFormat(pattern, flag, signal) {
+async function checkFormat(pattern, flag, signal, patternWorkers = new Set()) {
   if (pattern === undefined) {
     return { ok: /^[A-Za-z0-9_]{1,16}\{[^{}\r\n]{4,256}\}$/u.test(flag), detail: '默认要求 prefix{...} 形式。' };
   }
@@ -68,7 +68,7 @@ async function checkFormat(pattern, flag, signal) {
         if (error === undefined) resolve(report);
         else reject(error);
       };
-      const abort = () => finish(undefined, signal.reason ?? new Error('格式校验已取消。'));
+      const abort = () => finish(undefined, signal.reason ?? new ToolError('abort', '格式校验已取消。'));
       const timer = setTimeout(() => finish({ ok: false, detail: '格式校验超时，请简化 pattern。' }), PATTERN_TIMEOUT_MS);
       worker.once('message', result => finish(result.invalid
         ? { ok: false, detail: 'pattern 不是有效正则。' }
@@ -107,30 +107,100 @@ function checksFor(args, flag, sha256, receipts, scope, format) {
   return { duplicate, checks, ready: checks.every(item => item.ok) };
 }
 
-export async function handleSubmission(args, files, submit, platform, signal) {
+export async function handleSubmission(args, files, submit, platform, signal, options = {}) {
   const flag = typeof args.flag === 'string' ? args.flag.trim() : '';
   const sha256 = createHash('sha256').update(flag).digest('hex');
   const scope = { platform, challenge: scopePart(args.challenge), instance: scopePart(args.instance) };
   const base = { flag_sha256: sha256, ...scope };
-  const format = await checkFormat(args.pattern, flag, signal);
+  const format = await checkFormat(args.pattern, flag, signal, options.patternWorkers);
   const preflight = receipts => checksFor(args, flag, sha256, receipts, scope, format);
+  const authoritative = typeof files?.claimSubmissionAttempt === 'function';
+
+  if (authoritative) {
+    await files.syncLegacy?.();
+  }
+
   if (submit === undefined) {
-    const { receipts, document, corruptedLines } = await files.read();
+    const { receipts, document, corruptedLines = 0 } = await files.read();
     const check = preflight(receipts);
     if (args.record === true) {
-      await files.write(document, [...receipts, { ...base, at: new Date().toISOString(), kind: 'check', verdict: 'checked', ready: check.ready }]);
+      const entry = { ...base, id: randomUUID(), at: new Date().toISOString(), kind: 'check', verdict: 'checked', ready: check.ready };
+      if (authoritative && typeof files.recordCheckReceipt === 'function') {
+        await files.recordCheckReceipt(entry);
+        await files.projectJsonl?.().catch(() => {});
+      } else {
+        await files.write(document, [...receipts, entry]);
+      }
     }
     return { status: 'checked', ...check, receipts: receipts.length, flag_sha256: sha256, corrupted_receipts: corruptedLines };
   }
 
-  const { receipts, document, corruptedLines } = await files.read();
+  const { receipts, document, corruptedLines = 0 } = await files.read();
   const check = preflight(receipts);
-  if (!check.ready) return { status: 'rejected', verdict: 'rejected_local', ...check, receipts: receipts.length, flag_sha256: sha256, corrupted_receipts: corruptedLines };
-  if (platform === undefined) throw new Error('未配置竞赛平台地址。');
+  if (!check.ready) {
+    return { status: 'rejected', verdict: 'rejected_local', ...check, receipts: receipts.length, flag_sha256: sha256, corrupted_receipts: corruptedLines };
+  }
+  if (platform === undefined) throw new ToolError('dependency', '未配置竞赛平台地址。');
 
   const id = randomUUID();
   const pending = { ...base, id, at: new Date().toISOString(), kind: 'submit', verdict: 'pending' };
-  // Claim the attempt before calling the platform. A conflicting writer never sends a request.
+
+  if (authoritative) {
+    // Atomically claim inside SQLite BEGIN IMMEDIATE before calling the platform.
+    const claim = await files.claimSubmissionAttempt({
+      ...pending,
+      retry_unknown: args.retry_unknown === true,
+    });
+    if (!claim.claimed) {
+      const dupChecks = check.checks.map(item => item.name === 'not_duplicate'
+        ? {
+          ...item,
+          ok: false,
+          detail: '已有同项正式提交或待确认记录。若上次因 429/网络异常为 unknown，核对平台后可传 retry_unknown: true 重提。',
+        }
+        : item);
+      return {
+        status: 'rejected',
+        verdict: 'rejected_local',
+        duplicate: claim.duplicate,
+        checks: dupChecks,
+        ready: false,
+        receipts: claim.receipts_count,
+        flag_sha256: sha256,
+        corrupted_receipts: corruptedLines,
+      };
+    }
+    let response;
+    try {
+      response = await submit({ ...(scope.challenge === undefined ? {} : { challenge: scope.challenge }), flag });
+    } catch {
+      // An interrupted request may already have reached the platform.
+    }
+    const verdict = classifyVerdict(response);
+    const outcome = { ...pending, verdict, ready: verdict === 'accepted', platform_status: response?.status ?? null };
+    let recorded = false;
+    try {
+      const fin = await files.finalizeSubmissionAttempt(id, outcome);
+      recorded = Boolean(fin?.updated ?? true);
+    } catch {
+      // Preserve pending receipt in SQLite if finalization fails.
+    }
+    await files.projectJsonl?.().catch(() => {});
+    return {
+      status: verdict === 'unknown' ? 'unconfirmed' : 'submitted',
+      verdict,
+      ready: verdict === 'accepted',
+      platform_status: outcome.platform_status,
+      checks: check.checks,
+      receipts: claim.receipts_count,
+      flag_sha256: sha256,
+      receipt_id: id,
+      receipt_recorded: recorded,
+      corrupted_receipts: corruptedLines,
+    };
+  }
+
+  // Legacy CAS file fallback path.
   await files.write(document, [...receipts, pending]);
   let response;
   try {

@@ -1,3 +1,4 @@
+import { ToolError } from './tool-errors.js';
 export const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 export const MAX_ARCHIVE_MEMBER_BYTES = 1024 * 1024;
 export const MAX_MEMBER_NAME = 1024;
@@ -7,7 +8,7 @@ export function label(value, maximum = 96) {
 }
 
 export function checkRange(end, start, size, field) {
-  if (start < 0 || size < 0 || size > end - start) throw new Error('附件结构无效：' + field + ' 超出文件范围。');
+  if (start < 0 || size < 0 || size > end - start) throw new ToolError('size', '附件结构无效：' + field + ' 超出文件范围。');
 }
 
 export function page(table, total, rows, offset) {

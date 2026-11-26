@@ -3,8 +3,9 @@ import { readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { MAX_ATTACHMENT_BYTES } from './attachment-layout.js';
 import { WorkbenchDependencyError } from './workbench-config.js';
+import { ToolError } from './tool-errors.js';
 
-const SCRIPT = readFileSync(new URL('./compressed-stream-worker.py', import.meta.url), 'utf8');
+const SCRIPT = readFileSync(new URL('./core/workers/compressed-stream-worker.py', import.meta.url), 'utf8');
 const TIMEOUT_MS = 15000;
 const BZIP2_SIGNATURE = Buffer.from('425a68', 'hex');
 const XZ_SIGNATURE = Buffer.from('fd377a585a00', 'hex');
@@ -46,7 +47,7 @@ export async function decompressCompressedStream(bytes, format, signal, workbenc
         reject(error);
       } else resolve(result);
     };
-    const abort = () => finish(signal?.reason ?? new Error('压缩附件读取已取消。'));
+    const abort = () => finish(signal?.reason ?? new ToolError('abort', '压缩附件读取已取消。'));
     const timer = setTimeout(() => {
       python.kill();
       finish(undefined, { status: 'timeout', reason: '压缩附件解压超过 15 秒。' });

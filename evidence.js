@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { ToolError } from './tool-errors.js';
 
 export const MAX_EVIDENCE_SOURCES = 8;
 export const MAX_EVIDENCE_TEXT = 256;
@@ -71,7 +72,7 @@ export function* locatedTextRows(text, limit, subject) {
     const content = chunk.replace(/(?:\r\n|\r|\n)$/u, '');
     const location = { line: ++line, byte_offset: offset, byte_length: Buffer.byteLength(content, 'utf8') };
     offset += Buffer.byteLength(chunk, 'utf8');
-    if (line > limit) throw new Error(`${subject}最多检查 ${limit} 行。`);
+    if (line > limit) throw new ToolError('unsupported', `${subject}最多检查 ${limit} 行。`);
     if (content.trim() !== '') yield { content: line === 1 ? content.replace(/^\uFEFF/u, '') : content, location };
   }
 }

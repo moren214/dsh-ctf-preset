@@ -1,8 +1,8 @@
 {
   "name": "@local/dsh-ctf-preset",
-  "version": "0.51.5",
+  "version": "1.0.0",
   "private": true,
-  "description": "All-purpose CTF preset with shell, web, subagents and resumable progress for DeepSeek Harness",
+  "description": "Reusable CTF Core Runtime with Dual Presets (Copilot & Autonomous) and Headless Runner for DeepSeek Harness",
   "type": "module",
   "engines": {
     "dsh": ">=0.2.2-rc.5 <0.3.0"
@@ -10,10 +10,18 @@
   "scripts": {
     "check": "node scripts/check-modules.mjs",
     "test": "node --test test/*.test.js",
-    "test:coverage": "node scripts/check-coverage.mjs"
+    "test:coverage": "node scripts/check-coverage.mjs",
+    "test:python": "python -m unittest discover -s tests/python -v"
   },
   "exports": {
     ".": "./ctf-tools.js",
+    "./core": "./core/index.js",
+    "./copilot": "./presets/copilot/index.js",
+    "./autonomous": "./presets/autonomous/index.js",
+    "./runner": "./runner/cli.js",
+    "./routing": "./core/routing/ctf-router.js",
+    "./sandbox": "./core/sandbox/sandbox-runner.js",
+    "./state": "./core/state/state-store.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
@@ -25,6 +33,11 @@
     "locale/*.json",
     "icon.svg",
     "ctf-tools.js",
+    "core/",
+    "dsh-adapter/",
+    "skills/",
+    "presets/",
+    "runner/",
     "elf.js",
     "pwn-pattern.js",
     "pwn-payload.js",
@@ -93,7 +106,11 @@
     "ctf-arena.js",
     "ctf-router.js",
     "docker/Dockerfile",
-    "docker/Dockerfile.heavy"
+    "docker/Dockerfile.heavy",
+    "docker/Dockerfile.agent",
+    "docker/requirements-base.txt",
+    "docker/requirements-heavy.txt",
+    "docker/Gemfile.lock"
   ],
   "dsh": {
     "bundle": {

@@ -11,7 +11,7 @@ const SCHEMA_VERSION = 1;
 const MAX_FACTS = 5000;
 const MAX_INTENTS = 5000;
 const ATTEMPTS = 24;
-const mutationQueues = new Map();
+const QUEUE_SYMBOL = Symbol('ctfGraphMutationQueue');
 const DEFAULT_PRIORITY = 3;
 const DEFAULT_BUDGET_MINUTES = 15;
 const FACT_KINDS = ['recon', 'vuln', 'credential', 'crypto', 'binary', 'flag', 'note'];
@@ -19,8 +19,8 @@ const FACT_KINDS = ['recon', 'vuln', 'credential', 'crypto', 'binary', 'flag', '
 export const GRAPH_PROPERTIES = {
   action: {
     type: 'string',
-    enum: ['board', 'expand', 'add_fact', 'add_intent', 'claim_intent', 'finish_intent', 'dispatch_plan', 'export_writeup'],
-    description: 'board 查索引（支持分页与 summary_only）；expand 展开；add_fact/add_intent 写入；claim_intent 互斥认领；finish_intent 结案；dispatch_plan 生成并行计划；export_writeup 导出题解草稿。',
+    enum: ['board', 'expand', 'add_fact', 'add_intent', 'claim_intent', 'finish_intent', 'dispatch_plan', 'export_writeup', 'start_race', 'cancel_race_siblings'],
+    description: 'board 查索引（支持分页与 summary_only）；expand 展开；add_fact/add_intent 写入；claim_intent 互斥认领；finish_intent 结案；dispatch_plan 生成并行计划；export_writeup 导出题解草稿；start_race/cancel_race_siblings 管理 Best-of-N 赛马分支。',
   },
   challenge: { type: 'string', maxLength: 120 },
   status_filter: { type: 'string', enum: ['all', 'active', 'open', 'claimed', 'done', 'dead', 'overdue'], description: 'board 按状态筛选 Intent（active=open+claimed）。' },
@@ -48,6 +48,26 @@ export const GRAPH_PROPERTIES = {
   allow_same_challenge: { type: 'boolean', default: false },
   status: { type: 'string', enum: ['done', 'dead'] },
   outcome: { type: 'string', maxLength: 2000 },
+  race_id: { type: 'string', maxLength: 64 },
+  branch_id: { type: 'string', maxLength: 64 },
+  winner_intent_id: { type: 'string', maxLength: 32 },
+  branches: {
+    type: 'array',
+    maxItems: 10,
+    items: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['title'],
+      properties: {
+        branch_id: { type: 'string', maxLength: 64 },
+        title: { type: 'string', maxLength: 200 },
+        hypothesis: { type: 'string', maxLength: 1000 },
+        priority: { type: 'integer', minimum: 1, maximum: 5 },
+        budget_minutes: { type: 'integer', minimum: 1, maximum: 240 },
+        parent_fact_ids: { type: 'array', maxItems: 16, items: { type: 'string', maxLength: 32 } },
+      },
+    },
+  },
   facts: {
     type: 'array', maxItems: 10,
     items: {
@@ -205,12 +225,16 @@ function buildIntent(graph, input, challenge, defaultParents, nowIso) {
     ? cleanIdList(input.parent_fact_ids, 'parent_fact_ids', 16)
     : defaultParents;
   const hypothesis = cleanText(input.hypothesis, 'hypothesis', 1000);
+  const raceId = cleanText(input.race_id, 'race_id', 64, { singleLine: true });
+  const branchId = cleanText(input.branch_id, 'branch_id', 64, { singleLine: true });
   const intent = {
     id: nextId(graph.intents, 'I'),
     challenge,
     title,
     parent_fact_ids: parents,
     ...(hypothesis ? { hypothesis } : {}),
+    ...(raceId ? { race_id: raceId } : {}),
+    ...(branchId ? { branch_id: branchId } : {}),
     priority: cleanPriority(input.priority),
     budget_minutes: cleanBudget(input.budget_minutes),
     status: 'open',
@@ -338,20 +362,25 @@ async function preserveSidecar(files, filePath, body, latestPrimaryBody) {
   }
 }
 
-async function withMutationQueue(lockKey, task) {
-  if (!lockKey) return task();
-  const previous = mutationQueues.get(lockKey) ?? Promise.resolve();
+async function withMutationQueue(files, lockKey, task) {
+  if (!lockKey || !files || (typeof files !== 'object' && typeof files !== 'function')) return task();
+  let queues = files[QUEUE_SYMBOL];
+  if (!queues) {
+    queues = new Map();
+    files[QUEUE_SYMBOL] = queues;
+  }
+  const previous = queues.get(lockKey) ?? Promise.resolve();
   let release;
   const current = new Promise(resolve => { release = resolve; });
   const tail = previous.then(() => current, () => current);
-  mutationQueues.set(lockKey, tail);
+  queues.set(lockKey, tail);
   await previous.catch(() => {});
   try {
     return await task();
   } finally {
     release();
-    if (mutationQueues.get(lockKey) === tail) {
-      mutationQueues.delete(lockKey);
+    if (queues.get(lockKey) === tail) {
+      queues.delete(lockKey);
     }
   }
 }
@@ -366,7 +395,7 @@ async function commitMutation(files, nowMs, mutate) {
   } catch {
     // Fall back to unqueued CAS loop if probe fails.
   }
-  return withMutationQueue(lockKey, async () => {
+  return withMutationQueue(files, lockKey, async () => {
     const nowIso = new Date(nowMs).toISOString();
     for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
       const { document, graph, recovered } = await readGraph(files);
@@ -659,10 +688,9 @@ function buildDispatchPlan(graph, { challengeFilter, maxWorkers, allowSameChalle
   };
 }
 
-export async function manageGraph(args, files, { now = () => Date.now(), defaultOwner } = {}) {
-  const action = args.action;
-  const nowMs = now();
+const READ_ACTIONS = new Set(['board', 'export_writeup', 'dispatch_plan', 'expand']);
 
+function prepareReadGraphAction(action, args, nowMs) {
   if (action === 'board') {
     const challenge = cleanText(args.challenge, 'challenge', 120, { singleLine: true });
     const statusFilter = args.status_filter ?? 'all';
@@ -678,24 +706,27 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
       throw new ToolError('unsupported', 'offset 须为 0 至 5000 的整数。');
     }
     const summaryOnly = args.summary_only === true;
-    const { graph, recovered } = await readGraph(files);
-    return { ...summarizeBoard(graph, challenge, nowMs, { statusFilter, limit, offset, summaryOnly }), recovered };
+    return (graph, recovered) => ({
+      ...summarizeBoard(graph, challenge, nowMs, { statusFilter, limit, offset, summaryOnly }),
+      recovered,
+    });
   }
 
   if (action === 'export_writeup') {
     const challenge = cleanText(args.challenge, 'challenge', 120, { singleLine: true });
-    const { graph, recovered } = await readGraph(files);
-    const rendered = renderWriteupMarkdown(graph, challenge);
-    return {
-      action: 'export_writeup',
-      status: 'ok',
-      revision: graph.revision,
-      recovered,
-      ...(challenge ? { challenge } : {}),
-      challenge_count: rendered.challengeCount,
-      fact_count: rendered.factCount,
-      intent_count: rendered.intentCount,
-      markdown: rendered.markdown,
+    return (graph, recovered) => {
+      const rendered = renderWriteupMarkdown(graph, challenge);
+      return {
+        action: 'export_writeup',
+        status: 'ok',
+        revision: graph.revision,
+        recovered,
+        ...(challenge ? { challenge } : {}),
+        challenge_count: rendered.challengeCount,
+        fact_count: rendered.factCount,
+        intent_count: rendered.intentCount,
+        markdown: rendered.markdown,
+      };
     };
   }
 
@@ -706,8 +737,10 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
       throw new ToolError('unsupported', 'max_workers 须为 1 至 8 的整数。');
     }
     const allowSameChallenge = args.allow_same_challenge === true;
-    const { graph, recovered } = await readGraph(files);
-    return { ...buildDispatchPlan(graph, { challengeFilter, maxWorkers, allowSameChallenge, nowMs }), recovered };
+    return (graph, recovered) => ({
+      ...buildDispatchPlan(graph, { challengeFilter, maxWorkers, allowSameChallenge, nowMs }),
+      recovered,
+    });
   }
 
   if (action === 'expand') {
@@ -716,49 +749,48 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
     if (factIds.length === 0 && intentIds.length === 0) {
       throw new ToolError('unsupported', 'expand 至少需要提供 fact_ids 或 intent_ids 之一。');
     }
-    const { graph, recovered } = await readGraph(files);
-    const factMap = new Map(graph.facts.map(f => [f.id, f]));
-    const intentMap = new Map(graph.intents.map(i => [i.id, i]));
-    const facts = [];
-    const missingFacts = [];
-    for (const id of factIds) {
-      const hit = factMap.get(id);
-      if (hit) facts.push(hit);
-      else missingFacts.push(id);
-    }
-    const intents = [];
-    const missingIntents = [];
-    for (const id of intentIds) {
-      const hit = intentMap.get(id);
-      if (hit) {
-        const { claim_lease: _hiddenLease, ...publicIntent } = hit;
-        intents.push({ ...publicIntent, overdue: isIntentOverdue(hit, nowMs) });
-      } else missingIntents.push(id);
-    }
-    return {
-      action: 'expand',
-      status: 'ok',
-      revision: graph.revision,
-      recovered,
-      facts,
-      intents,
-      ...(missingFacts.length > 0 ? { missing_fact_ids: missingFacts } : {}),
-      ...(missingIntents.length > 0 ? { missing_intent_ids: missingIntents } : {}),
+    return (graph, recovered) => {
+      const factMap = new Map(graph.facts.map(f => [f.id, f]));
+      const intentMap = new Map(graph.intents.map(i => [i.id, i]));
+      const facts = [];
+      const missingFacts = [];
+      for (const id of factIds) {
+        const hit = factMap.get(id);
+        if (hit) facts.push(hit);
+        else missingFacts.push(id);
+      }
+      const intents = [];
+      const missingIntents = [];
+      for (const id of intentIds) {
+        const hit = intentMap.get(id);
+        if (hit) {
+          const { claim_lease: _hiddenLease, ...publicIntent } = hit;
+          intents.push({ ...publicIntent, overdue: isIntentOverdue(hit, nowMs) });
+        } else missingIntents.push(id);
+      }
+      return {
+        action: 'expand',
+        status: 'ok',
+        revision: graph.revision,
+        recovered,
+        facts,
+        intents,
+        ...(missingFacts.length > 0 ? { missing_fact_ids: missingFacts } : {}),
+        ...(missingIntents.length > 0 ? { missing_intent_ids: missingIntents } : {}),
+      };
     };
   }
 
-  if (!files.canWrite) {
-    throw new ToolError('permission', `当前会话为只读权限，无法执行 ${action}。`);
-  }
+  return undefined;
+}
 
-  const actor = cleanText(args.owner, 'owner', 120, { singleLine: true }) ?? defaultOwner ?? 'agent';
-
+function prepareWriteGraphAction(action, args, { actor }) {
   if (action === 'add_fact') {
     const challenge = cleanText(args.challenge, 'challenge', 120, { required: true, singleLine: true });
     if (args.spawn_intents !== undefined && (!Array.isArray(args.spawn_intents) || args.spawn_intents.length > 10)) {
       throw new ToolError('unsupported', 'spawn_intents 须为不超过 10 项的数组。');
     }
-    return commitMutation(files, nowMs, (graph, nowIso) => {
+    return (graph, nowIso) => {
       const { fact, deduplicated } = buildFact(graph, args, challenge, actor, nowIso);
       if (deduplicated) {
         return {
@@ -777,22 +809,17 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
       }
       return {
         skipWrite: false,
-        response: {
-          action: 'add_fact',
-          status: 'ok',
-          fact,
-          spawned_intents: spawned,
-        },
+        response: { action: 'add_fact', status: 'ok', fact, spawned_intents: spawned },
       };
-    });
+    };
   }
 
   if (action === 'add_intent') {
     const challenge = cleanText(args.challenge, 'challenge', 120, { required: true, singleLine: true });
-    return commitMutation(files, nowMs, (graph, nowIso) => {
+    return (graph, nowIso) => {
       const intent = buildIntent(graph, args, challenge, [], nowIso);
       return { skipWrite: false, response: { action: 'add_intent', status: 'ok', intent } };
-    });
+    };
   }
 
   if (action === 'claim_intent') {
@@ -804,7 +831,7 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
     const challengeFilter = cleanText(args.challenge, 'challenge', 120, { singleLine: true });
     const stealOverdue = args.steal_overdue === true;
 
-    return commitMutation(files, nowMs, (graph, nowIso, ts) => {
+    return (graph, nowIso, ts) => {
       let target;
       if (intentId) {
         target = graph.intents.find(i => i.id === intentId);
@@ -869,7 +896,7 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
           intent: target,
         },
       };
-    });
+    };
   }
 
   if (action === 'finish_intent') {
@@ -886,7 +913,7 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
       throw new ToolError('unsupported', 'spawn_intents 须为不超过 10 项的数组。');
     }
 
-    return commitMutation(files, nowMs, (graph, nowIso) => {
+    return (graph, nowIso) => {
       const target = graph.intents.find(i => i.id === intentId);
       if (!target) throw new ToolError('missing', `未找到 Intent ${intentId}。`);
       if (target.status === 'done' || target.status === 'dead') {
@@ -985,8 +1012,131 @@ export async function manageGraph(args, files, { now = () => Date.now(), default
           spawned_intents: spawned,
         },
       };
+    };
+  }
+
+  if (action === 'start_race') {
+    const challenge = cleanText(args.challenge, 'challenge', 120, { required: true, singleLine: true });
+    const raceId = cleanText(args.race_id, 'race_id', 64, { singleLine: true }) ?? `race-${randomUUID().slice(0, 8)}`;
+    if (!Array.isArray(args.branches) || args.branches.length < 2 || args.branches.length > 10) {
+      throw new ToolError('unsupported', 'start_race 的 branches 须为 2 至 10 项的数组。');
+    }
+    const parentIds = cleanIdList(args.parent_fact_ids, 'parent_fact_ids', 16);
+    const branchSpecs = args.branches.map((spec, index) => {
+      if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+        throw new ToolError('unsupported', 'branches 每项须为对象。');
+      }
+      return {
+        ...spec,
+        race_id: raceId,
+        branch_id: cleanText(spec.branch_id, 'branch_id', 64, { singleLine: true }) ?? `branch-${index + 1}`,
+      };
     });
+    return (graph, nowIso) => {
+      const intents = branchSpecs.map(spec => buildIntent(graph, spec, challenge, parentIds, nowIso));
+      return {
+        skipWrite: false,
+        response: { action: 'start_race', status: 'ok', challenge, race_id: raceId, intents },
+      };
+    };
+  }
+
+  if (action === 'cancel_race_siblings') {
+    const raceId = cleanText(args.race_id, 'race_id', 64, { required: true, singleLine: true });
+    const winnerIntentId = cleanText(args.winner_intent_id, 'winner_intent_id', 32, { singleLine: true });
+    const reason = cleanText(args.outcome, 'outcome', 2000)
+      ?? (winnerIntentId ? `Superseded by winning race branch ${winnerIntentId}.` : 'Race cancelled.');
+    return (graph, nowIso) => {
+      const matching = graph.intents.filter(i => i.race_id === raceId);
+      if (matching.length === 0) throw new ToolError('missing', `未找到赛马分支 race_id=${raceId}。`);
+      const cancelledIds = [];
+      for (const intent of matching) {
+        if (winnerIntentId && intent.id === winnerIntentId) continue;
+        if (intent.status === 'done' || intent.status === 'dead') continue;
+        intent.status = 'dead';
+        intent.outcome = reason;
+        intent.finished_at = nowIso;
+        intent.claim_lease = null;
+        if (winnerIntentId) intent.superseded_by = winnerIntentId;
+        cancelledIds.push(intent.id);
+      }
+      return {
+        skipWrite: cancelledIds.length === 0,
+        response: {
+          action: 'cancel_race_siblings',
+          status: 'ok',
+          race_id: raceId,
+          ...(winnerIntentId ? { winner_intent_id: winnerIntentId } : {}),
+          cancelled_ids: cancelledIds,
+        },
+      };
+    };
   }
 
   throw new ToolError('unsupported', `未知 action：${action}。`);
+}
+
+export async function manageGraph(args, files, { now = () => Date.now(), defaultOwner } = {}) {
+  const action = args.action;
+  const nowMs = now();
+
+  const readHandler = prepareReadGraphAction(action, args, nowMs);
+  if (readHandler) {
+    const { graph, recovered } = await readGraph(files);
+    return readHandler(graph, recovered);
+  }
+
+  if (!files.canWrite) {
+    throw new ToolError('permission', `当前会话为只读权限，无法执行 ${action}。`);
+  }
+
+  const actor = cleanText(args.owner, 'owner', 120, { singleLine: true }) ?? defaultOwner ?? 'agent';
+  const writeHandler = prepareWriteGraphAction(action, args, { actor });
+  return commitMutation(files, nowMs, writeHandler);
+}
+
+export async function manageGraphInStore(args, store, {
+  legacyGraphReader,
+  writeBoard,
+  now = () => Date.now(),
+  defaultOwner,
+} = {}) {
+  const action = args.action;
+  const nowMs = now();
+  const nowIso = new Date(nowMs).toISOString();
+
+  let snapshot = store.readGraphSnapshot();
+  if (snapshot.facts.length === 0 && snapshot.intents.length === 0 && snapshot.revision === 0 && typeof legacyGraphReader === 'function') {
+    const legacy = await legacyGraphReader().catch(() => undefined);
+    if (legacy && (legacy.facts?.length || legacy.intents?.length)) {
+      if (!store.readOnly) {
+        store.importLegacyGraph(legacy);
+        snapshot = store.readGraphSnapshot();
+      } else {
+        snapshot = legacy;
+      }
+    }
+  }
+
+  if (READ_ACTIONS.has(action)) {
+    const readHandler = prepareReadGraphAction(action, args, nowMs);
+    return readHandler(snapshot, false);
+  }
+
+  if (store.readOnly) {
+    throw new ToolError('permission', `当前会话为只读权限，无法执行 ${action}。`);
+  }
+
+  const actor = cleanText(args.owner, 'owner', 120, { singleLine: true }) ?? defaultOwner ?? 'agent';
+  const writeHandler = prepareWriteGraphAction(action, args, { actor });
+  const outcome = store.mutateGraph((graph, iso) => writeHandler(graph, iso, nowMs), nowIso);
+  const { graph, skipWrite, ...publicOutcome } = outcome;
+  if (!skipWrite && typeof writeBoard === 'function') {
+    try {
+      await writeBoard(renderBoardMarkdown(graph, nowMs));
+    } catch {
+      // BOARD.md projection failure does not invalidate committed SQLite state.
+    }
+  }
+  return publicOutcome;
 }

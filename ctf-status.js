@@ -9,7 +9,7 @@ const ATTEMPTS = 12;
 function entriesIn(document, normalizeEntry) {
   if (document.version === undefined) return [];
   try {
-    if (document.invalidText) throw new Error('Invalid text');
+    if (document.invalidText) throw new ToolError('encoding', 'Invalid text');
     const { entries } = JSON.parse(document.text);
     if (Array.isArray(entries) && entries.length <= MAX_ENTRIES
       && entries.every(entry => entry && typeof entry === 'object' && Number.isFinite(Date.parse(entry.at)))) {

@@ -1,6 +1,10 @@
+import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { lookup } from 'node:dns/promises';
 import { BlockList, isIP } from 'node:net';
+import path from 'node:path';
 import { ToolError } from './tool-errors.js';
+import { createStateStore } from './core/state/state-store.js';
 
 const nonglobal = new BlockList();
 for (const [prefix, length] of [
@@ -49,7 +53,7 @@ function allowsLoopbackDynamic(config) {
 export function webUrl(value) {
   const url = new URL(value);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.href.length > 8192) {
-    throw new Error('网络目标必须是不含登录信息的 HTTP(S) 地址。');
+    throw new ToolError('unsupported', '网络目标必须是不含登录信息的 HTTP(S) 地址。');
   }
   return url;
 }
@@ -82,13 +86,13 @@ export async function pinAddress(host, { publicOnly = false, signal, resolve = l
   signal?.throwIfAborted();
   const hostname = hostName(host);
   const family = isIP(hostname);
-  if (!hostname || hostname.includes('%')) throw new Error('网络目标主机无效。');
+  if (!hostname || hostname.includes('%')) throw new ToolError('unsupported', '网络目标主机无效。');
   const addresses = family ? [{ address: hostname, family }]
     : await abortable(resolve(hostname, { all: true, verbatim: true }), signal);
   if (addresses.length === 0 || addresses.some(({ address, family }) => isIP(address) !== family
     || infrastructure.check(address, familyName(family)) || (family === 6 && mapped.check(address, 'ipv6'))
     || (publicOnly && !publicAddress(address)))) {
-    throw new Error('网络目标的解析结果超出授权地址范围。');
+    throw new ToolError('permission', '网络目标的解析结果超出授权地址范围。');
   }
   signal?.throwIfAborted();
   return addresses[0];
@@ -187,14 +191,26 @@ function parseTcpRule(value) {
 const MAX_DYNAMIC_GRANTS = 64;
 const DYNAMIC_GRANT_TTL_MS = 30 * 60 * 1000;
 
-export function createNetworkBoundary(configSource = {}) {
+export function createNetworkBoundary(configSource = {}, { stateStoreForWorkspace } = {}) {
   const getConfig = typeof configSource === 'function' ? configSource : () => configSource ?? {};
   const scopedGrants = new WeakMap();
+  const runtimeInstanceId = randomUUID();
   const list = value => Array.isArray(value) ? value.filter(item => typeof item === 'string') : [];
   let cachedOriginsKey = '';
   let cachedHttpRules = [];
   let cachedTcpKey = '';
   let cachedTcpRules = [];
+
+  function sharedStore(scope, readOnly = false) {
+    if (typeof scope?.workspaceKey !== 'string' || scope.workspaceKey.length === 0) return undefined;
+    if (typeof stateStoreForWorkspace === 'function') {
+      return stateStoreForWorkspace(scope.workspaceKey, readOnly);
+    }
+    if (path.isAbsolute(scope.workspaceKey) && existsSync(scope.workspaceKey)) {
+      return createStateStore(scope.workspaceKey, { readOnly });
+    }
+    return undefined;
+  }
 
   function httpRules() {
     const items = list(getConfig()?.networkOrigins);
@@ -235,12 +251,12 @@ export function createNetworkBoundary(configSource = {}) {
 
   function hasDynamicGrant(kind, key, scope) {
     const grant = grantStore(scope)?.[kind]?.get(key);
-    if (!grant) return false;
-    if (grant.expiresAt <= Date.now()) {
+    if (grant) {
+      if (grant.expiresAt > Date.now()) return true;
       grantStore(scope)[kind].delete(key);
-      return false;
     }
-    return true;
+    const store = sharedStore(scope, true);
+    return store ? store.hasNetworkGrant(scope.workspaceKey, kind, key, { excludeGrantedBy: runtimeInstanceId }) : false;
   }
 
   function pruneExpired(grants) {
@@ -278,7 +294,11 @@ export function createNetworkBoundary(configSource = {}) {
     }
     pruneExpired(store.http);
     if (!store.http.has(url.origin) && store.http.size >= MAX_DYNAMIC_GRANTS) return undefined;
-    store.http.set(url.origin, { leaseId: scope.leaseId, expiresAt: Date.now() + DYNAMIC_GRANT_TTL_MS });
+    const expiresAt = Date.now() + DYNAMIC_GRANT_TTL_MS;
+    store.http.set(url.origin, { leaseId: scope.leaseId, expiresAt });
+    sharedStore(scope, false)?.grantNetworkTarget(scope.workspaceKey, 'http', url.origin, {
+      leaseId: scope.leaseId, grantedBy: runtimeInstanceId, expiresAt,
+    });
     return url.origin;
   }
 
@@ -300,29 +320,48 @@ export function createNetworkBoundary(configSource = {}) {
     const key = normalized + '/' + numericPort;
     pruneExpired(store.tcp);
     if (!store.tcp.has(key) && store.tcp.size >= MAX_DYNAMIC_GRANTS) return undefined;
-    store.tcp.set(key, { leaseId: scope.leaseId, expiresAt: Date.now() + DYNAMIC_GRANT_TTL_MS });
+    const expiresAt = Date.now() + DYNAMIC_GRANT_TTL_MS;
+    store.tcp.set(key, { leaseId: scope.leaseId, expiresAt });
+    sharedStore(scope, false)?.grantNetworkTarget(scope.workspaceKey, 'tcp', key, {
+      leaseId: scope.leaseId, grantedBy: runtimeInstanceId, expiresAt,
+    });
     return (family === 6 ? '[' + normalized + ']' : normalized) + ':' + numericPort;
   }
 
   function revoke(scope, leaseId) {
     const workspaces = scope?.session && scopedGrants.get(scope.session);
     const store = workspaces?.get(scope?.workspaceKey);
-    if (!store) return 0;
     let removed = 0;
-    for (const kind of ['http', 'tcp']) {
-      for (const [key, grant] of store[kind]) {
-        if (leaseId === undefined || grant.leaseId === leaseId) {
-          store[kind].delete(key);
-          removed++;
+    if (store) {
+      for (const kind of ['http', 'tcp']) {
+        for (const [key, grant] of store[kind]) {
+          if (leaseId === undefined || grant.leaseId === leaseId) {
+            store[kind].delete(key);
+            removed++;
+          }
         }
       }
     }
+    removed += sharedStore(scope, false)?.revokeNetworkGrants(scope?.workspaceKey, leaseId) ?? 0;
     return removed;
+  }
+
+  function hasAnyAuthorization(scope) {
+    if (httpRules().length > 0 || tcpRules().length > 0) return true;
+    const store = grantStore(scope);
+    if (store) {
+      pruneExpired(store.http);
+      pruneExpired(store.tcp);
+      if (store.http.size > 0 || store.tcp.size > 0) return true;
+    }
+    const dbStore = sharedStore(scope, true);
+    return dbStore ? dbStore.listNetworkGrants(scope.workspaceKey, { excludeGrantedBy: runtimeInstanceId }).length > 0 : false;
   }
 
   return {
     isHttpAuthorized,
     isTcpAuthorized,
+    hasAnyAuthorization,
     grantHttp,
     grantTcp,
     revoke,

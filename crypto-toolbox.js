@@ -44,7 +44,7 @@ function parseJsonObject(buffer, label) {
   try {
     const parsed = JSON.parse(buffer.toString('utf8'));
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('not object');
+      throw new ToolError('unsupported', 'not object');
     }
     return parsed;
   } catch {

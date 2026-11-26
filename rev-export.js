@@ -1,5 +1,6 @@
 import { parseEvidenceJson } from './evidence.js';
 import { hexAddress, MAX_REV_ADDRESS, revAddress, revText } from './rev-evidence.js';
+import { ToolError } from './tool-errors.js';
 
 const FORMATS = ['jsonl', 'listing'];
 const QUERIES = ['function', 'address', 'string'];
@@ -82,9 +83,9 @@ function relation(rows, definitions) {
 
 export function queryRevExport(bytes, file_path, format, query) {
   if (!FORMATS.includes(format) || !query || !QUERIES.includes(query.kind) || !shortText(query.value, query.kind === 'string')
-    || Object.keys(query).some(key => key !== 'kind' && key !== 'value')) throw new Error('请指定导出格式和有效的已知查询值。');
+    || Object.keys(query).some(key => key !== 'kind' && key !== 'value')) throw new ToolError('unsupported', '请指定导出格式和有效的已知查询值。');
   const address = query.kind === 'address' ? revAddress(query.value) : undefined;
-  if (query.kind === 'address' && address === undefined) throw new Error('地址须为带 0x 的十六进制字符串。');
+  if (query.kind === 'address' && address === undefined) throw new ToolError('unsupported', '地址须为带 0x 的十六进制字符串。');
   const { source, rows } = revText(bytes, file_path);
   if (format === 'listing' && query.kind === 'string') return { status: 'unavailable', reason: '该查询需带字符串记录的 JSONL 导出。', sources: [source] };
 

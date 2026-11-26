@@ -1,4 +1,5 @@
 import net from 'node:net';
+import { ToolError } from './tool-errors.js';
 
 const DEFAULT_MAX_SESSIONS = 8;
 const DEFAULT_IDLE_MS = 10 * 60 * 1000;
@@ -46,31 +47,31 @@ export const NET_SESSION_PROPERTIES = {
 
 function parseOptions(options) {
   if (options === null || typeof options !== 'object' || Array.isArray(options)) {
-    throw new Error('options 必须是对象。');
+    throw new ToolError('unsupported', 'options 必须是对象。');
   }
   for (const key of Object.keys(options)) {
-    if (key !== 'maxSessions' && key !== 'idleMs') throw new Error(`options 不支持 ${key}。`);
+    if (key !== 'maxSessions' && key !== 'idleMs') throw new ToolError('unsupported', `options 不支持 ${key}。`);
   }
   const maxSessions = options.maxSessions === undefined ? DEFAULT_MAX_SESSIONS : options.maxSessions;
-  if (!Number.isSafeInteger(maxSessions) || maxSessions < 1) throw new Error('maxSessions 必须是正整数。');
+  if (!Number.isSafeInteger(maxSessions) || maxSessions < 1) throw new ToolError('unsupported', 'maxSessions 必须是正整数。');
   const idleMs = options.idleMs === undefined ? DEFAULT_IDLE_MS : options.idleMs;
-  if (!Number.isSafeInteger(idleMs) || idleMs < 1) throw new Error('idleMs 必须是正整数。');
+  if (!Number.isSafeInteger(idleMs) || idleMs < 1) throw new ToolError('unsupported', 'idleMs 必须是正整数。');
   return { maxSessions, idleMs };
 }
 
 function parseHost(value) {
-  if (value === undefined) throw new Error('缺少必填参数 host。');
+  if (value === undefined) throw new ToolError('unsupported', '缺少必填参数 host。');
   if (typeof value !== 'string' || value.length < 1 || value.length > MAX_HOST_LENGTH
     || /[\s\u0000-\u001f\u007f]/u.test(value)) {
-    throw new Error('host 必须是不含空白字符的主机名或 IP 地址。');
+    throw new ToolError('network', 'host 必须是不含空白字符的主机名或 IP 地址。');
   }
   return value;
 }
 
 function parsePort(value) {
-  if (value === undefined) throw new Error('缺少必填参数 port。');
+  if (value === undefined) throw new ToolError('unsupported', '缺少必填参数 port。');
   if (!Number.isInteger(value) || value < 1 || value > 65535) {
-    throw new Error('port 必须是 1 至 65535 的整数。');
+    throw new ToolError('unsupported', 'port 必须是 1 至 65535 的整数。');
   }
   return value;
 }
@@ -78,7 +79,7 @@ function parsePort(value) {
 function parseTimeout(value, fallback) {
   if (value === undefined) return fallback;
   if (!Number.isInteger(value) || value < 1 || value > MAX_TIMEOUT_MS) {
-    throw new Error(`timeout_ms 必须是 1 至 ${MAX_TIMEOUT_MS} 的整数。`);
+    throw new ToolError('timeout', `timeout_ms 必须是 1 至 ${MAX_TIMEOUT_MS} 的整数。`);
   }
   return value;
 }
@@ -86,31 +87,31 @@ function parseTimeout(value, fallback) {
 function parseMaxBytes(value) {
   if (value === undefined) return DEFAULT_MAX_BYTES;
   if (!Number.isInteger(value) || value < 1 || value > MAX_RECV_BYTES) {
-    throw new Error(`max_bytes 必须是 1 至 ${MAX_RECV_BYTES} 的整数。`);
+    throw new ToolError('unsupported', `max_bytes 必须是 1 至 ${MAX_RECV_BYTES} 的整数。`);
   }
   return value;
 }
 
 function parseSessionId(input) {
   const value = input.session_id;
-  if (value === undefined) throw new Error('缺少必填参数 session_id。');
+  if (value === undefined) throw new ToolError('unsupported', '缺少必填参数 session_id。');
   if (typeof value !== 'string' || value.length < 1 || value.length > MAX_SESSION_ID_LENGTH) {
-    throw new Error('session_id 必须是字符串。');
+    throw new ToolError('unsupported', 'session_id 必须是字符串。');
   }
   return value;
 }
 
 function parseData(input) {
   const value = input.data;
-  if (value === undefined) throw new Error('缺少必填参数 data。');
-  if (typeof value !== 'string' || value.length < 1) throw new Error('data 必须是非空字符串。');
-  if (value.length > MAX_DATA_CHARS) throw new Error('data 超过允许的最大长度。');
+  if (value === undefined) throw new ToolError('unsupported', '缺少必填参数 data。');
+  if (typeof value !== 'string' || value.length < 1) throw new ToolError('unsupported', 'data 必须是非空字符串。');
+  if (value.length > MAX_DATA_CHARS) throw new ToolError('size', 'data 超过允许的最大长度。');
   return value;
 }
 
 function parseEncoding(value, allowed, fallback, label) {
   if (value === undefined) return fallback;
-  if (!allowed.includes(value)) throw new Error(`${label} 必须是 ${allowed.join('、')} 之一。`);
+  if (!allowed.includes(value)) throw new ToolError('unsupported', `${label} 必须是 ${allowed.join('、')} 之一。`);
   return value;
 }
 
@@ -118,21 +119,21 @@ function decodeData(data, encoding) {
   if (encoding === 'utf8') return Buffer.from(data, 'utf8');
   if (encoding === 'hex') {
     if (data.length % 2 !== 0 || !/^[0-9a-fA-F]+$/u.test(data)) {
-      throw new Error('hex 编码的 data 必须是偶数个十六进制字符。');
+      throw new ToolError('encoding', 'hex 编码的 data 必须是偶数个十六进制字符。');
     }
     return Buffer.from(data, 'hex');
   }
   if (!/^[A-Za-z0-9+/]*={0,2}$/u.test(data) || data.length % 4 === 1) {
-    throw new Error('base64 编码的 data 格式无效。');
+    throw new ToolError('encoding', 'base64 编码的 data 格式无效。');
   }
   return Buffer.from(data, 'base64');
 }
 
 function parseDelimiter(input) {
   const value = input.delimiter;
-  if (value === undefined) throw new Error('缺少必填参数 delimiter。');
+  if (value === undefined) throw new ToolError('unsupported', '缺少必填参数 delimiter。');
   if (typeof value !== 'string' || value.length < 1 || value.length > MAX_DELIMITER_CHARS) {
-    throw new Error('delimiter 必须是非空字符串。');
+    throw new ToolError('unsupported', 'delimiter 必须是非空字符串。');
   }
   const encoding = parseEncoding(input.delimiter_encoding, DELIMITER_ENCODINGS, 'utf8', 'delimiter_encoding');
   let bytes;
@@ -140,12 +141,12 @@ function parseDelimiter(input) {
     bytes = Buffer.from(value, 'utf8');
   } else {
     if (value.length % 2 !== 0 || !/^[0-9a-fA-F]+$/u.test(value)) {
-      throw new Error('hex 编码的 delimiter 必须是偶数个十六进制字符。');
+      throw new ToolError('encoding', 'hex 编码的 delimiter 必须是偶数个十六进制字符。');
     }
     bytes = Buffer.from(value, 'hex');
   }
-  if (bytes.length === 0) throw new Error('delimiter 不能为空。');
-  if (bytes.length > MAX_DELIMITER_BYTES) throw new Error(`delimiter 不能超过 ${MAX_DELIMITER_BYTES} 字节。`);
+  if (bytes.length === 0) throw new ToolError('unsupported', 'delimiter 不能为空。');
+  if (bytes.length > MAX_DELIMITER_BYTES) throw new ToolError('size', `delimiter 不能超过 ${MAX_DELIMITER_BYTES} 字节。`);
   return bytes;
 }
 
@@ -184,7 +185,7 @@ function describeBytes(sessionId, bytes, extra) {
 }
 
 function makeAbortError() {
-  const error = new Error('操作已取消');
+  const error = new ToolError('abort', '操作已取消');
   error.name = 'AbortError';
   return error;
 }
@@ -199,15 +200,15 @@ function throwIfAborted(signal) {
 
 function parseContext(context) {
   if (context === null || typeof context !== 'object' || Array.isArray(context)) {
-    throw new Error('context 必须是对象。');
+    throw new ToolError('unsupported', 'context 必须是对象。');
   }
   for (const key of Object.keys(context)) {
-    if (key !== 'signal') throw new Error(`context 不支持 ${key}。`);
+    if (key !== 'signal') throw new ToolError('unsupported', `context 不支持 ${key}。`);
   }
   const { signal } = context;
   if (signal !== undefined && (typeof signal !== 'object' || signal === null
     || typeof signal.addEventListener !== 'function' || typeof signal.aborted !== 'boolean')) {
-    throw new Error('context.signal 必须是 AbortSignal。');
+    throw new ToolError('unsupported', 'context.signal 必须是 AbortSignal。');
   }
   return signal;
 }
@@ -234,7 +235,7 @@ function abortWaiter(session, error) {
 }
 
 function waitForProgress(session, timeoutMs, signal) {
-  if (session.waiter !== undefined) throw new Error('会话已有等待中的读取操作，请勿并发读取。');
+  if (session.waiter !== undefined) throw new ToolError('conflict', '会话已有等待中的读取操作，请勿并发读取。');
   return new Promise((resolve, reject) => {
     const waiter = {
       reject,
@@ -274,8 +275,8 @@ function resumeAfterDrain(session) {
 
 function connectionLost(session) {
   const code = session.error?.code;
-  if (code === 'ECONNRESET') return new Error('连接被对端重置。');
-  return new Error(code ? `连接已断开（${code}）。` : '连接已断开。');
+  if (code === 'ECONNRESET') return new ToolError('network', '连接被对端重置。');
+  return new ToolError('network', code ? `连接已断开（${code}）。` : '连接已断开。');
 }
 
 function attachSession(session) {
@@ -325,14 +326,14 @@ function openSocket(session, timeoutMs, signal) {
       finish(resolve);
     }
     function onError(error) {
-      finish(reject, new Error(`连接 ${host}:${port} 失败：${error.message}`));
+      finish(reject, new ToolError('network', `连接 ${host}:${port} 失败：${error.message}`));
     }
     function onAbort() {
       finish(reject, makeAbortError());
       socket.destroy();
     }
     const timer = setTimeout(() => {
-      finish(reject, new Error('连接超时'));
+      finish(reject, new ToolError('timeout', '连接超时'));
       socket.destroy();
     }, timeoutMs);
     socket.once('connect', onConnect);
@@ -355,7 +356,7 @@ export function createNetSessionManager(options = {}) {
   function requireSession(input) {
     const id = parseSessionId(input);
     const session = sessions.get(id);
-    if (session === undefined) throw new Error('会话不存在或已关闭');
+    if (session === undefined) throw new ToolError('network', '会话不存在或已关闭');
     return session;
   }
 
@@ -370,7 +371,7 @@ export function createNetSessionManager(options = {}) {
         continue;
       }
       sessions.delete(id);
-      abortWaiter(session, new Error(idle ? '会话因空闲已关闭。' : '会话不存在或已关闭'));
+      abortWaiter(session, new ToolError('abort', idle ? '会话因空闲已关闭。' : '会话不存在或已关闭'));
       session.closed = true;
       session.ended = true;
       session.socket.destroy();
@@ -379,7 +380,7 @@ export function createNetSessionManager(options = {}) {
 
   function removeSession(session) {
     if (sessions.get(session.id) === session) sessions.delete(session.id);
-    abortWaiter(session, new Error('会话不存在或已关闭'));
+    abortWaiter(session, new ToolError('abort', '会话不存在或已关闭'));
     session.closed = true;
     session.ended = true;
     session.socket.destroy();
@@ -395,7 +396,7 @@ export function createNetSessionManager(options = {}) {
     const port = parsePort(input.port);
     const timeoutMs = parseTimeout(input.timeout_ms, DEFAULT_CONNECT_TIMEOUT_MS);
     if (sessions.size + pending >= maxSessions) {
-      throw new Error(`会话数量已达上限 ${maxSessions}，请先关闭不用的会话。`);
+      throw new ToolError('unsupported', `会话数量已达上限 ${maxSessions}，请先关闭不用的会话。`);
     }
     pending += 1;
     const id = `net-${++nextId}`;
@@ -405,7 +406,7 @@ export function createNetSessionManager(options = {}) {
       const authorizationSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
       const address = await authorize?.(host, port, authorizationSignal);
       throwIfAborted(signal);
-      if (disposed) throw new Error('会话管理器已释放。');
+      if (disposed) throw new ToolError('conflict', '会话管理器已释放。');
       socket = net.createConnection({ host: address?.address ?? host, port });
     } catch (error) {
       pending -= 1;
@@ -441,7 +442,7 @@ export function createNetSessionManager(options = {}) {
     }
     if (disposed) {
       socket.destroy();
-      throw new Error('会话管理器已释放。');
+      throw new ToolError('conflict', '会话管理器已释放。');
     }
     session.connectedAt = new Date();
     session.lastActivity = Date.now();
@@ -462,9 +463,9 @@ export function createNetSessionManager(options = {}) {
       throwIfAborted(signal);
       const encoding = parseEncoding(input.data_encoding, DATA_ENCODINGS, 'utf8', 'data_encoding');
       const bytes = decodeData(parseData(input), encoding);
-      if (bytes.length > MAX_SEND_BYTES) throw new Error('发送数据超过 1 MiB。');
-      if (session.closed || session.socket.destroyed) throw new Error('会话不存在或已关闭');
-      if (session.ended) throw new Error('连接已被对端关闭，无法发送。');
+      if (bytes.length > MAX_SEND_BYTES) throw new ToolError('size', '发送数据超过 1 MiB。');
+      if (session.closed || session.socket.destroyed) throw new ToolError('network', '会话不存在或已关闭');
+      if (session.ended) throw new ToolError('unsupported', '连接已被对端关闭，无法发送。');
       await new Promise((resolve, reject) => {
         let settled = false;
         function onAbort() {
@@ -487,7 +488,7 @@ export function createNetSessionManager(options = {}) {
           if (settled) return;
           settled = true;
           contract();
-          if (error) reject(new Error(`发送数据失败：${error.message}`));
+          if (error) reject(new ToolError('network', `发送数据失败：${error.message}`));
           else resolve();
         });
       });
@@ -584,7 +585,7 @@ export function createNetSessionManager(options = {}) {
   function closeSession(input) {
     const session = requireSession(input);
     sessions.delete(session.id);
-    abortWaiter(session, new Error('会话已关闭。'));
+    abortWaiter(session, new ToolError('abort', '会话已关闭。'));
     session.closed = true;
     session.ended = true;
     session.socket.destroy();
@@ -602,20 +603,20 @@ export function createNetSessionManager(options = {}) {
   }
 
   async function execute(input, context = {}) {
-    if (disposed) throw new Error('会话管理器已释放。');
+    if (disposed) throw new ToolError('conflict', '会话管理器已释放。');
     if (input === null || typeof input !== 'object' || Array.isArray(input)) {
-      throw new Error('参数必须是对象。');
+      throw new ToolError('unsupported', '参数必须是对象。');
     }
     const signal = parseContext(context);
     throwIfAborted(signal);
     const operation = input.operation;
     if (!NET_SESSION_OPERATIONS.includes(operation)) {
-      throw new Error(`operation 必须是 ${NET_SESSION_OPERATIONS.join('、')} 之一。`);
+      throw new ToolError('unsupported', `operation 必须是 ${NET_SESSION_OPERATIONS.join('、')} 之一。`);
     }
     for (const key of Object.keys(input)) {
-      if (!Object.hasOwn(NET_SESSION_PROPERTIES, key)) throw new Error(`提供了不支持的参数：${key}。`);
+      if (!Object.hasOwn(NET_SESSION_PROPERTIES, key)) throw new ToolError('unsupported', `提供了不支持的参数：${key}。`);
       if (key !== 'operation' && !OPERATION_KEYS[operation].includes(key)) {
-        throw new Error(`${operation} 操作不接受参数 ${key}。`);
+        throw new ToolError('unsupported', `${operation} 操作不接受参数 ${key}。`);
       }
     }
     pruneSessions(operation, input.session_id);
@@ -636,7 +637,7 @@ export function createNetSessionManager(options = {}) {
   function dispose() {
     disposed = true;
     for (const session of sessions.values()) {
-      abortWaiter(session, new Error('会话管理器已释放。'));
+      abortWaiter(session, new ToolError('conflict', '会话管理器已释放。'));
       session.closed = true;
       session.ended = true;
       session.socket.destroy();

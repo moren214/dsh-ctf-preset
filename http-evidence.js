@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { decodeEvidenceText, locatedTextRows, parseEvidenceJson } from './evidence.js';
+import { ToolError } from './tool-errors.js';
 
 export const MAX_HTTP_BYTES = 8 * 1024 * 1024;
 const MAX_RECORDS = 50000;
@@ -49,7 +50,7 @@ function validPath(value) {
 function parseRequest(request) {
   if (!hasKeys(request, ['method', 'path', 'request_id']) || !given(request.method, METHOD) || !validPath(request.path)
     || (request.request_id !== undefined && !given(request.request_id, REQUEST_ID))) {
-    throw new Error('请提供已知的请求方法和不带查询串的 / 路径，可附已记录的 request_id。');
+    throw new ToolError('unsupported', '请提供已知的请求方法和不带查询串的 / 路径，可附已记录的 request_id。');
   }
   return request;
 }
@@ -127,8 +128,8 @@ export function httpTextRows(text) {
 function* traceRows(text, format) {
   if (format === 'har') {
     const entries = parseEvidenceJson(text)?.log?.entries;
-    if (!Array.isArray(entries)) throw new Error('HAR 需要有效的 log.entries 数组。');
-    if (entries.length > MAX_RECORDS) throw new Error('每份 Web 原件最多检查 50000 条记录。');
+    if (!Array.isArray(entries)) throw new ToolError('unsupported', 'HAR 需要有效的 log.entries 数组。');
+    if (entries.length > MAX_RECORDS) throw new ToolError('unsupported', '每份 Web 原件最多检查 50000 条记录。');
     for (const [index, entry] of entries.entries()) yield parseHar(entry, index);
     return;
   }
@@ -173,23 +174,23 @@ function locateTrace(text, format, request) {
 export async function verifyHttpEvidence(args, files) {
   const request = parseRequest(args.request);
   if (!Array.isArray(args.sources) || args.sources.length < 1 || args.sources.length > MAX_SOURCES) {
-    throw new Error('请选择 1 至 6 份独立的本地 Web 证据。');
+    throw new ToolError('unsupported', '请选择 1 至 6 份独立的本地 Web 证据。');
   }
   const sources = args.sources.map(source => {
-    if (!hasKeys(source, ['file_path', 'format']) || !FORMATS.includes(source.format)) throw new Error('请提供原件路径和支持的 Web 格式。');
+    if (!hasKeys(source, ['file_path', 'format']) || !FORMATS.includes(source.format)) throw new ToolError('unsupported', '请提供原件路径和支持的 Web 格式。');
     return { ...source, file_path: files.normalizePath(source.file_path) };
   });
-  if (sources.every(source => source.format === 'expectations_jsonl')) throw new Error('至少需要一份实际请求记录。');
+  if (sources.every(source => source.format === 'expectations_jsonl')) throw new ToolError('unsupported', '至少需要一份实际请求记录。');
 
   const seen = new Set();
   const observations = [];
   for (const { file_path, format } of sources) {
     const { bytes, targetKey } = await files.read(file_path);
     const key = targetKey ?? file_path;
-    if (seen.has(key)) throw new Error('每个 Web 证据文件只能引用一次。');
+    if (seen.has(key)) throw new ToolError('unsupported', '每个 Web 证据文件只能引用一次。');
     seen.add(key);
     const text = decodeEvidenceText(bytes);
-    if (text === null) throw new Error(`Web 证据须使用有效的 UTF-8 文本。${file_path}`);
+    if (text === null) throw new ToolError('encoding', `Web 证据须使用有效的 UTF-8 文本。${file_path}`);
     const { location, ...observation } = locateTrace(text, format, request);
     const sha256 = createHash('sha256').update(bytes).digest('hex');
     observations.push({ format, ...observation, source: { file_path, sha256, ...location } });

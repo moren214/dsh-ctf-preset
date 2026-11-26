@@ -1,5 +1,6 @@
 import { checkRange, inPage, page } from './attachment-layout.js';
 import { createPcapngStatistics } from './pcapng-statistics.js';
+import { ToolError } from './tool-errors.js';
 
 const PCAP_MAGICS = new Map([
   [0xa1b2c3d4, { littleEndian: false, timestampUnit: 'microseconds' }],
@@ -41,7 +42,7 @@ function inspectPcap(bytes, paging, { littleEndian, timestampUnit }) {
   }
 
   const snaplen = u32(16);
-  if (snaplen === 0) throw new Error('附件结构无效：PCAP 快照长度为 0。');
+  if (snaplen === 0) throw new ToolError('unsupported', '附件结构无效：PCAP 快照长度为 0。');
   const rows = [];
   const issues = [];
   let cursor = 24;
@@ -104,7 +105,7 @@ function sectionReader(bytes, cursor) {
   checkRange(bytes.length, cursor, 28, 'PCAPNG 节头');
   const magic = bytes.readUInt32BE(cursor + 8);
   if (magic !== 0x1a2b3c4d && magic !== 0x4d3c2b1a) {
-    throw new Error('附件结构无效：PCAPNG 节头的字节序标记不匹配。');
+    throw new ToolError('unsupported', '附件结构无效：PCAPNG 节头的字节序标记不匹配。');
   }
   return reader(bytes, magic === 0x4d3c2b1a);
 }
@@ -112,7 +113,7 @@ function sectionReader(bytes, cursor) {
 function nextSectionEnd(bytes, size, following) {
   if (size === -1n) return null;
   if (size < 0n || size % 4n !== 0n || size > BigInt(bytes.length - following)) {
-    throw new Error('附件结构无效：PCAPNG 声明的节长度无效。');
+    throw new ToolError('unsupported', '附件结构无效：PCAPNG 声明的节长度无效。');
   }
   return following + Number(size);
 }
@@ -124,14 +125,14 @@ export function pcapngPacketBlock(type, cursor, size, read, interfaces) {
   checkRange(cursor + size, cursor, overhead, 'PCAPNG 包记录块');
   const interfaceId = simple ? 0 : type === PACKET_BLOCK ? read.u16(cursor + 8) : read.u32(cursor + 8);
   const info = interfaces[interfaceId];
-  if (info === undefined) throw new Error('附件结构无效：PCAPNG 包记录引用了当前节中不存在的接口。');
+  if (info === undefined) throw new ToolError('unsupported', '附件结构无效：PCAPNG 包记录引用了当前节中不存在的接口。');
   const snaplen = info.snapshot_length;
   const original = read.u32(cursor + (simple ? 8 : 24));
   const captured = simple ? Math.min(original, snaplen || original) : read.u32(cursor + 20);
   const padded = Math.ceil(captured / 4) * 4;
   const available = size - overhead;
   if (captured > original || (snaplen !== 0 && captured > snaplen) || padded > available || (simple && padded !== available)) {
-    throw new Error('附件结构无效：PCAPNG 包记录中的捕获长度无效。');
+    throw new ToolError('unsupported', '附件结构无效：PCAPNG 包记录中的捕获长度无效。');
   }
   return {
     interfaceId, info, original, captured, simple,
@@ -158,17 +159,17 @@ function inspectPcapng(bytes, paging, query) {
     const startsSection = bytes.readUInt32BE(cursor) === SECTION_HEADER;
     if (startsSection) {
       if (sectionEnd !== null && cursor !== sectionEnd) {
-        throw new Error('附件结构无效：PCAPNG 节头出现在声明的节边界以外。');
+        throw new ToolError('unsupported', '附件结构无效：PCAPNG 节头出现在声明的节边界以外。');
       }
       read = sectionReader(bytes, cursor);
     }
     const { byteOrder, u16, u32, i64 } = read;
     const type = u32(cursor);
     const size = u32(cursor + 4);
-    if (size < 12 || size % 4 !== 0) throw new Error('附件结构无效：PCAPNG 块长度或对齐不正确。');
+    if (size < 12 || size % 4 !== 0) throw new ToolError('unsupported', '附件结构无效：PCAPNG 块长度或对齐不正确。');
     checkRange(startsSection ? bytes.length : sectionEnd ?? bytes.length, cursor, size, 'PCAPNG 块');
     const next = cursor + size;
-    if (u32(next - 4) !== size) throw new Error('附件结构无效：PCAPNG 块头与块尾长度不一致。');
+    if (u32(next - 4) !== size) throw new ToolError('unsupported', '附件结构无效：PCAPNG 块头与块尾长度不一致。');
     const row = statistics === undefined && inPage(total, paging) ? {
       type: BLOCK_NAMES[type] ?? 'unknown', type_id: type, file_offset: cursor, block_size: size,
     } : null;
@@ -235,7 +236,7 @@ function inspectPcapng(bytes, paging, query) {
 export function inspectCapture(bytes, paging, pcapngQuery) {
   const magic = bytes.length >= 4 ? bytes.readUInt32BE(0) : undefined;
   if (magic === SECTION_HEADER) return inspectPcapng(bytes, paging, pcapngQuery);
-  if (pcapngQuery !== undefined) throw new Error('pcapng 查询须用于 PCAPNG 原件。');
+  if (pcapngQuery !== undefined) throw new ToolError('unsupported', 'pcapng 查询须用于 PCAPNG 原件。');
   const pcap = PCAP_MAGICS.get(magic);
   if (pcap) return inspectPcap(bytes, paging, pcap);
   return undefined;

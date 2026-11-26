@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { decodeEvidenceText, lineBounds } from './evidence.js';
+import { ToolError } from './tool-errors.js';
 
 export const MAX_BATCH_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_RANGES = 10;
@@ -23,15 +24,15 @@ export const BATCH_TEXT_PROPERTIES = {
 };
 
 function requestRanges(files, normalizePath) {
-  if (!Array.isArray(files) || files.length < 1 || files.length > MAX_RANGES) throw new Error('请选择 1 至 10 段本地文本。');
+  if (!Array.isArray(files) || files.length < 1 || files.length > MAX_RANGES) throw new ToolError('unsupported', '请选择 1 至 10 段本地文本。');
   return files.map(range => {
     if (!range || typeof range !== 'object' || Array.isArray(range)
       || Object.keys(range).some(key => !['file_path', 'start_line', 'line_count'].includes(key))) {
-      throw new Error('文本范围须包含原件路径，可附行号及行数。');
+      throw new ToolError('unsupported', '文本范围须包含原件路径，可附行号及行数。');
     }
     const { start_line = 1, line_count = 64 } = range;
     if (!Number.isSafeInteger(start_line) || start_line < 1 || !Number.isSafeInteger(line_count) || line_count < 1 || line_count > MAX_LINES) {
-      throw new Error('起始行从 1 开始，每段最多读 160 行。');
+      throw new ToolError('unsupported', '起始行从 1 开始，每段最多读 160 行。');
     }
     return { file_path: normalizePath(range.file_path), start_line, line_count };
   });

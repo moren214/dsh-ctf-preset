@@ -5,6 +5,7 @@ import https from 'node:https';
 import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import zlib from 'node:zlib';
+import { ToolError } from './tool-errors.js';
 
 const METHODS = Object.freeze(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
 const BODY_ENCODINGS = Object.freeze(['utf8', 'hex', 'base64']);
@@ -70,8 +71,8 @@ export const HTTP_REQUEST_PROPERTIES = {
   allow_insecure: { type: 'boolean', default: false },
 };
 
-function namedError(message, name) {
-  const error = new Error(message);
+function namedError(message, name, kind = 'network', options = {}) {
+  const error = new ToolError(kind, message, undefined, options);
   if (name !== undefined) error.name = name;
   return error;
 }
@@ -80,32 +81,41 @@ function errorLocation(url) {
   return url.origin + url.pathname;
 }
 
-function timeoutError(timeoutMs, url) {
-  return namedError(`HTTP 请求超时：超过 ${timeoutMs} ms 未完成（${errorLocation(url)}）。`, 'TimeoutError');
+function isIdempotentMethod(method) {
+  return method === 'GET' || method === 'HEAD' || method === 'OPTIONS';
 }
 
-function abortError(url) {
-  return namedError(`HTTP 请求已取消（${errorLocation(url)}）。`, 'AbortError');
+function timeoutError(timeoutMs, url, sideEffectMayHaveOccurred = false) {
+  return namedError(`HTTP 请求超时：超过 ${timeoutMs} ms 未完成（${errorLocation(url)}）。`, 'TimeoutError', 'timeout', { sideEffectMayHaveOccurred });
 }
 
-function networkError(error, url) {
+function abortError(url, sideEffectMayHaveOccurred = false) {
+  return namedError(`HTTP 请求已取消（${errorLocation(url)}）。`, 'AbortError', 'abort', { sideEffectMayHaveOccurred });
+}
+
+function networkError(error, url, method = 'GET') {
   const code = typeof error?.code === 'string' ? error.code : '';
   let reason;
+  let sideEffectMayHaveOccurred = false;
+  const mutating = !isIdempotentMethod(method);
   if (code === 'ENOTFOUND') reason = `无法解析主机名 ${url.hostname}`;
   else if (code === 'EAI_AGAIN') reason = `DNS 解析暂时失败（${url.hostname}）`;
   else if (code === 'ECONNREFUSED') reason = `连接被拒绝（${url.hostname}）`;
-  else if (code === 'ECONNRESET') reason = '连接被对端重置';
-  else if (code === 'ETIMEDOUT') reason = '连接超时';
+  else if (code === 'ECONNRESET') { reason = '连接被对端重置'; sideEffectMayHaveOccurred = mutating; }
+  else if (code === 'ETIMEDOUT') { reason = '连接超时'; sideEffectMayHaveOccurred = mutating; }
   else if (code === 'EHOSTUNREACH') reason = '目标主机不可达';
   else if (code === 'ENETUNREACH') reason = '目标网络不可达';
-  else if (code === 'EPIPE') reason = '连接已断开';
+  else if (code === 'EPIPE') { reason = '连接已断开'; sideEffectMayHaveOccurred = mutating; }
   else if (code.startsWith('CERT_') || code.startsWith('ERR_TLS') || code.startsWith('ERR_SSL')
     || code === 'EPROTO' || code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE'
     || code === 'SELF_SIGNED_CERT_IN_CHAIN' || code === 'DEPTH_ZERO_SELF_SIGNED_CERT') {
     reason = 'TLS 握手或证书校验失败，若目标使用自签名证书可设置 allow_insecure=true';
-  } else reason = '网络请求失败';
+  } else {
+    reason = '网络请求失败';
+    sideEffectMayHaveOccurred = mutating;
+  }
   const suffix = code === '' ? '' : `（${code}）`;
-  return namedError(`HTTP 请求失败：${reason}${suffix}（${errorLocation(url)}）。`);
+  return namedError(`HTTP 请求失败：${reason}${suffix}（${errorLocation(url)}）。`, undefined, 'network', { sideEffectMayHaveOccurred });
 }
 
 function bodyError(error, url) {
@@ -119,20 +129,20 @@ function bodyError(error, url) {
 }
 
 function parseUrl(value) {
-  if (value === undefined) throw new Error('缺少必填参数 url。');
-  if (typeof value !== 'string' || value.length === 0) throw new Error('url 必须是非空字符串。');
-  if (value.length > MAX_URL_LENGTH) throw new Error(`url 不能超过 ${MAX_URL_LENGTH} 字符。`);
+  if (value === undefined) throw new ToolError('unsupported', '缺少必填参数 url。');
+  if (typeof value !== 'string' || value.length === 0) throw new ToolError('unsupported', 'url 必须是非空字符串。');
+  if (value.length > MAX_URL_LENGTH) throw new ToolError('unsupported', `url 不能超过 ${MAX_URL_LENGTH} 字符。`);
   let url;
   try {
     url = new URL(value);
   } catch {
-    throw new Error('url 不是合法的绝对 URL，请包含 http:// 或 https://。');
+    throw new ToolError('unsupported', 'url 不是合法的绝对 URL，请包含 http:// 或 https://。');
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('url 只支持 http 或 https 协议。');
+    throw new ToolError('unsupported', 'url 只支持 http 或 https 协议。');
   }
-  if (url.hostname === '') throw new Error('url 缺少主机名。');
-  if (url.username || url.password) throw new Error('URL 不能包含用户名或密码。');
+  if (url.hostname === '') throw new ToolError('network', 'url 缺少主机名。');
+  if (url.username || url.password) throw new ToolError('unsupported', 'URL 不能包含用户名或密码。');
   url.hash = '';
   return url;
 }
@@ -140,7 +150,7 @@ function parseUrl(value) {
 function parseMethod(value) {
   if (value === undefined) return DEFAULT_METHOD;
   if (typeof value !== 'string' || !METHODS.includes(value)) {
-    throw new Error(`method 必须是 ${METHODS.join('、')} 之一。`);
+    throw new ToolError('unsupported', `method 必须是 ${METHODS.join('、')} 之一。`);
   }
   return value;
 }
@@ -148,30 +158,30 @@ function parseMethod(value) {
 function parseHeaders(value) {
   if (value === undefined) return {};
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('headers 必须是字符串键值对象。');
+    throw new ToolError('unsupported', 'headers 必须是字符串键值对象。');
   }
   const entries = Object.entries(value);
-  if (entries.length > MAX_HEADERS) throw new Error(`headers 最多 ${MAX_HEADERS} 个。`);
+  if (entries.length > MAX_HEADERS) throw new ToolError('unsupported', `headers 最多 ${MAX_HEADERS} 个。`);
   const headers = {};
   const seen = new Set();
   let total = 0;
   for (const [name, headerValue] of entries) {
     if (typeof name !== 'string' || !TOKEN.test(name)) {
-      throw new Error(`header 名不合法：${JSON.stringify(name)}；只允许 RFC token 字符。`);
+      throw new ToolError('unsupported', `header 名不合法：${JSON.stringify(name)}；只允许 RFC token 字符。`);
     }
-    if (typeof headerValue !== 'string') throw new Error(`header ${name} 的值必须是字符串。`);
+    if (typeof headerValue !== 'string') throw new ToolError('unsupported', `header ${name} 的值必须是字符串。`);
     if (!HEADER_VALUE.test(headerValue)) {
-      throw new Error(`header ${name} 的值不能包含控制字符或 CR/LF，只允许制表符和可打印字符。`);
+      throw new ToolError('unsupported', `header ${name} 的值不能包含控制字符或 CR/LF，只允许制表符和可打印字符。`);
     }
     if (headerValue.length > MAX_HEADER_VALUE_CHARS) {
-      throw new Error(`header ${name} 的值不能超过 ${MAX_HEADER_VALUE_CHARS} 字符。`);
+      throw new ToolError('unsupported', `header ${name} 的值不能超过 ${MAX_HEADER_VALUE_CHARS} 字符。`);
     }
     const lower = name.toLowerCase();
-    if (seen.has(lower)) throw new Error(`header 名重复（忽略大小写）：${name}。`);
+    if (seen.has(lower)) throw new ToolError('unsupported', `header 名重复（忽略大小写）：${name}。`);
     seen.add(lower);
     total += name.length + headerValue.length;
     if (total > MAX_HEADER_TOTAL_CHARS) {
-      throw new Error(`header 名称与值合计不能超过 ${MAX_HEADER_TOTAL_CHARS} 字符。`);
+      throw new ToolError('unsupported', `header 名称与值合计不能超过 ${MAX_HEADER_TOTAL_CHARS} 字符。`);
     }
     headers[name] = headerValue;
   }
@@ -182,27 +192,27 @@ function decodeBody(text, encoding) {
   if (encoding === 'utf8') return Buffer.from(text, 'utf8');
   if (encoding === 'hex') {
     if (text.length % 2 !== 0 || !/^[0-9a-fA-F]*$/u.test(text)) {
-      throw new Error('hex 编码的 body 必须是偶数个十六进制字符。');
+      throw new ToolError('encoding', 'hex 编码的 body 必须是偶数个十六进制字符。');
     }
     return Buffer.from(text, 'hex');
   }
   if (!/^[A-Za-z0-9+/]*={0,2}$/u.test(text) || text.length % 4 === 1) {
-    throw new Error('base64 编码的 body 格式无效。');
+    throw new ToolError('encoding', 'base64 编码的 body 格式无效。');
   }
   return Buffer.from(text, 'base64');
 }
 
 function parseBody(input) {
   const text = input.body === undefined ? '' : input.body;
-  if (typeof text !== 'string') throw new Error('body 必须是字符串。');
-  if (text.length > MAX_BODY_BYTES * 2) throw new Error(`body 文本不能超过 ${MAX_BODY_BYTES * 2} 字符。`);
+  if (typeof text !== 'string') throw new ToolError('unsupported', 'body 必须是字符串。');
+  if (text.length > MAX_BODY_BYTES * 2) throw new ToolError('unsupported', `body 文本不能超过 ${MAX_BODY_BYTES * 2} 字符。`);
   const encoding = input.body_encoding === undefined ? DEFAULT_BODY_ENCODING : input.body_encoding;
   if (typeof encoding !== 'string' || !BODY_ENCODINGS.includes(encoding)) {
-    throw new Error(`body_encoding 必须是 ${BODY_ENCODINGS.join('、')} 之一。`);
+    throw new ToolError('unsupported', `body_encoding 必须是 ${BODY_ENCODINGS.join('、')} 之一。`);
   }
   const bytes = decodeBody(text, encoding);
   if (bytes.length > MAX_BODY_BYTES) {
-    throw new Error(`body 编码后不能超过 ${MAX_BODY_BYTES} 字节（1 MiB）。`);
+    throw new ToolError('size', `body 编码后不能超过 ${MAX_BODY_BYTES} 字节（1 MiB）。`);
   }
   return bytes;
 }
@@ -210,35 +220,35 @@ function parseBody(input) {
 function parseInteger(value, fallback, minimum, maximum, name) {
   if (value === undefined) return fallback;
   if (!Number.isInteger(value) || value < minimum || value > maximum) {
-    throw new Error(`${name} 必须是 ${minimum} 至 ${maximum} 的整数。`);
+    throw new ToolError('unsupported', `${name} 必须是 ${minimum} 至 ${maximum} 的整数。`);
   }
   return value;
 }
 
 function parseBoolean(value, fallback, name) {
   if (value === undefined) return fallback;
-  if (typeof value !== 'boolean') throw new Error(`${name} 必须是布尔值。`);
+  if (typeof value !== 'boolean') throw new ToolError('unsupported', `${name} 必须是布尔值。`);
   return value;
 }
 
 function parseOptions(options) {
   if (options === null || typeof options !== 'object' || Array.isArray(options)) {
-    throw new Error('options 必须是对象。');
+    throw new ToolError('unsupported', 'options 必须是对象。');
   }
   for (const key of Object.keys(options)) {
-    if (!['signal', 'authorize', 'cookieJar', 'readFile'].includes(key)) throw new Error(`options 不支持 ${key}。`);
+    if (!['signal', 'authorize', 'cookieJar', 'readFile'].includes(key)) throw new ToolError('dependency', `options 不支持 ${key}。`);
   }
   const { signal, authorize, cookieJar, readFile } = options;
-  if (authorize !== undefined && typeof authorize !== 'function') throw new Error('options.authorize 须为函数。');
-  if (readFile !== undefined && typeof readFile !== 'function') throw new Error('options.readFile 须为函数。');
+  if (authorize !== undefined && typeof authorize !== 'function') throw new ToolError('unsupported', 'options.authorize 须为函数。');
+  if (readFile !== undefined && typeof readFile !== 'function') throw new ToolError('dependency', 'options.readFile 须为函数。');
   if (cookieJar !== undefined && (cookieJar === null || typeof cookieJar !== 'object'
     || typeof cookieJar.headerFor !== 'function' || typeof cookieJar.store !== 'function')) {
-    throw new Error('options.cookieJar 无效。');
+    throw new ToolError('unsupported', 'options.cookieJar 无效。');
   }
   if (signal !== undefined) {
     if (signal === null || typeof signal !== 'object' || typeof signal.addEventListener !== 'function'
       || typeof signal.removeEventListener !== 'function' || typeof signal.aborted !== 'boolean') {
-      throw new Error('options.signal 必须是 AbortSignal。');
+      throw new ToolError('unsupported', 'options.signal 必须是 AbortSignal。');
     }
   }
   return signal;
@@ -363,42 +373,42 @@ export function createCookieJarStore({ maxJars = 16, maxCookiesPerJar = 64 } = {
 
 function escapeMultipartParam(value, label) {
   if (typeof value !== 'string' || value.length === 0 || value.length > 256 || /[\r\n\0]/u.test(value)) {
-    throw new Error(`multipart.${label} 须为 1 至 256 字符的单行文本。`);
+    throw new ToolError('unsupported', `multipart.${label} 须为 1 至 256 字符的单行文本。`);
   }
   return value.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
 }
 
 async function buildMultipartBody(parts, readFile) {
   if (!Array.isArray(parts) || parts.length < 1 || parts.length > 16) {
-    throw new Error('multipart 须包含 1 至 16 个字段。');
+    throw new ToolError('unsupported', 'multipart 须包含 1 至 16 个字段。');
   }
   const boundary = '----dshCtfBoundary' + randomBytes(12).toString('hex');
   const chunks = [];
   let total = 0;
   for (const part of parts) {
-    if (!part || typeof part !== 'object' || Array.isArray(part)) throw new Error('multipart 每项须是对象。');
+    if (!part || typeof part !== 'object' || Array.isArray(part)) throw new ToolError('unsupported', 'multipart 每项须是对象。');
     for (const key of Object.keys(part)) {
       if (!['name', 'value', 'value_encoding', 'file_path', 'filename', 'content_type'].includes(key)) {
-        throw new Error(`multipart 不支持字段 ${key}。`);
+        throw new ToolError('unsupported', `multipart 不支持字段 ${key}。`);
       }
     }
     const fieldName = escapeMultipartParam(part.name, 'name');
     const hasValue = part.value !== undefined;
     const hasFile = part.file_path !== undefined;
-    if (hasValue === hasFile) throw new Error(`multipart 字段 ${part.name} 须在 value 和 file_path 中二选一。`);
+    if (hasValue === hasFile) throw new ToolError('unsupported', `multipart 字段 ${part.name} 须在 value 和 file_path 中二选一。`);
     let payload;
     let filename = part.filename;
     if (hasFile) {
       if (typeof part.file_path !== 'string' || part.file_path.length === 0 || part.file_path.length > 1024) {
-        throw new Error('multipart.file_path 无效。');
+        throw new ToolError('unsupported', 'multipart.file_path 无效。');
       }
-      if (typeof readFile !== 'function') throw new Error('当前环境不支持 multipart.file_path 文件上传。');
+      if (typeof readFile !== 'function') throw new ToolError('dependency', '当前环境不支持 multipart.file_path 文件上传。');
       payload = await readFile(part.file_path, MAX_BODY_BYTES);
       filename ??= part.file_path.split(/[\\/]/u).pop() || 'upload.bin';
     } else {
-      if (typeof part.value !== 'string') throw new Error('multipart.value 必须是字符串。');
+      if (typeof part.value !== 'string') throw new ToolError('unsupported', 'multipart.value 必须是字符串。');
       const encoding = part.value_encoding ?? DEFAULT_BODY_ENCODING;
-      if (!BODY_ENCODINGS.includes(encoding)) throw new Error(`value_encoding 必须是 ${BODY_ENCODINGS.join('、')} 之一。`);
+      if (!BODY_ENCODINGS.includes(encoding)) throw new ToolError('unsupported', `value_encoding 必须是 ${BODY_ENCODINGS.join('、')} 之一。`);
       payload = decodeBody(part.value, encoding);
     }
     let disposition = `Content-Disposition: form-data; name="${fieldName}"`;
@@ -406,7 +416,7 @@ async function buildMultipartBody(parts, readFile) {
     const partLines = [`--${boundary}`, disposition];
     if (part.content_type !== undefined) {
       if (typeof part.content_type !== 'string' || !HEADER_VALUE.test(part.content_type) || part.content_type.length > 256) {
-        throw new Error('multipart.content_type 格式无效。');
+        throw new ToolError('unsupported', 'multipart.content_type 格式无效。');
       }
       partLines.push(`Content-Type: ${part.content_type}`);
     } else if (hasFile) {
@@ -415,11 +425,11 @@ async function buildMultipartBody(parts, readFile) {
     const headerBuf = Buffer.from(partLines.join('\r\n') + '\r\n\r\n', 'utf8');
     const trailerBuf = Buffer.from('\r\n', 'utf8');
     total += headerBuf.length + payload.length + trailerBuf.length;
-    if (total > MAX_BODY_BYTES) throw new Error(`multipart 请求体超过 ${MAX_BODY_BYTES} 字节（1 MiB）。`);
+    if (total > MAX_BODY_BYTES) throw new ToolError('size', `multipart 请求体超过 ${MAX_BODY_BYTES} 字节（1 MiB）。`);
     chunks.push(headerBuf, payload, trailerBuf);
   }
   const closing = Buffer.from(`--${boundary}--\r\n`, 'utf8');
-  if (total + closing.length > MAX_BODY_BYTES) throw new Error(`multipart 请求体超过 ${MAX_BODY_BYTES} 字节（1 MiB）。`);
+  if (total + closing.length > MAX_BODY_BYTES) throw new ToolError('size', `multipart 请求体超过 ${MAX_BODY_BYTES} 字节（1 MiB）。`);
   chunks.push(closing);
   return { body: Buffer.concat(chunks), contentType: `multipart/form-data; boundary=${boundary}` };
 }
@@ -441,19 +451,19 @@ function mergeCookieHeader(headers, jarHeader) {
 
 function parseInput(input) {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) {
-    throw new Error('请求参数必须是对象。');
+    throw new ToolError('unsupported', '请求参数必须是对象。');
   }
   for (const key of Object.keys(input)) {
     if (!Object.prototype.hasOwnProperty.call(HTTP_REQUEST_PROPERTIES, key)) {
-      throw new Error(`不支持的参数：${key}。`);
+      throw new ToolError('unsupported', `不支持的参数：${key}。`);
     }
   }
   if (input.body !== undefined && input.multipart !== undefined) {
-    throw new Error('body 和 multipart 不能同时提供。');
+    throw new ToolError('unsupported', 'body 和 multipart 不能同时提供。');
   }
   if (input.cookie_jar !== undefined && (typeof input.cookie_jar !== 'string'
     || input.cookie_jar.length < 1 || input.cookie_jar.length > 64 || /[\r\n\0]/u.test(input.cookie_jar))) {
-    throw new Error('cookie_jar 须为 1 至 64 字符的单行标识。');
+    throw new ToolError('unsupported', 'cookie_jar 须为 1 至 64 字符的单行标识。');
   }
   return {
     url: parseUrl(input.url),
@@ -539,7 +549,7 @@ function createDecoder(encoding) {
 async function readCapped(stream, limit, decoders, retainPartial) {
   const chunks = [];
   let total = 0;
-  const limitReached = new Error('Response preview limit reached');
+  const limitReached = { limitReached: true };
   const output = new Writable({
     write(chunk, _encoding, callback) {
       const keep = Math.min(chunk.length, limit - total);
@@ -664,10 +674,11 @@ function requestOnce(hop) {
       controller.abort();
     };
 
-    const onTimeout = () => interrupt(timeoutError(timeoutMs, url));
+    const mutating = !isIdempotentMethod(method);
+    const onTimeout = () => interrupt(timeoutError(timeoutMs, url, mutating));
 
     function onExternalAbort() {
-      interrupt(abortError(url));
+      interrupt(abortError(url, mutating));
     }
 
     if (signal !== undefined) {
@@ -690,14 +701,14 @@ function requestOnce(hop) {
     try {
       request = transport.request(url, requestOptions, onResponse);
     } catch (error) {
-      fail(networkError(error, url));
+      fail(networkError(error, url, method));
       return;
     }
 
     request.on('error', error => {
       if (done) return;
       if (response !== undefined) response.destroy(interrupted ?? error);
-      else fail(interrupted ?? networkError(error, url));
+      else fail(interrupted ?? networkError(error, url, method));
     });
 
     request.setTimeout(timeoutMs, onTimeout);
@@ -707,7 +718,7 @@ function requestOnce(hop) {
       if (body !== null && body.length > 0) request.end(body);
       else request.end();
     } catch {
-      fail(namedError(`发送请求失败（${errorLocation(url)}）。`));
+      fail(namedError(`发送请求失败（${errorLocation(url)}）。`, undefined, 'network', { sideEffectMayHaveOccurred: mutating }));
       return;
     }
 

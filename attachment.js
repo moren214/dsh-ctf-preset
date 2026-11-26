@@ -4,6 +4,7 @@ import { checkRange, inPage, label, page } from './attachment-layout.js';
 import { inspectCapture } from './capture.js';
 import { inspectElf } from './elf.js';
 import { inspectImage } from './image-metadata.js';
+import { ToolError } from './tool-errors.js';
 
 const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
 const WASM_MAGIC = Buffer.from([0x00, 0x61, 0x73, 0x6d]);
@@ -30,12 +31,12 @@ export function readPeHeader(bytes) {
   const flags = bytes.readUInt16LE(pe + 22);
   const optional = pe + 24;
   checkRange(bytes.length, optional, optionalSize, 'PE 可选头');
-  if (optionalSize < 2) throw new Error('附件结构无效：PE 可选头缺失。');
+  if (optionalSize < 2) throw new ToolError('unsupported', '附件结构无效：PE 可选头缺失。');
   const magic = bytes.readUInt16LE(optional);
   if (magic !== 0x10b && magic !== 0x20b) {
     return { format, status: 'unsupported', reason: '当前检查覆盖 PE32 和 PE32+。' };
   }
-  if (optionalSize < (magic === 0x10b ? 96 : 112)) throw new Error('附件结构无效：PE 可选头长度不足。');
+  if (optionalSize < (magic === 0x10b ? 96 : 112)) throw new ToolError('unsupported', '附件结构无效：PE 可选头长度不足。');
   const entry = bytes.readUInt32LE(optional + 16);
   const firstSection = optional + optionalSize;
   checkRange(bytes.length, firstSection, total * 40, 'PE 节表');
@@ -102,7 +103,7 @@ function wasmSize(bytes, start) {
     result += (byte & 0x7f) * 2 ** (index * 7);
     if ((byte & 0x80) === 0) return { size: result, payload: offset + 1 };
   }
-  throw new Error('附件结构无效：WebAssembly 节大小不是有效的 varuint32。');
+  throw new ToolError('unsupported', '附件结构无效：WebAssembly 节大小不是有效的 varuint32。');
 }
 
 export function wasmVersion(bytes) {
@@ -114,7 +115,7 @@ export function* wasmSections(bytes) {
   let index = 0;
   let cursor = 8;
   while (cursor < bytes.length) {
-    if (index >= 65536) throw new Error('WebAssembly 节数量超出检查上限。');
+    if (index >= 65536) throw new ToolError('size', 'WebAssembly 节数量超出检查上限。');
     const id = bytes[cursor];
     const { size, payload } = wasmSize(bytes, cursor + 1);
     checkRange(bytes.length, payload, size, 'WebAssembly 节内容');
